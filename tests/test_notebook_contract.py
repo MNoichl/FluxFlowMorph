@@ -14,8 +14,8 @@ EXPECTED_SECTIONS = [
     "Path configuration",
     "Repository clone or update",
     "Dependency installation",
-    "Hugging Face authentication",
-    "Model license and access preflight",
+    "Hugging Face access mode",
+    "Model repository preflight",
     "Optional Google Drive mount",
     "Input upload or staging",
     "Run configuration",
@@ -98,6 +98,11 @@ def test_notebook_can_generate_source_conditioned_runware_endpoints() -> None:
     code = _code(_load())
     assert "GENERATE_TEST_ENDPOINTS = True" in code
     assert "Flux2KleinPipeline.from_pretrained(" in code
+    preview_load = code.split("Flux2KleinPipeline.from_pretrained(", 1)[1].split(
+        "PREVIEW_PIPE.enable_model_cpu_offload()", 1
+    )[0]
+    assert "AUTHENTICATION" not in preview_load
+    assert "token=" not in preview_load
     assert "prompt=SOURCE_GENERATION_PROMPT" in code
     assert "image=generated_source" in code
     assert "generated_young_woman.png" in code
