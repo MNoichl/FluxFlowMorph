@@ -6,11 +6,7 @@ import re
 from pathlib import Path
 
 
-NOTEBOOK = (
-    Path(__file__).resolve().parents[1]
-    / "notebooks"
-    / "FlowMorph_FLUX2_Klein_Base_9B_LoRA_Colab.ipynb"
-)
+NOTEBOOK = Path(__file__).resolve().parents[1] / "notebooks" / "FlowMorph_FLUX2_Klein_Base_9B_LoRA_Colab.ipynb"
 
 EXPECTED_SECTIONS = [
     "Runtime identification",
@@ -44,11 +40,7 @@ def _load() -> dict:
 
 
 def _code(notebook: dict) -> str:
-    return "\n".join(
-        "".join(cell["source"])
-        for cell in notebook["cells"]
-        if cell["cell_type"] == "code"
-    )
+    return "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
 
 
 def test_notebook_is_valid_clean_nbformat() -> None:
@@ -78,7 +70,8 @@ def test_notebook_has_all_23_recommended_sections_in_order() -> None:
 
 def test_notebook_exposes_plain_exact_reference_variables() -> None:
     code = _code(_load())
-    assert 'MODEL_ID = "black-forest-labs/FLUX.2-klein-base-9B"' in code
+    assert 'RUN_MODE = "experimental"' in code
+    assert 'MODEL_ID = "Runware/BFL-FLUX.2-klein-base-9B"' in code
     assert "LORA_SOURCE = None" in code
     assert "RESOLUTION = 512" in code
     assert "GUIDANCE_SCALE = 4.0" in code
@@ -99,6 +92,17 @@ def test_notebook_exposes_plain_exact_reference_variables() -> None:
         "OUTPUT_NAME",
     ):
         assert re.search(rf"^{variable}\s*=", code, re.MULTILINE), variable
+
+
+def test_notebook_can_generate_source_conditioned_runware_endpoints() -> None:
+    code = _code(_load())
+    assert "GENERATE_TEST_ENDPOINTS = True" in code
+    assert "Flux2KleinPipeline.from_pretrained(" in code
+    assert "prompt=SOURCE_GENERATION_PROMPT" in code
+    assert "image=generated_source" in code
+    assert "generated_young_woman.png" in code
+    assert "generated_older_man.png" in code
+    assert "PREVIEW_PIPE.maybe_free_model_hooks()" in code
 
 
 def test_notebook_is_thin_and_contains_no_algorithm_implementation() -> None:
@@ -123,9 +127,7 @@ def test_notebook_is_thin_and_contains_no_algorithm_implementation() -> None:
 
 def test_config_resolves_before_pipeline_import() -> None:
     code = _code(_load())
-    assert code.index("CONFIG = resolve_config") < code.index(
-        "from flowmorph_klein.pipeline import FlowMorphRunner"
-    )
+    assert code.index("CONFIG = resolve_config") < code.index("from flowmorph_klein.pipeline import FlowMorphRunner")
 
 
 def test_colab_only_features_are_guarded_and_plain_path_is_always_printed() -> None:

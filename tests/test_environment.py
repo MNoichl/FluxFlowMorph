@@ -44,3 +44,22 @@ def test_colab_secret_timeout_falls_back_to_interactive_login(monkeypatch):
     assert authentication.source == "interactive_login"
     assert authentication.token == "hf_interactive_test_token"
     assert login_calls == [True]
+
+
+def test_explicit_anonymous_access_skips_colab_secrets(monkeypatch):
+    def unexpected_secret_lookup(_key):
+        raise AssertionError("anonymous access must not query Colab secrets")
+
+    google = ModuleType("google")
+    colab = ModuleType("google.colab")
+    colab.userdata = SimpleNamespace(get=unexpected_secret_lookup)
+    google.colab = colab
+
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.colab", colab)
+
+    authentication = resolve_hf_token(allow_anonymous=True)
+
+    assert authentication.source == "anonymous"
+    assert authentication.token is None

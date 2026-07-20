@@ -36,7 +36,7 @@ class ManifestDefaults(StrictConfigModel):
         if value not in ALLOWED_MODEL_IDS:
             raise ValueError(
                 "manifest model_id must be FLUX.2 Klein Base 9B or its explicit "
-                "experimental Base-9B FP8 variant"
+                "pinned public mirror or experimental Base-9B FP8 variant"
             )
         return value
 
@@ -112,9 +112,7 @@ def _resolve_input_path(path: Path, root: Path) -> Path:
     try:
         resolved.relative_to(resolved_root)
     except ValueError as error:
-        raise ManifestError(
-            f"relative manifest path {path!s} escapes its input root {resolved_root}"
-        ) from error
+        raise ManifestError(f"relative manifest path {path!s} escapes its input root {resolved_root}") from error
     return resolved
 
 
@@ -147,20 +145,12 @@ def validate_manifest(
                     missing.append(str(candidate))
                 elif not candidate.is_file():
                     non_files.append(str(candidate))
-        resolved_pairs.append(
-            pair.model_copy(
-                update={"source_image": source_path, "target_image": target_path}
-            )
-        )
+        resolved_pairs.append(pair.model_copy(update={"source_image": source_path, "target_image": target_path}))
 
     if missing:
-        raise ManifestError(
-            "manifest image paths do not exist: " + ", ".join(sorted(set(missing)))
-        )
+        raise ManifestError("manifest image paths do not exist: " + ", ".join(sorted(set(missing))))
     if non_files:
-        raise ManifestError(
-            "manifest image paths must be files: " + ", ".join(sorted(set(non_files)))
-        )
+        raise ManifestError("manifest image paths must be files: " + ", ".join(sorted(set(non_files))))
     return manifest.model_copy(update={"pairs": tuple(resolved_pairs)})
 
 

@@ -10,7 +10,7 @@ This report uses three validation labels:
   the real FLUX.2 Klein Base 9B path was not executed.
 - **Not run**: no result artifact or performance claim exists.
 
-The final full-suite command `pytest -q` completed with **185 passed and 7
+The final full-suite command `pytest -q` completed with **188 passed and 7
 skipped in 1.54 seconds**. The seven skipped tests are the explicitly opt-in
 CUDA/gated-model integrations; they did not execute. Python byte-compilation
 of `src/` and `scripts/` passed, and the notebook JSON plus all 24 code cells
@@ -515,7 +515,7 @@ offline tested only.
 
 No model-load, conditioning, VAE, backward-probe, endpoint-fit, render, decode,
 metric, video, or packaging runtime has been measured on production hardware.
-The only reportable timing is the final local full suite: 185 passed and 7
+The only reportable timing is the final local full suite: 188 passed and 7
 opt-in integration tests skipped in 1.54 seconds. `compileall` passed for
 `src/` and `scripts/`; the notebook JSON and all 24 code cells parsed
 successfully. These validation timings have no predictive value for the 9B
@@ -621,7 +621,7 @@ These are anticipated mechanisms, not claims about an unrendered result.
 
 No gated CUDA/model/LoRA experiment was attempted, so there are no production
 failures to hide and no memory profile can honestly be labeled failed or
-passed. The final full suite had no test failures: 185 passed and 7 gated
+passed. The final full suite had no test failures: 188 passed and 7 gated
 integration tests skipped in 1.54 seconds. With the declared `ruff==0.14.14`
 installed in the project virtual environment, `.venv/bin/ruff check .`
 reported `All checks passed!`. `compileall` passed for `src/` and `scripts/`,

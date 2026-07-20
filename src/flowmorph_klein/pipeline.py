@@ -29,6 +29,7 @@ from . import (
     FLOWMORPH_COMMIT,
     FLUX2_COMMIT,
     FP8_MODEL_ID,
+    MIRROR_MODEL_ID,
     MODEL_ID,
     MODEL_REVISION,
 )
@@ -173,9 +174,7 @@ def _jsonable(value: Any) -> Any:
 
 def _atomic_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
@@ -397,9 +396,7 @@ class FlowMorphRunner:
                 raise PipelineError(f"cannot read existing run manifest {path}: {error}") from error
             existing_hash = manifest.get("config_hash")
             if existing_hash != self.config_hash:
-                raise PipelineError(
-                    "existing run directory was created from a different resolved configuration"
-                )
+                raise PipelineError("existing run directory was created from a different resolved configuration")
             phase = manifest.get("phase")
             try:
                 RunPhase(phase)
@@ -497,7 +494,9 @@ class FlowMorphRunner:
         self._write_manifest()
         self._log(f"FAILED during {operation}: {message}")
 
-    def _require_prepared_values(self) -> tuple[
+    def _require_prepared_values(
+        self,
+    ) -> tuple[
         Any,
         FlowMorphFlux2Model,
         ConditioningCache,
@@ -538,15 +537,10 @@ class FlowMorphRunner:
             reuse_persisted_inputs = True
         if self.phase is RunPhase.FAILED:
             if not resume:
-                raise PipelineError(
-                    "this run is marked failed; call prepare(resume=True) or resume() explicitly"
-                )
+                raise PipelineError("this run is marked failed; call prepare(resume=True) or resume() explicitly")
             self._restore_failed_phase_for_resume()
         try:
-            if (
-                self.config.memory.model_cpu_offload
-                or self.config.memory.sequential_cpu_offload
-            ):
+            if self.config.memory.model_cpu_offload or self.config.memory.sequential_cpu_offload:
                 raise PipelineError(
                     "Accelerate model/sequential CPU offload is not validated for the "
                     "differentiable transformer path; use the explicit VAE/text-encoder "
@@ -558,7 +552,7 @@ class FlowMorphRunner:
             if not self._at_least(RunPhase.INPUTS_VALIDATED):
                 self._advance(RunPhase.INPUTS_VALIDATED)
 
-            self.authentication = resolve_hf_token()
+            self.authentication = resolve_hf_token(allow_anonymous=self.config.model.id == MIRROR_MODEL_ID)
             access = verify_model_access(
                 self.authentication,
                 model_id=self.config.model.id,
@@ -617,9 +611,7 @@ class FlowMorphRunner:
             expected_original = record.get("original_sha256")
             actual_original = sha256_file(source)
             if actual_original != expected_original:
-                mismatches.append(
-                    f"{label}: current source checksum differs from the staged run"
-                )
+                mismatches.append(f"{label}: current source checksum differs from the staged run")
 
             suffix = source.suffix.lower() or ".bin"
             staged_original = input_directory / f"{label}_original{suffix}"
@@ -633,9 +625,7 @@ class FlowMorphRunner:
             if not processed.is_file():
                 mismatches.append(f"{label}: persisted preprocessed image is missing")
             elif sha256_file(processed) != expected_processed:
-                mismatches.append(
-                    f"{label}: persisted preprocessed image checksum is corrupt"
-                )
+                mismatches.append(f"{label}: persisted preprocessed image checksum is corrupt")
 
         configured_lora = self.config.lora.source
         recorded_lora = self.manifest.get("lora")
@@ -644,14 +634,9 @@ class FlowMorphRunner:
             if local_lora.is_file():
                 expected_lora = recorded_lora.get("sha256")
                 if sha256_file(local_lora) != expected_lora:
-                    mismatches.append(
-                        "LoRA: current local file checksum differs from the staged run"
-                    )
+                    mismatches.append("LoRA: current local file checksum differs from the staged run")
         if mismatches:
-            raise PipelineError(
-                "resume provenance validation failed before staging: "
-                + "; ".join(mismatches)
-            )
+            raise PipelineError("resume provenance validation failed before staging: " + "; ".join(mismatches))
 
     def _load_persisted_preprocessed_inputs(
         self,
@@ -668,13 +653,9 @@ class FlowMorphRunner:
             original_size = tuple(int(value) for value in record["original_size"])
             processed_size = tuple(int(value) for value in record["processed_size"])
             if len(original_size) != 2 or len(processed_size) != 2:
-                raise PipelineError(
-                    f"persisted {label} input metadata contains invalid dimensions"
-                )
+                raise PipelineError(f"persisted {label} input metadata contains invalid dimensions")
             if image.size != processed_size:
-                raise PipelineError(
-                    f"persisted {label} image dimensions disagree with its manifest"
-                )
+                raise PipelineError(f"persisted {label} image dimensions disagree with its manifest")
             return PreprocessedImage(
                 image=image,
                 source_path=source,
@@ -693,9 +674,7 @@ class FlowMorphRunner:
 
     def _prepare_inputs(self, *, reuse_persisted: bool = False) -> None:
         if reuse_persisted:
-            self.source_preprocessed, self.target_preprocessed = (
-                self._load_persisted_preprocessed_inputs()
-            )
+            self.source_preprocessed, self.target_preprocessed = self._load_persisted_preprocessed_inputs()
             return
         input_directory = self.run_directory / "inputs"
         input_directory.mkdir(parents=True, exist_ok=True)
@@ -744,9 +723,7 @@ class FlowMorphRunner:
         try:
             from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel
         except ImportError as error:
-            raise PipelineError(
-                "the pinned Diffusers installation with Flux2KleinPipeline is required"
-            ) from error
+            raise PipelineError("the pinned Diffusers installation with Flux2KleinPipeline is required") from error
 
         dtype = _torch_dtype(self.config.model.transformer_compute_dtype)
         common = {
@@ -783,9 +760,7 @@ class FlowMorphRunner:
                 )
                 layerwise_casting = getattr(transformer, "enable_layerwise_casting", None)
                 if not callable(layerwise_casting):
-                    raise PipelineError(
-                        "pinned Diffusers transformer lacks layerwise FP8 storage casting"
-                    )
+                    raise PipelineError("pinned Diffusers transformer lacks layerwise FP8 storage casting")
                 layerwise_casting(
                     storage_dtype=torch.float8_e4m3fn,
                     compute_dtype=dtype,
@@ -822,8 +797,7 @@ class FlowMorphRunner:
             raise PipelineError("Diffusers distribution metadata is unavailable") from error
         if installed_diffusers_version != "0.39.0":
             raise PipelineError(
-                "the inspected Diffusers 0.39.0 build is required; found "
-                f"{installed_diffusers_version!r}"
+                f"the inspected Diffusers 0.39.0 build is required; found {installed_diffusers_version!r}"
             )
         direct_url = _distribution_direct_url("diffusers")
         vcs_info = direct_url.get("vcs_info", {}) if isinstance(direct_url, Mapping) else {}
@@ -835,19 +809,13 @@ class FlowMorphRunner:
                 "Install requirements-colab.txt."
             )
         if type(pipeline).__name__ != "Flux2KleinPipeline":
-            raise PipelineError(
-                f"loaded pipeline class is {type(pipeline).__name__}, expected Flux2KleinPipeline"
-            )
+            raise PipelineError(f"loaded pipeline class is {type(pipeline).__name__}, expected Flux2KleinPipeline")
         config = getattr(pipeline, "config", None)
         is_distilled = (
-            config.get("is_distilled")
-            if isinstance(config, Mapping)
-            else getattr(config, "is_distilled", None)
+            config.get("is_distilled") if isinstance(config, Mapping) else getattr(config, "is_distilled", None)
         )
         if is_distilled is not False:
-            raise PipelineError(
-                "loaded pipeline does not explicitly identify itself as undistilled Klein Base 9B"
-            )
+            raise PipelineError("loaded pipeline does not explicitly identify itself as undistilled Klein Base 9B")
         transformer = getattr(pipeline, "transformer", None)
         vae = getattr(pipeline, "vae", None)
         scheduler = getattr(pipeline, "scheduler", None)
@@ -867,8 +835,7 @@ class FlowMorphRunner:
         ]
         if wrong_classes:
             raise PipelineError(
-                "loaded pipeline component classes do not match the pinned contract: "
-                + ", ".join(wrong_classes)
+                "loaded pipeline component classes do not match the pinned contract: " + ", ".join(wrong_classes)
             )
         expected = {
             "in_channels": 128,
@@ -892,9 +859,7 @@ class FlowMorphRunner:
             if actual != required:
                 mismatches.append(f"{key}={actual!r}, expected {required!r}")
         if mismatches:
-            raise PipelineError(
-                "loaded transformer is not the Klein 9B architecture: " + ", ".join(mismatches)
-            )
+            raise PipelineError("loaded transformer is not the Klein 9B architecture: " + ", ".join(mismatches))
         parameter_dtypes: dict[str, int] = {}
         parameter_count = 0
         for parameter in transformer.parameters():
@@ -903,23 +868,18 @@ class FlowMorphRunner:
             parameter_dtypes[label] = parameter_dtypes.get(label, 0) + parameter.numel()
         if parameter_count <= 0:
             raise PipelineError("loaded transformer contains no parameters")
-        if self.config.model.id == FP8_MODEL_ID and not any(
-            label.startswith("float8") for label in parameter_dtypes
-        ):
-            raise PipelineError(
-                "experimental FP8 repository loaded without any float8 transformer parameters"
-            )
+        if self.config.model.id == FP8_MODEL_ID and not any(label.startswith("float8") for label in parameter_dtypes):
+            raise PipelineError("experimental FP8 repository loaded without any float8 transformer parameters")
         resolved = access.get("resolved_revision")
         if resolved != self.config.model.revision:
-            raise PipelineError(
-                f"Hub resolved model revision {resolved!r}, expected {self.config.model.revision!r}"
-            )
+            raise PipelineError(f"Hub resolved model revision {resolved!r}, expected {self.config.model.revision!r}")
         report = {
             "status": "loaded_and_structurally_verified",
             "model_id": self.config.model.id,
             "requested_revision": self.config.model.revision,
             "resolved_revision": resolved,
             "reference_bf16_model": self.config.model.id == MODEL_ID,
+            "public_mirror_bf16_model": self.config.model.id == MIRROR_MODEL_ID,
             "experimental_fp8_model": self.config.model.id == FP8_MODEL_ID,
             "profile": self.config.model.profile.value,
             "pipeline_class": type(pipeline).__name__,
@@ -972,9 +932,7 @@ class FlowMorphRunner:
             _move_module(pipe.text_encoder, "cpu")
             release_cuda_memory()
         text_encoder_after = cuda_memory_snapshot(self.device)
-        self._offload_report["text_encoder"] = self._offload_delta(
-            text_encoder_before, text_encoder_after
-        )
+        self._offload_report["text_encoder"] = self._offload_delta(text_encoder_before, text_encoder_after)
 
         prompt_manifest = {
             "policy": "source/target prompt; bridge fallback; then neutral 'an image'",
@@ -1045,9 +1003,7 @@ class FlowMorphRunner:
             )
         vae_config = getattr(pipe.vae, "config", None)
         loaded_patch_size = (
-            vae_config.get("patch_size")
-            if isinstance(vae_config, Mapping)
-            else getattr(vae_config, "patch_size", None)
+            vae_config.get("patch_size") if isinstance(vae_config, Mapping) else getattr(vae_config, "patch_size", None)
         )
         if loaded_patch_size is None:
             raise PipelineError("loaded FLUX.2 VAE config does not expose patch_size")
@@ -1097,12 +1053,8 @@ class FlowMorphRunner:
 
     def _write_schedule(self) -> None:
         assert self.schedule is not None
-        start = get_start_state_metadata(
-            self.schedule, self.config.flowmorph.start_timestep_index
-        )
-        chain = get_render_chain(
-            self.schedule, self.config.flowmorph.render_indices
-        )
+        start = get_start_state_metadata(self.schedule, self.config.flowmorph.start_timestep_index)
+        chain = get_render_chain(self.schedule, self.config.flowmorph.render_indices)
         payload = {
             "scheduler_points": self.schedule.num_inference_steps,
             "image_seq_len": self.schedule.image_seq_len,
@@ -1169,9 +1121,11 @@ class FlowMorphRunner:
         ids = self.image_ids.to(self.device)
         conditional = self.conditioning_cache.source.to(self.device)
         unconditional = self.conditioning_cache.unconditional.to(self.device)
-        timestep = self.schedule.timesteps[self.config.flowmorph.start_timestep_index].to(
-            self.device
-        ) if self.schedule is not None else torch.tensor(0.0, device=self.device)
+        timestep = (
+            self.schedule.timesteps[self.config.flowmorph.start_timestep_index].to(self.device)
+            if self.schedule is not None
+            else torch.tensor(0.0, device=self.device)
+        )
 
         disable = getattr(self.pipeline, "disable_lora", None)
         enable = getattr(self.pipeline, "enable_lora", None)
@@ -1206,13 +1160,9 @@ class FlowMorphRunner:
                 cfg_execution=self.config.guidance.execution.value,
             )
         numerical = compare_lora_velocities(baseline, adapted)
-        activation = verify_active_adapter(
-            self.pipeline, self.config.lora.adapter_name, strict=True
-        )
+        activation = verify_active_adapter(self.pipeline, self.config.lora.adapter_name, strict=True)
         if not numerical.changed:
-            raise PipelineError(
-                "LoRA is registered but did not change the deterministic velocity smoke test"
-            )
+            raise PipelineError("LoRA is registered but did not change the deterministic velocity smoke test")
         self.lora_report = {
             "status": "verified",
             "load": self.lora_load_report.as_dict(),
@@ -1220,9 +1170,7 @@ class FlowMorphRunner:
             "numerical_smoke_test": numerical.as_dict(),
             "fit_scale": self.config.lora.fit_scale,
             "render_scale": self.config.lora.render_scale,
-            "same_fit_and_render_scale": (
-                self.config.lora.fit_scale == self.config.lora.render_scale
-            ),
+            "same_fit_and_render_scale": (self.config.lora.fit_scale == self.config.lora.render_scale),
             "distilled_9b_override": self.config.lora.allow_distilled_9b,
             "fused": False,
             "included_in_output_archive": False,
@@ -1252,15 +1200,9 @@ class FlowMorphRunner:
         self.model.freeze()
         if any(parameter.requires_grad for parameter in self.model.parameters()):
             raise PipelineError("one or more transformer/LoRA parameters remain trainable")
-        self.model_report["gradient_checkpointing_enabled"] = bool(
-            self.config.model.gradient_checkpointing
-        )
-        self.model_report["attention_backend_configured"] = (
-            self.config.model.attention_backend.value
-        )
-        self.model_report["transformer_execution_device"] = str(
-            _module_device(self.pipeline.transformer)
-        )
+        self.model_report["gradient_checkpointing_enabled"] = bool(self.config.model.gradient_checkpointing)
+        self.model_report["attention_backend_configured"] = self.config.model.attention_backend.value
+        self.model_report["transformer_execution_device"] = str(_module_device(self.pipeline.transformer))
         _write_json(self.run_directory / "model_report.json", self.model_report)
 
     def _bound_predictor(self) -> _BoundCFGVelocityPredictor:
@@ -1291,16 +1233,12 @@ class FlowMorphRunner:
         previous_probe_history: list[dict[str, Any]] = []
         if report_path.is_file():
             try:
-                previous_memory_report = json.loads(
-                    report_path.read_text(encoding="utf-8")
-                )
+                previous_memory_report = json.loads(report_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 previous_memory_report = {}
             recorded_history = previous_memory_report.get("probe_history")
             if isinstance(recorded_history, list):
-                previous_probe_history = [
-                    dict(item) for item in recorded_history if isinstance(item, Mapping)
-                ]
+                previous_probe_history = [dict(item) for item in recorded_history if isinstance(item, Mapping)]
             else:
                 legacy_probe = previous_memory_report.get("backward_probe")
                 if isinstance(legacy_probe, Mapping):
@@ -1319,9 +1257,7 @@ class FlowMorphRunner:
             "automatic_profile_switching": False,
             "semantic_controls_held_fixed": [
                 "9B model and revision",
-                (
-                    f"{self.config.input.width}x{self.config.input.height} resolution"
-                ),
+                (f"{self.config.input.width}x{self.config.input.height} resolution"),
                 f"{self.config.flowmorph.scheduler_points} scheduler points",
                 (
                     f"{self.config.flowmorph.optimization_steps_source}/"
@@ -1336,13 +1272,9 @@ class FlowMorphRunner:
             ),
         }
         try:
-            _, model, cache, source_latent, _, image_ids, schedule = (
-                self._require_prepared_values()
-            )
+            _, model, cache, source_latent, _, image_ids, schedule = self._require_prepared_values()
             assert self.device is not None
-            start = get_start_state_metadata(
-                schedule, self.config.flowmorph.start_timestep_index
-            )
+            start = get_start_state_metadata(schedule, self.config.flowmorph.start_timestep_index)
 
             def attempt_probe() -> tuple[BackwardProbeReport, tuple[int, ...]]:
                 conditional = cache.source.to(self.device)
@@ -1366,9 +1298,7 @@ class FlowMorphRunner:
                     z=z,
                     sigma_i=start.sigma_i,
                     sigma_last=start.sigma_last,
-                    timestep=schedule.timesteps[
-                        self.config.flowmorph.start_timestep_index
-                    ].to(self.device),
+                    timestep=schedule.timesteps[self.config.flowmorph.start_timestep_index].to(self.device),
                     predict_velocity=predict,
                     frozen_parameters=model.parameters(),
                 )
@@ -1395,9 +1325,7 @@ class FlowMorphRunner:
                             "attempt": attempt_number,
                             "profile": self.config.model.profile.value,
                             "status": "out_of_memory" if oom else "failed",
-                            "error": redact_secrets(
-                                f"{type(attempt_error).__name__}: {attempt_error}"
-                            ),
+                            "error": redact_secrets(f"{type(attempt_error).__name__}: {attempt_error}"),
                             "memory": cuda_memory_snapshot(self.device),
                         }
                     )
@@ -1415,9 +1343,7 @@ class FlowMorphRunner:
                         "oom_retry_policy": retry_policy,
                         "support_claim": "not_yet_established",
                     }
-                    _write_json(
-                        self.run_directory / "memory_report.json", self.memory_report
-                    )
+                    _write_json(self.run_directory / "memory_report.json", self.memory_report)
                     self._log(
                         "production backward probe OOM; released probe tensors and "
                         "retrying the explicitly selected profile once"
@@ -1458,9 +1384,7 @@ class FlowMorphRunner:
             self.manifest["backward_probe_status"] = "passed"
             self.manifest["last_backward_probe_at"] = recorded_at
             self.model_report["production_backward_probe"] = "passed"
-            self.model_report["production_backward_probe_attempts"] = len(
-                probe_attempts
-            )
+            self.model_report["production_backward_probe_attempts"] = len(probe_attempts)
             _write_json(self.run_directory / "model_report.json", self.model_report)
             self._write_manifest()
             if not self._at_least(RunPhase.BACKWARD_PREFLIGHT_PASSED):
@@ -1499,14 +1423,9 @@ class FlowMorphRunner:
             error.__traceback__ = None
             release_cuda_memory()
             try:
-                self.archive_report = create_run_archive(
-                    self.run_directory, self.run_id
-                )
+                self.archive_report = create_run_archive(self.run_directory, self.run_id)
             except Exception as packaging_error:
-                self._log(
-                    "diagnostic archive creation also failed: "
-                    + redact_secrets(str(packaging_error))
-                )
+                self._log("diagnostic archive creation also failed: " + redact_secrets(str(packaging_error)))
             raise
 
     def run(self, *, resume: bool = False) -> FlowMorphRunResult:
@@ -1524,22 +1443,16 @@ class FlowMorphRunner:
                 self.prepare(resume=resume)
             if self._session_backward_probe_report is None:
                 if not self.config.memory.run_production_backward_probe:
-                    raise PipelineError(
-                        "production backward probe is mandatory for this implementation"
-                    )
+                    raise PipelineError("production backward probe is mandatory for this implementation")
                 self.run_production_backward_probe()
 
             self._set_lora_scale(self.config.lora.fit_scale)
-            self.source_endpoint, source_rows = self._fit_endpoint(
-                "source", resume=resume
-            )
+            self.source_endpoint, source_rows = self._fit_endpoint("source", resume=resume)
             if not self._at_least(RunPhase.SOURCE_CHECKPOINTED):
                 self._advance(RunPhase.SOURCE_CHECKPOINTED)
             release_cuda_memory()
 
-            self.target_endpoint, target_rows = self._fit_endpoint(
-                "target", resume=resume
-            )
+            self.target_endpoint, target_rows = self._fit_endpoint("target", resume=resume)
             if not self._at_least(RunPhase.TARGET_CHECKPOINTED):
                 self._advance(RunPhase.TARGET_CHECKPOINTED)
             release_cuda_memory()
@@ -1547,13 +1460,8 @@ class FlowMorphRunner:
             self._set_lora_scale(self.config.lora.render_scale)
             latent_frames = self._render_latents()
             source_conditioning_frames = None
-            if (
-                self.config.flowmorph.render_conditioning_mode
-                is RenderConditioningMode.INTERPOLATED_EMBEDDINGS
-            ):
-                source_conditioning_frames = self._render_latents(
-                    conditioning_mode=RenderConditioningMode.SOURCE
-                )
+            if self.config.flowmorph.render_conditioning_mode is RenderConditioningMode.INTERPOLATED_EMBEDDINGS:
+                source_conditioning_frames = self._render_latents(conditioning_mode=RenderConditioningMode.SOURCE)
             raw_images, display_images = self._decode_and_save_frames(
                 latent_frames,
                 source_conditioning_frames=source_conditioning_frames,
@@ -1576,9 +1484,7 @@ class FlowMorphRunner:
                     "display_frame_count": len(display_images),
                     "metrics_status": "complete",
                     "reference_reproduction_claimed": False,
-                    "result_interpretation": (
-                        "local single-pair reproduction run; not a reproduction of paper tables"
-                    ),
+                    "result_interpretation": ("local single-pair reproduction run; not a reproduction of paper tables"),
                 }
             )
             self._write_manifest()
@@ -1593,21 +1499,16 @@ class FlowMorphRunner:
                 expected_model_id=self.config.model.id,
                 require_lora=self.config.lora.source is not None,
                 require_conditioning_comparison=(
-                    self.config.flowmorph.render_conditioning_mode
-                    is RenderConditioningMode.INTERPOLATED_EMBEDDINGS
+                    self.config.flowmorph.render_conditioning_mode is RenderConditioningMode.INTERPOLATED_EMBEDDINGS
                 ),
             )
             # Validate a preliminary archive before labeling the phase. The
             # final rebuild below includes the updated phase and checksum.
             if self.config.output.create_zip:
-                self.archive_report = create_run_archive(
-                    self.run_directory, self.run_id
-                )
+                self.archive_report = create_run_archive(self.run_directory, self.run_id)
                 if not self._at_least(RunPhase.ARCHIVE_VALIDATED):
                     self._advance(RunPhase.ARCHIVE_VALIDATED)
-                self.archive_report = create_run_archive(
-                    self.run_directory, self.run_id
-                )
+                self.archive_report = create_run_archive(self.run_directory, self.run_id)
                 self._maybe_copy_archive_to_drive()
             else:
                 self.manifest["archive_status"] = "disabled_by_explicit_configuration"
@@ -1641,12 +1542,8 @@ class FlowMorphRunner:
         verify_active_adapter(self.pipeline, self.config.lora.adapter_name, strict=True)
 
     def _endpoint_metadata(self, label: str) -> dict[str, Any]:
-        _, _, cache, source_latent, target_latent, _, schedule = (
-            self._require_prepared_values()
-        )
-        preprocessed = (
-            self.source_preprocessed if label == "source" else self.target_preprocessed
-        )
+        _, _, cache, source_latent, target_latent, _, schedule = self._require_prepared_values()
+        preprocessed = self.source_preprocessed if label == "source" else self.target_preprocessed
         latent = source_latent if label == "source" else target_latent
         conditioning = cache.source if label == "source" else cache.target
         if preprocessed is None or preprocessed.output_path is None:
@@ -1658,9 +1555,7 @@ class FlowMorphRunner:
             lora_source = self.lora_load_report.source.repo_id or "local_safetensors"
             lora_revision = self.lora_load_report.source.resolved_revision
             lora_sha = self.lora_load_report.source.sha256
-        start = get_start_state_metadata(
-            schedule, self.config.flowmorph.start_timestep_index
-        )
+        start = get_start_state_metadata(schedule, self.config.flowmorph.start_timestep_index)
         return {
             "schema_version": 1,
             "endpoint": label,
@@ -1692,9 +1587,7 @@ class FlowMorphRunner:
                 "pred_learning_rate": self.config.flowmorph.pred_learning_rate,
                 "u_learning_rate": self.config.flowmorph.u_learning_rate,
                 "weight_decay": (
-                    0.01
-                    if self.config.flowmorph.weight_decay is None
-                    else self.config.flowmorph.weight_decay
+                    0.01 if self.config.flowmorph.weight_decay is None else self.config.flowmorph.weight_decay
                 ),
             },
             "loss_mode": self.config.flowmorph.loss_mode.value,
@@ -1728,14 +1621,10 @@ class FlowMorphRunner:
             checkpoint_every=self.config.flowmorph.checkpoint_every,
         )
 
-    def _fit_endpoint(
-        self, label: str, *, resume: bool
-    ) -> tuple[FlowMorphEndpoint, list[dict[str, Any]]]:
+    def _fit_endpoint(self, label: str, *, resume: bool) -> tuple[FlowMorphEndpoint, list[dict[str, Any]]]:
         if label not in {"source", "target"}:
             raise ValueError("endpoint label must be source or target")
-        _, model, cache, source_latent, target_latent, _, schedule = (
-            self._require_prepared_values()
-        )
+        _, model, cache, source_latent, target_latent, _, schedule = self._require_prepared_values()
         assert self.device is not None
         z_cpu = source_latent if label == "source" else target_latent
         conditioning_cpu = cache.source if label == "source" else cache.target
@@ -1752,9 +1641,7 @@ class FlowMorphRunner:
         previous_rows = self._read_csv_rows(csv_path)
         if checkpoint_directory.exists():
             if not resume:
-                raise PipelineError(
-                    f"{label} checkpoint already exists; use explicit resume to avoid overwriting it"
-                )
+                raise PipelineError(f"{label} checkpoint already exists; use explicit resume to avoid overwriting it")
             loaded = load_endpoint_checkpoint(
                 checkpoint_directory,
                 expected_metadata=metadata,
@@ -1776,17 +1663,11 @@ class FlowMorphRunner:
                     timestep_i=metadata["timestep_i"],
                 )
                 if not previous_rows:
-                    raise CheckpointError(
-                        f"completed {label} checkpoint lacks optimization history"
-                    )
+                    raise CheckpointError(f"completed {label} checkpoint lacks optimization history")
                 return endpoint, previous_rows
             descriptor = loaded.metadata.get("optimizer_state")
-            if not loaded.metadata.get("optimizer_state_saved") or not isinstance(
-                descriptor, Mapping
-            ):
-                raise CheckpointError(
-                    f"incomplete {label} checkpoint has no optimizer moments for exact resume"
-                )
+            if not loaded.metadata.get("optimizer_state_saved") or not isinstance(descriptor, Mapping):
+                raise CheckpointError(f"incomplete {label} checkpoint has no optimizer moments for exact resume")
             optimizer_state = unflatten_optimizer_state(loaded.tensors, descriptor)
 
         z = z_cpu.to(self.device, dtype=torch.float32)
@@ -1817,16 +1698,12 @@ class FlowMorphRunner:
             self.manifest[f"{label}_completed_steps"] = step
             self._write_manifest()
 
-        start = get_start_state_metadata(
-            schedule, self.config.flowmorph.start_timestep_index
-        )
+        start = get_start_state_metadata(schedule, self.config.flowmorph.start_timestep_index)
         result: EndpointOptimizationResult = optimize_endpoint(
             z,
             sigma_i=start.sigma_i,
             sigma_last=start.sigma_last,
-            timestep_i=schedule.timesteps[
-                self.config.flowmorph.start_timestep_index
-            ].to(self.device),
+            timestep_i=schedule.timesteps[self.config.flowmorph.start_timestep_index].to(self.device),
             predictor=predictor,
             conditioning=conditioning,
             config=settings,
@@ -1886,17 +1763,13 @@ class FlowMorphRunner:
         return rows
 
     @staticmethod
-    def _merge_history(
-        previous: Sequence[dict[str, Any]], new: Sequence[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def _merge_history(previous: Sequence[dict[str, Any]], new: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         by_step: dict[int, dict[str, Any]] = {}
         for row in (*previous, *new):
             by_step[int(row["step"])] = dict(row)
         return [by_step[step] for step in sorted(by_step)]
 
-    def _write_history_snapshot(
-        self, path: Path, rows: Sequence[dict[str, Any]]
-    ) -> None:
+    def _write_history_snapshot(self, path: Path, rows: Sequence[dict[str, Any]]) -> None:
         merged = self._merge_history((), rows)
         if merged:
             write_csv(path, merged)
@@ -1920,15 +1793,10 @@ class FlowMorphRunner:
             predictor=predictor,
             source_conditioning=cache.source.to(self.device),
             target_conditioning=cache.target.to(self.device),
-            bridge_conditioning=(
-                cache.bridge.to(self.device) if cache.bridge is not None else None
-            ),
+            bridge_conditioning=(cache.bridge.to(self.device) if cache.bridge is not None else None),
             frame_count=self.config.flowmorph.frame_count,
             render_indices=self.config.flowmorph.render_indices,
-            conditioning_mode=(
-                conditioning_mode
-                or self.config.flowmorph.render_conditioning_mode
-            ),
+            conditioning_mode=(conditioning_mode or self.config.flowmorph.render_conditioning_mode),
             conditioning_interpolator=interpolate_conditioning,
             output_dtype=torch.float32,
             use_inference_mode=True,
@@ -1946,9 +1814,7 @@ class FlowMorphRunner:
 
     def _decode_one(self, tokens: torch.Tensor) -> Image.Image:
         assert self.pipeline is not None and self.image_ids is not None and self.device is not None
-        vae_dtype = _module_dtype(
-            self.pipeline.vae, _torch_dtype(self.config.model.transformer_compute_dtype)
-        )
+        vae_dtype = _module_dtype(self.pipeline.vae, _torch_dtype(self.config.model.transformer_compute_dtype))
         result = decode_packed_latent(
             tokens.to(self.device, dtype=vae_dtype),
             self.image_ids.to(self.device),
@@ -1983,9 +1849,7 @@ class FlowMorphRunner:
                 raw_images.append(self._decode_one(frame.final_latent))
             if source_conditioning_frames is not None:
                 for frame in source_conditioning_frames:
-                    source_conditioning_images.append(
-                        self._decode_one(frame.final_latent)
-                    )
+                    source_conditioning_images.append(self._decode_one(frame.final_latent))
         if len(raw_images) != self.config.flowmorph.frame_count:
             raise PipelineError("decoded raw frame count does not match configuration")
         raw_directory = self.run_directory / "raw_frames"
@@ -2006,8 +1870,7 @@ class FlowMorphRunner:
         if source_conditioning_frames is not None:
             if len(source_conditioning_images) != len(raw_images):
                 raise PipelineError(
-                    "source-conditioning comparison frame count does not match the "
-                    "interpolated-embedding render"
+                    "source-conditioning comparison frame count does not match the interpolated-embedding render"
                 )
             comparison_directory = self.run_directory / "conditioning_comparison"
             baseline_directory = comparison_directory / "source_conditioning_frames"
@@ -2016,9 +1879,7 @@ class FlowMorphRunner:
                 image.save(baseline_directory / f"frame_{index:03d}.png")
             paired_images: list[Image.Image] = []
             paired_labels: list[str] = []
-            for index, (primary, baseline) in enumerate(
-                zip(raw_images, source_conditioning_images, strict=True)
-            ):
+            for index, (primary, baseline) in enumerate(zip(raw_images, source_conditioning_images, strict=True)):
                 paired_images.extend((primary, baseline))
                 paired_labels.extend(
                     (
@@ -2039,13 +1900,9 @@ class FlowMorphRunner:
                 "frame_count_per_mode": len(raw_images),
                 "primary_frames": "raw_frames",
                 "baseline_frames": "conditioning_comparison/source_conditioning_frames",
-                "paired_contact_sheet": (
-                    "conditioning_comparison/interpolated_vs_source.png"
-                ),
+                "paired_contact_sheet": ("conditioning_comparison/interpolated_vs_source.png"),
             }
-            _write_json(
-                comparison_directory / "comparison.json", comparison_report
-            )
+            _write_json(comparison_directory / "comparison.json", comparison_report)
             self.manifest["conditioning_comparison"] = comparison_report
             self._write_manifest()
         _move_module(self.pipeline.vae, "cpu")
@@ -2091,12 +1948,8 @@ class FlowMorphRunner:
         for name, image in saved.items():
             image.save(endpoint_directory / f"{name}.png")
         if self.config.output.save_difference_images:
-            difference_image(source_reference, source_generated).save(
-                endpoint_directory / "source_difference.png"
-            )
-            difference_image(target_reference, target_generated).save(
-                endpoint_directory / "target_difference.png"
-            )
+            difference_image(source_reference, source_generated).save(endpoint_directory / "source_difference.png")
+            difference_image(target_reference, target_generated).save(endpoint_directory / "target_difference.png")
         source_metrics = endpoint_reconstruction_metrics(
             source_reference,
             source_generated,
@@ -2123,9 +1976,7 @@ class FlowMorphRunner:
             transition_rows,
         )
         metrics = {
-            "interpretation": (
-                "local single-pair metrics; not a reproduction of FlowMorph paper tables"
-            ),
+            "interpretation": ("local single-pair metrics; not a reproduction of FlowMorph paper tables"),
             "metric_implementations": {
                 "psnr": "project implementation, RGB [0,1]",
                 "ssim": "skimage.metrics.structural_similarity, channel_axis=-1",
@@ -2202,13 +2053,9 @@ class FlowMorphRunner:
         )
         copied_sha256 = sha256_file(copied_archive)
         if copied_sha256 != self.archive_report.sha256:
-            raise PipelineError(
-                "Drive archive checksum does not match the locally validated archive"
-            )
+            raise PipelineError("Drive archive checksum does not match the locally validated archive")
         manifest_source = self.run_directory / "run_manifest.json"
-        manifest_destination = self.config.paths.drive_root / "manifests" / (
-            f"{self.run_id}.json"
-        )
+        manifest_destination = self.config.paths.drive_root / "manifests" / (f"{self.run_id}.json")
         manifest_destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(manifest_source, manifest_destination)
         if sha256_file(manifest_source) != sha256_file(manifest_destination):

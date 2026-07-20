@@ -48,8 +48,18 @@ from .types import (
 
 
 BASE_MODEL_ID = "black-forest-labs/FLUX.2-klein-base-9B"
+MIRROR_MODEL_ID = "Runware/BFL-FLUX.2-klein-base-9B"
 FP8_MODEL_ID = "black-forest-labs/FLUX.2-klein-base-9b-fp8"
-ALLOWED_MODEL_IDS = frozenset({BASE_MODEL_ID, FP8_MODEL_ID})
+BASE_MODEL_REVISION = "32773329fbe7e81a90ef971740e8ba4b0364ecf3"
+MIRROR_MODEL_REVISION = "52d7274119d8a2b67f4fba1a43694d9169a44851"
+FP8_MODEL_REVISION = "9ecf2143d71542449960c5584340269c6d401449"
+BF16_BASE_MODEL_IDS = frozenset({BASE_MODEL_ID, MIRROR_MODEL_ID})
+ALLOWED_MODEL_IDS = frozenset({*BF16_BASE_MODEL_IDS, FP8_MODEL_ID})
+MODEL_REVISIONS = {
+    BASE_MODEL_ID: BASE_MODEL_REVISION,
+    MIRROR_MODEL_ID: MIRROR_MODEL_REVISION,
+    FP8_MODEL_ID: FP8_MODEL_REVISION,
+}
 REFERENCE_RENDER_INDICES = (35, 55, 75, 95)
 
 
@@ -73,9 +83,7 @@ class ProjectConfig(StrictConfigModel):
 class PathsConfig(StrictConfigModel):
     input_root: Path = Path("/content/flowmorph_klein_images/max_v1")
     work_root: Path = Path("/content/flowmorph_klein_work/max_v1")
-    result_root: Path = Path(
-        "/content/flowmorph_klein_results/max_v1/full_lora_reproduction_v1"
-    )
+    result_root: Path = Path("/content/flowmorph_klein_results/max_v1/full_lora_reproduction_v1")
     hf_cache: Path = Path("/content/hf_cache")
     drive_root: Path | None = Path("/content/drive/MyDrive/FlowMorphKlein9B")
 
@@ -97,18 +105,14 @@ class ModelConfig(StrictConfigModel):
         if value not in ALLOWED_MODEL_IDS:
             raise ValueError(
                 "model.id must be the FLUX.2 Klein Base 9B model or its explicit "
-                "experimental Base-9B FP8 variant; FLUX.1, 4B, and distilled "
-                "models are not supported"
+                "pinned public Runware mirror or experimental Base-9B FP8 variant; "
+                "FLUX.1, 4B, and distilled models are not supported"
             )
         return value
 
     @model_validator(mode="after")
     def validate_quantization_matches_model_artifact(self) -> "ModelConfig":
-        expected = (
-            QuantizationMode.FP8
-            if self.id == FP8_MODEL_ID
-            else QuantizationMode.NONE
-        )
+        expected = QuantizationMode.FP8 if self.id == FP8_MODEL_ID else QuantizationMode.NONE
         if self.quantization is not expected:
             raise ValueError(
                 f"model.quantization must be {expected.value!r} for model.id "
@@ -122,9 +126,7 @@ class LoraConfig(StrictConfigModel):
     revision: str | None = None
     subfolder: str | None = None
     weight_name: str | None = None
-    adapter_name: str = Field(
-        default="flowmorph_adapter", pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
-    )
+    adapter_name: str = Field(default="flowmorph_adapter", pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
     fit_scale: float = Field(default=1.0, ge=0.0)
     render_scale: float = Field(default=1.0, ge=0.0)
     require_base_9b_compatibility: bool = True
@@ -147,24 +149,19 @@ class LoraConfig(StrictConfigModel):
             r"(?i)[?&](?:token|access_token|auth|authorization)=[^&\s]+",
             value,
         ):
-            raise ValueError(
-                "lora.source must not embed credentials; use HF_TOKEN or Colab secrets"
-            )
+            raise ValueError("lora.source must not embed credentials; use HF_TOKEN or Colab secrets")
         return value
 
     @model_validator(mode="after")
     def validate_archive_policy(self) -> "LoraConfig":
-        if self.source is not None and (
-            self.fit_scale <= 0.0 or self.render_scale <= 0.0
-        ):
+        if self.source is not None and (self.fit_scale <= 0.0 or self.render_scale <= 0.0):
             raise ValueError(
                 "a configured LoRA requires positive fit and render scales so activation "
                 "can be demonstrated numerically"
             )
         if self.include_in_output_archive:
             raise ValueError(
-                "version 1 never packages downloaded/user LoRA weights; keep "
-                "lora.include_in_output_archive=false"
+                "version 1 never packages downloaded/user LoRA weights; keep lora.include_in_output_archive=false"
             )
         return self
 
@@ -213,13 +210,9 @@ class FlowMorphConfig(StrictConfigModel):
         if tuple(sorted(set(indices))) != indices:
             raise ValueError("flowmorph.render_indices must be strictly increasing")
         if indices[0] != self.start_timestep_index:
-            raise ValueError(
-                "the first render index must equal flowmorph.start_timestep_index"
-            )
+            raise ValueError("the first render index must equal flowmorph.start_timestep_index")
         if indices[-1] >= self.scheduler_points:
-            raise ValueError(
-                "all render indices must be smaller than flowmorph.scheduler_points"
-            )
+            raise ValueError("all render indices must be smaller than flowmorph.scheduler_points")
         return self
 
 
@@ -270,9 +263,7 @@ class OutputConfig(StrictConfigModel):
         "create_zip",
     )
     @classmethod
-    def require_mandatory_artifacts(
-        cls, value: bool, info: ValidationInfo
-    ) -> bool:
+    def require_mandatory_artifacts(cls, value: bool, info: ValidationInfo) -> bool:
         if not value:
             raise ValueError(
                 f"output.{info.field_name} must be true because the runner and "
@@ -296,9 +287,7 @@ class ReproducibilityConfig(StrictConfigModel):
 
     @field_validator("record_environment", "record_checksums")
     @classmethod
-    def require_provenance_records(
-        cls, value: bool, info: ValidationInfo
-    ) -> bool:
+    def require_provenance_records(cls, value: bool, info: ValidationInfo) -> bool:
         if not value:
             raise ValueError(
                 f"reproducibility.{info.field_name} must be true because the "
@@ -327,23 +316,23 @@ class ProjectTemplateConfig(StrictConfigModel):
         profile = self.model.profile
         if self.model.id == FP8_MODEL_ID:
             if profile is not HardwareProfile.FP8_9B_EXPERIMENTAL:
-                raise ValueError(
-                    "the Base-9B FP8 model requires profile 'fp8_9b_experimental'"
-                )
+                raise ValueError("the Base-9B FP8 model requires profile 'fp8_9b_experimental'")
             if self.run_mode is not RunMode.EXPERIMENTAL:
                 raise ValueError("the Base-9B FP8 model requires run_mode 'experimental'")
         elif profile is HardwareProfile.FP8_9B_EXPERIMENTAL:
             raise ValueError("the FP8 profile requires the Base-9B FP8 model ID")
 
+        if self.model.id == MIRROR_MODEL_ID and self.run_mode is not RunMode.EXPERIMENTAL:
+            raise ValueError(
+                "the public Runware mirror requires run_mode 'experimental' so it "
+                "cannot be mislabeled as the official reference repository"
+            )
+
         if profile is HardwareProfile.UNSUPPORTED_LOW_VRAM:
             if self.run_mode is not RunMode.DIAGNOSTIC:
-                raise ValueError(
-                    "unsupported_low_vram is a diagnostic profile and cannot run fitting"
-                )
+                raise ValueError("unsupported_low_vram is a diagnostic profile and cannot run fitting")
         elif self.run_mode is RunMode.DIAGNOSTIC:
-            raise ValueError(
-                "run_mode 'diagnostic' requires profile 'unsupported_low_vram'"
-            )
+            raise ValueError("run_mode 'diagnostic' requires profile 'unsupported_low_vram'")
 
         if self.lora.fit_scale != self.lora.render_scale:
             warnings.warn(
@@ -355,18 +344,15 @@ class ProjectTemplateConfig(StrictConfigModel):
 
         if self.lora.allow_distilled_9b and self.run_mode is not RunMode.EXPERIMENTAL:
             raise ValueError(
-                "lora.allow_distilled_9b is an explicit mismatch override and requires "
-                "run_mode 'experimental'"
+                "lora.allow_distilled_9b is an explicit mismatch override and requires run_mode 'experimental'"
             )
 
         if (
-            self.flowmorph.render_conditioning_mode
-            is RenderConditioningMode.INTERPOLATED_EMBEDDINGS
+            self.flowmorph.render_conditioning_mode is RenderConditioningMode.INTERPOLATED_EMBEDDINGS
             and self.run_mode is not RunMode.EXPERIMENTAL
         ):
             raise ValueError(
-                "flowmorph.render_conditioning_mode='interpolated_embeddings' "
-                "requires run_mode 'experimental'"
+                "flowmorph.render_conditioning_mode='interpolated_embeddings' requires run_mode 'experimental'"
             )
 
         if self.run_mode is RunMode.REFERENCE:
@@ -433,8 +419,7 @@ class ProjectTemplateConfig(StrictConfigModel):
         ]
         if mismatches:
             raise ValueError(
-                "the selected production profile cannot silently change semantics: "
-                + ", ".join(mismatches)
+                "the selected production profile cannot silently change semantics: " + ", ".join(mismatches)
             )
 
     def _validate_reference_contract(self) -> None:
@@ -500,9 +485,7 @@ class ProjectTemplateConfig(StrictConfigModel):
             if actual != required
         ]
         if mismatches:
-            raise ValueError(
-                "reference mode contract violation: " + ", ".join(mismatches)
-            )
+            raise ValueError("reference mode contract violation: " + ", ".join(mismatches))
         if self.lora.fit_scale != self.lora.render_scale:
             raise ValueError("reference mode requires identical LoRA fit/render scales")
 
@@ -527,18 +510,11 @@ class ResolvedRunConfig(ProjectTemplateConfig):
     @model_validator(mode="after")
     def validate_resolved_values(self) -> "ResolvedRunConfig":
         if self.model.profile is HardwareProfile.AUTO:
-            raise ValueError(
-                "model.profile='auto' must be resolved by hardware detection before running"
-            )
-        required_revision = (
-            "9ecf2143d71542449960c5584340269c6d401449"
-            if self.model.id == FP8_MODEL_ID
-            else "32773329fbe7e81a90ef971740e8ba4b0364ecf3"
-        )
+            raise ValueError("model.profile='auto' must be resolved by hardware detection before running")
+        required_revision = MODEL_REVISIONS[self.model.id]
         if self.model.revision != required_revision:
             raise ValueError(
-                f"resolved model revision must be pinned to {required_revision}; "
-                f"received {self.model.revision!r}"
+                f"resolved model revision must be pinned to {required_revision}; received {self.model.revision!r}"
             )
         return self
 
@@ -571,9 +547,7 @@ def load_yaml_mapping(path: str | Path) -> dict[str, Any]:
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
-        raise ConfigurationError(
-            f"configuration {config_path} must contain a YAML mapping at its root"
-        )
+        raise ConfigurationError(f"configuration {config_path} must contain a YAML mapping at its root")
     return loaded
 
 
@@ -600,9 +574,7 @@ def _set_dotted_value(target: dict[str, Any], dotted_key: str, value: Any) -> No
         if existing is None:
             cursor[part] = {}
         elif not isinstance(existing, dict):
-            raise ConfigurationError(
-                f"cannot assign nested override {dotted_key!r}; {part!r} is not a mapping"
-            )
+            raise ConfigurationError(f"cannot assign nested override {dotted_key!r}; {part!r} is not a mapping")
         cursor = cursor[part]
     cursor[parts[-1]] = value
 
@@ -643,9 +615,7 @@ def parse_cli_overrides(arguments: Sequence[str]) -> dict[str, Any]:
             index += 1
             raw_value = arguments[index]
         else:
-            raise ConfigurationError(
-                f"CLI override {argument!r} must use key=value or --key value syntax"
-            )
+            raise ConfigurationError(f"CLI override {argument!r} must use key=value or --key value syntax")
         key = raw_key.strip()
         if not key:
             raise ConfigurationError("CLI override keys cannot be empty")
@@ -722,11 +692,7 @@ def resolve_config(
     # runnable configurations always materialize the audited revision before
     # validation or any model access.
     if data["model"].get("revision") is None:
-        data["model"]["revision"] = (
-            "9ecf2143d71542449960c5584340269c6d401449"
-            if data["model"].get("id") == FP8_MODEL_ID
-            else "32773329fbe7e81a90ef971740e8ba4b0364ecf3"
-        )
+        data["model"]["revision"] = MODEL_REVISIONS[data["model"].get("id")]
     if source_image is not None:
         data["input"]["source_image"] = Path(source_image)
     if target_image is not None:
@@ -739,14 +705,10 @@ def resolve_config(
 
     if check_input_files:
         missing = [
-            str(path)
-            for path in (resolved.input.source_image, resolved.input.target_image)
-            if not path.is_file()
+            str(path) for path in (resolved.input.source_image, resolved.input.target_image) if not path.is_file()
         ]
         if missing:
-            raise ConfigurationError(
-                "endpoint images must exist before model download: " + ", ".join(missing)
-            )
+            raise ConfigurationError("endpoint images must exist before model download: " + ", ".join(missing))
     return resolved
 
 

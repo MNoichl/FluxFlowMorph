@@ -19,13 +19,9 @@ from . import DIFFUSERS_COMMIT, MODEL_ID, MODEL_REVISION
 
 
 _TOKEN_RE = re.compile(r"hf_[A-Za-z0-9]{8,}")
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)((?:hf[_-]?token|huggingface[_-]?token|authorization)\s*[:=]\s*)[^\s,;]+"
-)
+_SECRET_ASSIGNMENT_RE = re.compile(r"(?i)((?:hf[_-]?token|huggingface[_-]?token|authorization)\s*[:=]\s*)[^\s,;]+")
 _BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
-_QUERY_SECRET_RE = re.compile(
-    r"(?i)([?&](?:token|access_token|auth|authorization)=)[^&\s]+"
-)
+_QUERY_SECRET_RE = re.compile(r"(?i)([?&](?:token|access_token|auth|authorization)=)[^&\s]+")
 
 
 class EnvironmentValidationError(RuntimeError):
@@ -38,7 +34,7 @@ class ModelAccessError(EnvironmentValidationError):
 
 @dataclass(frozen=True)
 class AuthenticationResult:
-    token: str
+    token: str | None
     source: str
 
     def __repr__(self) -> str:  # prevent accidental notebook display
@@ -148,12 +144,22 @@ def write_environment(path: str | Path, environment: dict[str, Any] | None = Non
     return output
 
 
-def resolve_hf_token(*, allow_interactive: bool = True) -> AuthenticationResult:
+def resolve_hf_token(
+    *,
+    allow_interactive: bool = True,
+    allow_anonymous: bool = False,
+) -> AuthenticationResult:
     """Resolve HF credentials without printing or persisting the token here."""
 
     environment_token = os.environ.get("HF_TOKEN")
     if environment_token:
         return AuthenticationResult(environment_token, "environment")
+
+    # Public mirror runs should not touch Colab's UI-only Secrets bridge.  A
+    # Colab-backed kernel opened in VS Code can import google.colab but waits
+    # for that bridge until it times out.
+    if allow_anonymous:
+        return AuthenticationResult(None, "anonymous")
 
     try:
         from google.colab import userdata

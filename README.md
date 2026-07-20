@@ -1,9 +1,10 @@
 # FluxFlowMorph
 
 An inspectable, resumable adaptation of
-[FlowMorph](https://github.com/VITA-Group/FlowMorph) for exactly
-`black-forest-labs/FLUX.2-klein-base-9B`, with one optional user-supplied
-FLUX.2 Klein Base 9B LoRA.
+[FlowMorph](https://github.com/VITA-Group/FlowMorph) for FLUX.2 Klein Base 9B,
+with one optional user-supplied LoRA. The official repository remains the
+reference source; an explicitly labeled experimental art mode supports the
+pinned public `Runware/BFL-FLUX.2-klein-base-9B` mirror.
 
 The implementation freezes the transformer, active LoRA, VAE, and text
 encoder; fits only FP32 endpoint variables `pred` and `u`; fits source and
@@ -50,16 +51,20 @@ in standard Colab or through the VS Code Colab extension. Its first
 configuration cell exposes plain Python variables, including:
 
 ```python
-MODEL_ID = "black-forest-labs/FLUX.2-klein-base-9B"
+RUN_MODE = "experimental"
+MODEL_ID = "Runware/BFL-FLUX.2-klein-base-9B"
+MODEL_REVISION = "52d7274119d8a2b67f4fba1a43694d9169a44851"
+GENERATE_TEST_ENDPOINTS = True
 LORA_SOURCE = None  # set later to org/repo, HF file URL, resolve URL, or local safetensors
-SOURCE_IMAGE = "/content/flowmorph_klein_images/max_v1/images/source.png"
-TARGET_IMAGE = "/content/flowmorph_klein_images/max_v1/images/target.png"
 PROFILE = "auto"
 ```
 
-Do not paste a Hugging Face token into the notebook. Authentication resolves
-`HF_TOKEN` from the environment, Colab secret storage, or interactive Hub
-login. Accept the model gate/license on Hugging Face first.
+The default notebook preview anonymously downloads the pinned public mirror,
+generates a young-woman source portrait, creates an older-man target
+conditioned on that source, saves both endpoint images, and unloads the preview
+pipeline before fitting. Set `GENERATE_TEST_ENDPOINTS = False` to use your own
+images. The official gated repository and private LoRAs still require
+`HF_TOKEN`; never paste a token into an editable cell.
 
 ## Local development
 

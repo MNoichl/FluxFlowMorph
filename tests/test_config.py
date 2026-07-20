@@ -9,6 +9,8 @@ from pydantic import ValidationError
 from flowmorph_klein.config import (
     BASE_MODEL_ID,
     FP8_MODEL_ID,
+    MIRROR_MODEL_ID,
+    MIRROR_MODEL_REVISION,
     ProjectTemplateConfig,
     canonical_config_hash,
     cli_namespace_overrides,
@@ -53,11 +55,31 @@ def test_forbidden_model_substitutions_fail(model_id: str) -> None:
         ProjectTemplateConfig.model_validate({"model": {"id": model_id}})
 
 
+def test_runware_mirror_requires_explicit_art_mode_and_pinned_revision(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValidationError, match="requires run_mode 'experimental'"):
+        ProjectTemplateConfig.model_validate({"model": {"id": MIRROR_MODEL_ID}})
+
+    source = tmp_path / "source.png"
+    target = tmp_path / "target.png"
+    source.write_bytes(b"source")
+    target.write_bytes(b"target")
+    template = ProjectTemplateConfig.model_validate({"run_mode": "experimental", "model": {"id": MIRROR_MODEL_ID}})
+    resolved = resolve_config(
+        template,
+        selected_profile=HardwareProfile.A100_80GB_FULL,
+        source_image=source,
+        target_image=target,
+    )
+
+    assert resolved.model.id == MIRROR_MODEL_ID
+    assert resolved.model.revision == MIRROR_MODEL_REVISION
+
+
 def test_reference_profile_cannot_silently_reduce_semantics() -> None:
     with pytest.raises(ValidationError, match="cannot silently change semantics"):
-        ProjectTemplateConfig.model_validate(
-            {"flowmorph": {"optimization_steps_source": 10}}
-        )
+        ProjectTemplateConfig.model_validate({"flowmorph": {"optimization_steps_source": 10}})
 
     with pytest.raises(ValidationError, match="cannot silently change semantics"):
         ProjectTemplateConfig.model_validate({"input": {"width": 256}})
@@ -128,9 +150,7 @@ def test_quantization_label_must_match_the_exact_model_artifact() -> None:
             }
         )
     with pytest.raises(ValidationError, match="must be 'none'"):
-        ProjectTemplateConfig.model_validate(
-            {"model": {"id": BASE_MODEL_ID, "quantization": "fp8"}}
-        )
+        ProjectTemplateConfig.model_validate({"model": {"id": BASE_MODEL_ID, "quantization": "fp8"}})
 
 
 @pytest.mark.parametrize(
@@ -209,13 +229,9 @@ def test_low_vram_diagnostic_still_requires_production_shape() -> None:
 
 def test_invalid_render_chain_is_rejected() -> None:
     with pytest.raises(ValidationError, match="strictly increasing"):
-        ProjectTemplateConfig.model_validate(
-            {"flowmorph": {"render_indices": [35, 75, 55, 95]}}
-        )
+        ProjectTemplateConfig.model_validate({"flowmorph": {"render_indices": [35, 75, 55, 95]}})
     with pytest.raises(ValidationError, match="smaller than"):
-        ProjectTemplateConfig.model_validate(
-            {"flowmorph": {"render_indices": [35, 55, 75, 100]}}
-        )
+        ProjectTemplateConfig.model_validate({"flowmorph": {"render_indices": [35, 55, 75, 100]}})
 
 
 def test_resolved_config_requires_paths_and_concrete_profile(tmp_path: Path) -> None:
@@ -306,9 +322,7 @@ def test_lora_source_rejects_embedded_credentials(source: str) -> None:
 
 def test_configured_lora_requires_nonzero_scales() -> None:
     with pytest.raises(ValidationError, match="positive fit and render scales"):
-        ProjectTemplateConfig.model_validate(
-            {"lora": {"source": "org/repo", "fit_scale": 0.0}}
-        )
+        ProjectTemplateConfig.model_validate({"lora": {"source": "org/repo", "fit_scale": 0.0}})
 
 
 @pytest.mark.parametrize(
@@ -365,10 +379,7 @@ def test_interpolated_render_conditioning_is_allowed_in_experimental_mode() -> N
         }
     )
 
-    assert (
-        config.flowmorph.render_conditioning_mode
-        is RenderConditioningMode.INTERPOLATED_EMBEDDINGS
-    )
+    assert config.flowmorph.render_conditioning_mode is RenderConditioningMode.INTERPOLATED_EMBEDDINGS
 
 
 def test_config_hash_is_stable_and_sensitive() -> None:
@@ -376,7 +387,5 @@ def test_config_hash_is_stable_and_sensitive() -> None:
     second = ProjectTemplateConfig()
     assert canonical_config_hash(first) == canonical_config_hash(second)
 
-    smoke = ProjectTemplateConfig.model_validate(
-        {"run_mode": "smoke", "flowmorph": {"frame_count": 3}}
-    )
+    smoke = ProjectTemplateConfig.model_validate({"run_mode": "smoke", "flowmorph": {"frame_count": 3}})
     assert canonical_config_hash(first) != canonical_config_hash(smoke)
