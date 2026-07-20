@@ -1,0 +1,31 @@
+# Diffusers v0.39.0 source inspected on 2026-07-20. This exact commit is
+# intentionally pinned; its project-level 9B CUDA validation status is
+# recorded in IMPLEMENTATION_REPORT.md rather than implied by this file.
+git+https://github.com/huggingface/diffusers.git@a3608b512ed7248499a44c61d954965ed9bdae4d
+transformers==4.56.1
+accelerate==1.12.0
+peft==0.19.1
+safetensors==0.8.0
+huggingface-hub==0.36.2
+hf-xet==1.5.2
+sentencepiece==0.2.2
+protobuf==7.35.1
+pillow==12.3.0
+numpy==2.5.1
+scipy==1.18.0
+pyyaml==6.0.3
+pydantic==2.13.4
+tqdm==4.69.0
+rich==15.0.0
+psutil==7.2.2
+pandas==3.0.3
+matplotlib==3.11.1
+scikit-image==0.26.0
+torchmetrics==1.9.0
+lpips==0.1.4
+moviepy==1.0.3
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+ipywidgets==8.1.8
+anywidget==0.11.0
+zstandard==0.25.0

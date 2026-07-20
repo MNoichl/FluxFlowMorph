@@ -1,0 +1,19 @@
+run_mode: reference
+model:
+  id: black-forest-labs/FLUX.2-klein-base-9B
+  revision: 32773329fbe7e81a90ef971740e8ba4b0364ecf3
+  profile: a100_80gb_full
+  transformer_compute_dtype: bfloat16
+  optimization_parameter_dtype: float32
+  quantization: none
+  gradient_checkpointing: true
+  use_tf32: true
+  attention_backend: sdpa
+memory:
+  text_encoder_offload: true
+  vae_offload: true
+  model_cpu_offload: false
+  sequential_cpu_offload: false
+  allow_degraded_run: false
+  run_production_backward_probe: true
+  save_intermediate_states: false

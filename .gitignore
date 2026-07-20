@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+outputs/
+hf_cache/
+*.flowmorph-klein.zip
+.DS_Store

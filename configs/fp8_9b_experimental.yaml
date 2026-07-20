@@ -1,0 +1,19 @@
+run_mode: experimental
+model:
+  id: black-forest-labs/FLUX.2-klein-base-9b-fp8
+  revision: 9ecf2143d71542449960c5584340269c6d401449
+  profile: fp8_9b_experimental
+  transformer_compute_dtype: bfloat16
+  optimization_parameter_dtype: float32
+  quantization: fp8
+  gradient_checkpointing: true
+  use_tf32: true
+  attention_backend: sdpa
+memory:
+  text_encoder_offload: true
+  vae_offload: true
+  model_cpu_offload: false
+  sequential_cpu_offload: false
+  allow_degraded_run: false
+  run_production_backward_probe: true
+  save_intermediate_states: false

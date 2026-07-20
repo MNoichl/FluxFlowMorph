@@ -1,0 +1,100 @@
+run_mode: reference
+
+project:
+  name: flowmorph_klein_full
+  version: 1
+  repository_root: /content/FlowMorphKlein9B
+
+paths:
+  input_root: /content/flowmorph_klein_images/max_v1
+  work_root: /content/flowmorph_klein_work/max_v1
+  result_root: /content/flowmorph_klein_results/max_v1/full_lora_reproduction_v1
+  hf_cache: /content/hf_cache
+  drive_root: /content/drive/MyDrive/FlowMorphKlein9B
+
+model:
+  id: black-forest-labs/FLUX.2-klein-base-9B
+  revision: 32773329fbe7e81a90ef971740e8ba4b0364ecf3
+  profile: auto
+  transformer_compute_dtype: bfloat16
+  optimization_parameter_dtype: float32
+  quantization: none
+  gradient_checkpointing: true
+  use_tf32: true
+  attention_backend: sdpa
+
+lora:
+  source: null
+  revision: null
+  subfolder: null
+  weight_name: null
+  adapter_name: flowmorph_adapter
+  fit_scale: 1.0
+  render_scale: 1.0
+  require_base_9b_compatibility: true
+  allow_distilled_9b: false
+  include_in_output_archive: false
+
+input:
+  source_image: null
+  target_image: null
+  source_prompt: null
+  target_prompt: null
+  bridge_prompt: a smooth transformation between the two subjects
+  negative_prompt: ""
+  resize_mode: stretch
+  width: 512
+  height: 512
+
+flowmorph:
+  scheduler_points: 100
+  start_timestep_index: 35
+  optimization_steps_source: 100
+  optimization_steps_target: 100
+  pred_learning_rate: 0.04
+  u_learning_rate: 0.01
+  optimizer: adamw
+  weight_decay: null
+  loss_mode: code_l2_norm
+  frame_count: 20
+  interpolation_mode: decoupled
+  render_indices: [35, 55, 75, 95]
+  alpha_schedule: linear
+  render_conditioning_mode: source
+  checkpoint_every: 25
+
+guidance:
+  enabled: true
+  scale: 4.0
+  execution: sequential
+
+memory:
+  text_encoder_offload: true
+  vae_offload: true
+  model_cpu_offload: false
+  sequential_cpu_offload: false
+  allow_degraded_run: false
+  run_production_backward_probe: true
+  save_intermediate_states: false
+
+output:
+  save_raw_frames: true
+  save_display_frames: true
+  save_endpoint_states: true
+  save_optimizer_states: false
+  save_loss_history: true
+  save_difference_images: true
+  save_contact_sheet: true
+  save_webp: true
+  save_gif: true
+  save_mp4: true
+  fps: 12
+  create_zip: true
+  archive_suffix: .flowmorph-klein.zip
+  copy_archive_to_drive: false
+
+reproducibility:
+  seed: 42
+  deterministic_algorithms: false
+  record_environment: true
+  record_checksums: true

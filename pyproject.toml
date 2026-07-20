@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowmorph-klein"
+version = "0.1.0"
+description = "Inspectable FlowMorph adaptation for FLUX.2 Klein Base 9B"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "FlowMorph Klein reproduction contributors" }]
+dependencies = [
+  "huggingface-hub>=0.34,<1",
+  "numpy>=1.26",
+  "pillow>=10",
+  "pydantic>=2.10,<3",
+  "pyyaml>=6",
+  "safetensors>=0.5",
+  "torch>=2.6",
+  "tqdm>=4.66",
+]
+
+[project.scripts]
+flowmorph-klein = "flowmorph_klein.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+  "integration: requires external services or model weights",
+  "flux2_9b: requires the gated FLUX.2 Klein Base 9B model",
+  "requires_gated_access: requires accepted model terms and HF authentication",
+  "requires_lora: requires a user-supplied compatible LoRA",
+  "production_backward: performs a production-shape CUDA backward pass",
+  "full_endpoint: performs a complete 100-step endpoint fit",
+  "full_morph: performs the complete twenty-frame morph",
+  "fp8_experimental: exercises the experimental 9B FP8 profile",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
