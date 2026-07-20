@@ -279,6 +279,24 @@ def _distribution_direct_url(name: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _validate_diffusers_provenance(
+    model_id: str,
+    installed_commit: str | None,
+) -> str:
+    """Return the active provenance policy or reject an official run."""
+
+    if installed_commit == DIFFUSERS_COMMIT:
+        return "exact_inspected_commit"
+    if model_id == MIRROR_MODEL_ID:
+        return "art_mode_version_and_structure"
+    raise PipelineError(
+        "Diffusers must be installed from the exact inspected Git commit for "
+        "official reference/FP8 runs; "
+        f"found provenance {installed_commit!r}, expected {DIFFUSERS_COMMIT!r}. "
+        "Install requirements-colab.txt."
+    )
+
+
 class _BoundCFGVelocityPredictor:
     """Bind fixed CFG and image-ID inputs to the small optimizer protocol."""
 
@@ -802,12 +820,10 @@ class FlowMorphRunner:
         direct_url = _distribution_direct_url("diffusers")
         vcs_info = direct_url.get("vcs_info", {}) if isinstance(direct_url, Mapping) else {}
         installed_commit = vcs_info.get("commit_id") if isinstance(vcs_info, Mapping) else None
-        if installed_commit != DIFFUSERS_COMMIT:
-            raise PipelineError(
-                "Diffusers must be installed from the exact inspected Git commit; "
-                f"found provenance {installed_commit!r}, expected {DIFFUSERS_COMMIT!r}. "
-                "Install requirements-colab.txt."
-            )
+        diffusers_provenance_policy = _validate_diffusers_provenance(
+            self.config.model.id,
+            installed_commit,
+        )
         if type(pipeline).__name__ != "Flux2KleinPipeline":
             raise PipelineError(f"loaded pipeline class is {type(pipeline).__name__}, expected Flux2KleinPipeline")
         config = getattr(pipeline, "config", None)
@@ -896,6 +912,8 @@ class FlowMorphRunner:
             "diffusers_commit_expected": DIFFUSERS_COMMIT,
             "diffusers_version_installed": installed_diffusers_version,
             "diffusers_commit_installed": installed_commit,
+            "diffusers_commit_verified": installed_commit == DIFFUSERS_COMMIT,
+            "diffusers_provenance_policy": diffusers_provenance_policy,
             "diffusers_direct_url": direct_url,
             "model_access": dict(access),
             "base_component_access": self._base_component_access,

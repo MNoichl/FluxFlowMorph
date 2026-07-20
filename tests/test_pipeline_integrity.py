@@ -6,9 +6,15 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
+from flowmorph_klein import MIRROR_MODEL_ID, MODEL_ID
 from flowmorph_klein.colab_io import sha256_file
 from flowmorph_klein.config import ProjectTemplateConfig, resolve_config
-from flowmorph_klein.pipeline import FlowMorphRunner, PipelineError, _is_cuda_out_of_memory
+from flowmorph_klein.pipeline import (
+    FlowMorphRunner,
+    PipelineError,
+    _is_cuda_out_of_memory,
+    _validate_diffusers_provenance,
+)
 from flowmorph_klein.acceptance import RunPhase
 from flowmorph_klein.types import HardwareProfile, RunMode
 
@@ -84,6 +90,15 @@ def test_resume_reuses_verified_preprocessed_images_without_rewriting(
 )
 def test_cuda_oom_classification(error: BaseException, expected: bool) -> None:
     assert _is_cuda_out_of_memory(error) is expected
+
+
+def test_runware_art_mode_accepts_release_wheel_without_git_metadata() -> None:
+    assert (
+        _validate_diffusers_provenance(MIRROR_MODEL_ID, None)
+        == "art_mode_version_and_structure"
+    )
+    with pytest.raises(PipelineError, match="official reference/FP8"):
+        _validate_diffusers_provenance(MODEL_ID, None)
 
 
 def test_public_resume_routes_prepare_through_explicit_resume_mode() -> None:
