@@ -23,9 +23,16 @@ def test_colab_secret_timeout_falls_back_to_interactive_login(monkeypatch):
     colab.userdata = SimpleNamespace(get=timed_out_secret)
     google.colab = colab
 
+    login_calls = []
+    available_token = [None]
+
+    def login_without_version_specific_keywords():
+        login_calls.append(True)
+        available_token[0] = "hf_interactive_test_token"
+
     hub = ModuleType("huggingface_hub")
-    hub.login = lambda *, skip_if_logged_in: None
-    hub.get_token = lambda: "hf_interactive_test_token"
+    hub.login = login_without_version_specific_keywords
+    hub.get_token = lambda: available_token[0]
 
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setitem(sys.modules, "google", google)
@@ -36,3 +43,4 @@ def test_colab_secret_timeout_falls_back_to_interactive_login(monkeypatch):
 
     assert authentication.source == "interactive_login"
     assert authentication.token == "hf_interactive_test_token"
+    assert login_calls == [True]

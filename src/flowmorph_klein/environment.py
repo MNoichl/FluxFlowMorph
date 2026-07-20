@@ -176,8 +176,14 @@ def resolve_hf_token(*, allow_interactive: bool = True) -> AuthenticationResult:
     try:
         from huggingface_hub import get_token, login
 
-        login(skip_if_logged_in=True)
         token = get_token()
+        if not token:
+            # The pinned Colab Hub release does not yet accept the newer
+            # ``skip_if_logged_in`` keyword.  Checking the cache first and
+            # invoking ``login()`` without version-specific arguments works
+            # with both its widget prompt and newer releases.
+            login()
+            token = get_token()
     except Exception as exc:  # hub changes its interactive exception types across versions
         raise ModelAccessError(redact_secrets(f"Hugging Face login failed: {exc}")) from exc
     if not token:
