@@ -96,6 +96,8 @@ def test_notebook_exposes_plain_exact_reference_variables() -> None:
 
 def test_notebook_can_generate_source_conditioned_runware_endpoints() -> None:
     code = _code(_load())
+    assert "UPDATE_REPOSITORY = True" in code
+    assert "MODEL_ID not in ALLOWED_MODEL_IDS" in code
     assert "GENERATE_TEST_ENDPOINTS = True" in code
     assert "Flux2KleinPipeline.from_pretrained(" in code
     preview_load = code.split("Flux2KleinPipeline.from_pretrained(", 1)[1].split(
