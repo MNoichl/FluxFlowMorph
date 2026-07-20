@@ -161,7 +161,13 @@ def resolve_hf_token(*, allow_interactive: bool = True) -> AuthenticationResult:
         colab_token = userdata.get("HF_TOKEN")
         if colab_token:
             return AuthenticationResult(colab_token, "colab_secret")
-    except (ImportError, KeyError, RuntimeError):
+    # ``google.colab`` can be importable from a Colab-backed kernel opened in
+    # VS Code even though its UI-only Secrets bridge is unavailable.  That
+    # bridge raises a custom TimeoutException (not a RuntimeError), so treat
+    # any ordinary lookup failure as "no Colab secret" and continue to the
+    # explicit interactive Hub login below.  BaseException subclasses such as
+    # KeyboardInterrupt and SystemExit still propagate.
+    except Exception:
         pass
 
     if not allow_interactive:
