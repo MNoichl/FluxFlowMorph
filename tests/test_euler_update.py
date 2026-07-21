@@ -6,8 +6,8 @@ from flowmorph_klein.flow_schedule import (
     euler_flow_update,
     get_render_chain,
 )
-from flowmorph_klein.renderer import render_latent_trajectory
-from flowmorph_klein.renderer import select_render_conditioning
+from flowmorph_klein.flow_state import FlowMorphEndpoint
+from flowmorph_klein.renderer import render_latent_trajectory, render_morph, select_render_conditioning
 from flowmorph_klein.types import RenderConditioningMode
 
 
@@ -132,3 +132,55 @@ def test_renderer_conditioning_selection_defaults_to_released_source_behavior() 
         )
         is bridge
     )
+
+
+def test_renderer_uses_one_scheduled_conditioning_per_frame() -> None:
+    class RecordingPredictor(ConstantVelocityPredictor):
+        def __init__(self) -> None:
+            super().__init__(torch.zeros(1))
+            self.conditionings = []
+
+        def predict_velocity(self, state, timestep, conditioning):
+            self.conditionings.append(conditioning)
+            return super().predict_velocity(state, timestep, conditioning)
+
+    endpoint = FlowMorphEndpoint(
+        z=torch.zeros(1),
+        delta=torch.zeros(1),
+        u=torch.zeros(1),
+        sigma_i=0.8,
+        sigma_last=0.0,
+    )
+    schedule = build_flowmorph_schedule(timesteps=[800.0], sigmas=[0.8, 0.0])
+    predictor = RecordingPredictor()
+    scheduled = ("first", "middle", "last")
+
+    frames = render_morph(
+        endpoint,
+        endpoint,
+        schedule=schedule,
+        predictor=predictor,
+        source_conditioning="source",
+        target_conditioning="target",
+        alphas=(0.0, 0.5, 1.0),
+        render_indices=(0,),
+        conditioning_mode="prompt_schedule",
+        frame_conditionings=scheduled,
+    )
+
+    assert predictor.conditionings == list(scheduled)
+    assert len(frames) == 3
+
+    with pytest.raises(ValueError, match="one package per rendered frame"):
+        render_morph(
+            endpoint,
+            endpoint,
+            schedule=schedule,
+            predictor=predictor,
+            source_conditioning="source",
+            target_conditioning="target",
+            alphas=(0.0, 1.0),
+            render_indices=(0,),
+            conditioning_mode="prompt_schedule",
+            frame_conditionings=("only one",),
+        )

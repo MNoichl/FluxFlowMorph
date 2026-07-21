@@ -172,10 +172,18 @@ class InputConfig(StrictConfigModel):
     source_prompt: str | None = None
     target_prompt: str | None = None
     bridge_prompt: str | None = "a smooth transformation between the two subjects"
+    bridge_prompts: tuple[str, ...] | None = None
     negative_prompt: str = ""
     resize_mode: ResizeMode = ResizeMode.STRETCH
     width: int = Field(default=512, gt=0)
     height: int = Field(default=512, gt=0)
+
+    @field_validator("bridge_prompts")
+    @classmethod
+    def validate_bridge_prompts(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is not None and any(not prompt.strip() for prompt in value):
+            raise ValueError("input.bridge_prompts cannot contain blank prompts")
+        return value
 
 
 class ResolvedInputConfig(InputConfig):
@@ -354,6 +362,16 @@ class ProjectTemplateConfig(StrictConfigModel):
             raise ValueError(
                 "flowmorph.render_conditioning_mode='interpolated_embeddings' requires run_mode 'experimental'"
             )
+
+        uses_prompt_schedule = self.flowmorph.render_conditioning_mode is RenderConditioningMode.PROMPT_SCHEDULE
+        if uses_prompt_schedule and self.run_mode is not RunMode.EXPERIMENTAL:
+            raise ValueError("flowmorph.render_conditioning_mode='prompt_schedule' requires run_mode 'experimental'")
+        if uses_prompt_schedule and self.input.bridge_prompts is None:
+            raise ValueError("prompt_schedule rendering requires input.bridge_prompts")
+        if self.input.bridge_prompts is not None and not uses_prompt_schedule:
+            raise ValueError("input.bridge_prompts requires flowmorph.render_conditioning_mode='prompt_schedule'")
+        if uses_prompt_schedule and len(self.input.bridge_prompts or ()) != self.flowmorph.frame_count:
+            raise ValueError("input.bridge_prompts must contain exactly flowmorph.frame_count prompts")
 
         if self.run_mode is RunMode.REFERENCE:
             self._validate_reference_contract()

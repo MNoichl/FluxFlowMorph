@@ -382,6 +382,36 @@ def test_interpolated_render_conditioning_is_allowed_in_experimental_mode() -> N
     assert config.flowmorph.render_conditioning_mode is RenderConditioningMode.INTERPOLATED_EMBEDDINGS
 
 
+def test_prompt_schedule_requires_experimental_mode_and_one_prompt_per_frame() -> None:
+    prompts = [f"frame {index}" for index in range(20)]
+    with pytest.raises(ValidationError, match="requires run_mode 'experimental'"):
+        ProjectTemplateConfig.model_validate(
+            {
+                "input": {"bridge_prompts": prompts},
+                "flowmorph": {"render_conditioning_mode": "prompt_schedule"},
+            }
+        )
+
+    with pytest.raises(ValidationError, match="exactly flowmorph.frame_count"):
+        ProjectTemplateConfig.model_validate(
+            {
+                "run_mode": "experimental",
+                "input": {"bridge_prompts": prompts[:-1]},
+                "flowmorph": {"render_conditioning_mode": "prompt_schedule"},
+            }
+        )
+
+    config = ProjectTemplateConfig.model_validate(
+        {
+            "run_mode": "experimental",
+            "input": {"bridge_prompts": prompts},
+            "flowmorph": {"render_conditioning_mode": "prompt_schedule"},
+        }
+    )
+    assert config.input.bridge_prompts == tuple(prompts)
+    assert config.flowmorph.render_conditioning_mode is RenderConditioningMode.PROMPT_SCHEDULE
+
+
 def test_config_hash_is_stable_and_sensitive() -> None:
     first = ProjectTemplateConfig()
     second = ProjectTemplateConfig()

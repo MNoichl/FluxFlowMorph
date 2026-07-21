@@ -72,6 +72,7 @@ class RenderConditioningMode(StringEnum):
     SOURCE = "source"
     TARGET = "target"
     SHARED_BRIDGE = "shared_bridge"
+    PROMPT_SCHEDULE = "prompt_schedule"
     INTERPOLATED_EMBEDDINGS = "interpolated_embeddings"
     NEAREST_ENDPOINT = "nearest_endpoint"
 

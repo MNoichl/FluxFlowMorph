@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "still_life_cycle_example",
+    "description": "Three painterly table arrangements forming a closed visual loop.",
+    "loop": true
+  },
+  "generation": {
+    "model_id": "Runware/BFL-FLUX.2-klein-base-9B",
+    "model_revision": "52d7274119d8a2b67f4fba1a43694d9169a44851",
+    "width": 512,
+    "height": 512,
+    "num_inference_steps": 28,
+    "guidance_scale": 4.0,
+    "seed": 4200,
+    "prompt_prefix": "RIJKSOIL",
+    "continuity": {
+      "enabled": true,
+      "reference_blend": 0.15,
+      "blur_radius": 12.0,
+      "background_rgb": [127, 127, 127]
+    }
+  },
+  "lora": {
+    "source": "MaxNoichl/RIJKSOIL_FLUX2_KLEIN9B_lora_01_000001650",
+    "revision": "042a31d6cd09bf55195f820461fac60b1a358409",
+    "weight_name": "RIJKSOIL_FLUX2_KLEIN9B_lora_01_000001650.safetensors",
+    "adapter_name": "rijks_oil",
+    "scale": 1.0,
+    "allow_distilled_9b_provenance": true
+  },
+  "flowmorph": {
+    "frame_count": 20,
+    "render_conditioning_mode": "prompt_schedule",
+    "fps": 12.0
+  },
+  "mainframes": [
+    {
+      "id": "pears_and_copper",
+      "prompt": "Painterly still life on a dark walnut table: three green pears beside a low hammered copper bowl, folded umber linen, deep olive wall, soft northern window light from the left, restrained seventeenth-century oil-painting composition, visible brushwork",
+      "seed_offset": 0
+    },
+    {
+      "id": "tulips_and_porcelain",
+      "prompt": "Painterly still life on the same dark walnut table: five pale pink tulips in a blue-and-white porcelain vase, folded cream linen, muted slate wall, soft northern window light from the left, restrained oil-painting composition, visible brushwork",
+      "seed_offset": 1
+    },
+    {
+      "id": "lemons_and_silver",
+      "prompt": "Painterly still life on the same dark walnut table: four yellow lemons beside a small tarnished silver ewer, folded blue-gray linen, smoky charcoal wall, soft northern window light from the left, restrained oil-painting composition, visible brushwork",
+      "seed_offset": 2
+    }
+  ],
+  "transitions": [
+    {
+      "from": "pears_and_copper",
+      "to": "tulips_and_porcelain",
+      "bridge_prompts": [
+        "Dark walnut-table still life of three green pears, low hammered copper bowl and umber linen, olive wall, northern light, painterly oil brushwork",
+        "The three pears remain dominant; the copper bowl grows slightly taller and cooler, umber linen begins to lighten, same table and left window light",
+        "Three pears beside a copper vessel whose rim rises toward a vase shape, olive-brown room, restrained painterly still life",
+        "Two pears and one pear-shaped green bud beside a taller copper vessel, linen shifting from umber to taupe, same composition",
+        "Two green pears and a closed pale bud; copper vessel lengthening upward, hints of cobalt glaze appearing near its base",
+        "One pear, two green pear-buds and a half-copper half-porcelain vessel, cloth now warm gray, northern light unchanged",
+        "One pear and three botanical buds emerging upward; vessel transitioning from hammered copper to blue-white ceramic",
+        "Small pear at the foot of a squat blue-and-copper vase, three short pink buds, muted olive-slate wall",
+        "Pear receding beside a rounded blue-and-white vase, three opening tulip buds, taupe-cream linen, painterly brushwork",
+        "A final green pear beside a porcelain vase with four half-open pale pink tulips; traces of copper warmth remain in the glaze",
+        "Four pale pink tulips now dominate a blue-white vase; pear reduced to a green oval accent, linen midway between taupe and cream",
+        "Five tulip forms in a porcelain vase; the last pear-like accent becomes a leaf, wall cooling toward slate",
+        "Five pale pink tulips, blue-white vase with one copper-colored glaze band, cream-gray cloth, stable walnut table",
+        "Five opening tulips in a mostly porcelain vase; copper band fading, linen lightening, same left northern illumination",
+        "Five pale pink tulips in a blue-and-white vase, only a faint copper reflection, muted slate-green wall",
+        "Tulip still life settled into the original low triangular composition, blue-white vase, cream linen, slate wall",
+        "Five pale tulips with clearer petals and green stems, porcelain ornament sharpening, all pear and copper motifs nearly gone",
+        "Blue-and-white vase and five pink tulips on walnut, folded cream linen, cool slate wall, restrained old-master brushwork",
+        "Five pale pink tulips fully resolved in porcelain, consistent table horizon and soft northern light from the left",
+        "Painterly still life on the same dark walnut table: five pale pink tulips in a blue-and-white porcelain vase, folded cream linen, muted slate wall, soft northern window light from the left, restrained oil-painting composition, visible brushwork"
+      ]
+    },
+    {
+      "from": "tulips_and_porcelain",
+      "to": "lemons_and_silver",
+      "bridge_prompts": [
+        "Five pale pink tulips in a blue-and-white porcelain vase, cream linen and slate wall on the dark walnut table, painterly northern light",
+        "Tulips and porcelain remain; one lowest blossom curls into a pale yellow fruit-like form near the vase base",
+        "Four tulips above the porcelain vase, one small lemon forming on the table, cream cloth beginning to cool",
+        "Four shorter tulips and a clear yellow lemon; blue porcelain glaze develops a silvery reflection",
+        "Three tulips, two yellow lemon forms and a vase whose neck narrows like a metal ewer, same table horizon",
+        "Three fading pink flowers above a half-porcelain half-silver vessel, two lemons, linen turning blue-gray",
+        "Two tulips and two lemons balance around a cool metallic vessel with residual cobalt ornament",
+        "Two short flowers, three lemons and a squat silver-blue ewer, slate wall darkening softly",
+        "One tulip remains above a tarnished vessel; three yellow lemons occupy the former flower silhouette below",
+        "A final pink tulip bends beside three lemons and a mostly silver ewer, cloth equally cream and blue-gray",
+        "Four lemons now dominate; last tulip petal becomes a warm reflected highlight on the silver vessel",
+        "Four yellow lemons and a small tarnished silver ewer with a faint blue porcelain trace, blue-gray linen",
+        "Lemons arranged in the former flower rhythm around the ewer, silver surface resolving, smoky slate wall",
+        "Four lemons beside a compact silver ewer, porcelain pattern nearly absent, cool folded cloth",
+        "Tarnished silver and lemon yellow fully established, same restrained triangular arrangement and walnut table",
+        "Four distinct lemons with leaves, small silver ewer, blue-gray linen, wall shifting from slate to charcoal",
+        "Lemon and silver still life with stable left window light, painterly edges and subdued smoky background",
+        "Four lemons beside a tarnished silver ewer, blue-gray folds clear, dark walnut tabletop unchanged",
+        "Resolved lemon still life, smoky charcoal wall and subtle silver reflections, restrained old-master oil brushwork",
+        "Painterly still life on the same dark walnut table: four yellow lemons beside a small tarnished silver ewer, folded blue-gray linen, smoky charcoal wall, soft northern window light from the left, restrained oil-painting composition, visible brushwork"
+      ]
+    },
+    {
+      "from": "lemons_and_silver",
+      "to": "pears_and_copper",
+      "bridge_prompts": [
+        "Four yellow lemons beside a small tarnished silver ewer, blue-gray linen and smoky charcoal wall on the dark walnut table",
+        "Lemons and silver remain; metal reflections warm slightly and the blue-gray cloth takes on an umber edge",
+        "Four lemons beside a silver ewer developing copper warmth, charcoal wall softening toward brown-olive",
+        "Three lemons and one yellow-green oval fruit; vessel half silver and half tarnished copper",
+        "Three yellow-green fruits beside a low warm metallic ewer, linen balanced between blue-gray and umber",
+        "Two lemons and two ripening green pears, silver neck shortening while copper bowl broadens below",
+        "Two green pears, one lemon and one transitional fruit beside a squat copper-silver vessel",
+        "Three pear-shaped green fruits and a last lemon, vessel collapsing into a low hammered bowl",
+        "Three green pears dominate; a small yellow fruit remains, copper bowl clear, wall shifting toward olive",
+        "Three pears and a fading yellow accent beside the copper bowl, blue-gray cloth warming to taupe",
+        "The yellow accent becomes a green highlight; three pears, low copper bowl and taupe linen",
+        "Three green pears beside a hammered copper bowl with one cool silver reflection, olive-charcoal wall",
+        "Pear-and-copper arrangement settling into a low triangular composition, cloth increasingly umber",
+        "Three pears clearly resolved, copper bowl wider and warmer, smoky background now deep olive",
+        "Green fruit and copper still life under the same northern light, only a faint cool trace in the linen",
+        "Three green pears, hammered bowl and folded warm-brown cloth on walnut, restrained painterly edges",
+        "Pear still life nearly complete; umber linen, deep olive wall and copper reflections fully restored",
+        "Three distinct green pears beside the low copper bowl, stable table horizon, soft left window light",
+        "Resolved pear-and-copper arrangement with deep olive wall and visible old-master oil brushwork",
+        "Painterly still life on a dark walnut table: three green pears beside a low hammered copper bowl, folded umber linen, deep olive wall, soft northern window light from the left, restrained seventeenth-century oil-painting composition, visible brushwork"
+      ]
+    }
+  ]
+}

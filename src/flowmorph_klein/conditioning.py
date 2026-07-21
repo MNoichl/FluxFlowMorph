@@ -112,6 +112,7 @@ class ConditioningCache:
     target: ConditioningPackage
     unconditional: ConditioningPackage
     bridge: ConditioningPackage | None = None
+    prompt_schedule: tuple[ConditioningPackage, ...] = ()
 
     def cpu(self) -> "ConditioningCache":
         return ConditioningCache(
@@ -119,6 +120,7 @@ class ConditioningCache:
             target=self.target.cpu(),
             unconditional=self.unconditional.cpu(),
             bridge=self.bridge.cpu() if self.bridge is not None else None,
+            prompt_schedule=tuple(package.cpu() for package in self.prompt_schedule),
         )
 
     def as_dict(self) -> dict[str, ConditioningPackage]:
@@ -129,14 +131,12 @@ class ConditioningCache:
         }
         if self.bridge is not None:
             result["bridge"] = self.bridge
+        result.update({f"schedule_{index:03d}": package for index, package in enumerate(self.prompt_schedule)})
         return result
 
     @property
     def prompt_hashes(self) -> dict[str, str]:
-        return {
-            name: package.prompt_sha256
-            for name, package in self.as_dict().items()
-        }
+        return {name: package.prompt_sha256 for name, package in self.as_dict().items()}
 
 
 def _clean_optional_prompt(prompt: str | None) -> str | None:
@@ -235,6 +235,7 @@ def build_conditioning_cache(
     source_prompt: str | None,
     target_prompt: str | None,
     bridge_prompt: str | None,
+    bridge_prompts: tuple[str, ...] | list[str] | None = None,
     negative_prompt: str = "",
     neutral_prompt: str = NEUTRAL_PROMPT,
     device: torch.device | str | None = None,
@@ -275,6 +276,7 @@ def build_conditioning_cache(
         target=get(prompts.target),
         unconditional=get(prompts.negative),
         bridge=get(prompts.bridge) if prompts.bridge is not None else None,
+        prompt_schedule=tuple(get(prompt) for prompt in (bridge_prompts or ())),
     )
 
 
@@ -321,6 +323,8 @@ def select_render_conditioning(
         if cache.bridge is None:
             raise ValueError("shared_bridge mode requires bridge conditioning")
         return cache.bridge
+    if normalized_mode == "prompt_schedule":
+        raise ValueError("prompt_schedule conditioning must be selected by frame index")
     if normalized_mode == "interpolated_embeddings":
         return interpolate_conditioning(cache.source, cache.target, alpha)
     if normalized_mode == "nearest_endpoint":

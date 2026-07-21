@@ -87,9 +87,7 @@ def select_render_conditioning(
         return source_conditioning if amount < 0.5 else target_conditioning
     if selected_mode is RenderConditioningMode.INTERPOLATED_EMBEDDINGS:
         if conditioning_interpolator is None:
-            raise ValueError(
-                "interpolated_embeddings requires an explicit compatible-embedding interpolator"
-            )
+            raise ValueError("interpolated_embeddings requires an explicit compatible-embedding interpolator")
         return conditioning_interpolator(source_conditioning, target_conditioning, amount)
     raise AssertionError(f"unhandled conditioning mode: {selected_mode}")
 
@@ -127,9 +125,7 @@ def _require_finite_render_tensor(
     if frame_index is not None:
         context.append(f"frame {frame_index}")
     if step is not None:
-        context.append(
-            f"render step {step.chain_position} (scheduler index {step.current_index})"
-        )
+        context.append(f"render step {step.chain_position} (scheduler index {step.current_index})")
     location = " at " + ", ".join(context) if context else ""
     raise FloatingPointError(f"{quantity} contains non-finite values{location}")
 
@@ -194,6 +190,7 @@ def render_morph(
     render_indices: Sequence[int] = (35, 55, 75, 95),
     conditioning_mode: RenderConditioningMode | str = RenderConditioningMode.SOURCE,
     bridge_conditioning: Any = None,
+    frame_conditionings: Sequence[Any] | None = None,
     conditioning_interpolator: ConditioningInterpolator | None = None,
     output_dtype: torch.dtype | None = None,
     use_inference_mode: bool = True,
@@ -211,6 +208,11 @@ def render_morph(
     coefficients = linear_alphas(frame_count) if alphas is None else tuple(_alpha_value(alpha) for alpha in alphas)
     if not coefficients:
         raise ValueError("at least one alpha is required")
+    if selected_mode is RenderConditioningMode.PROMPT_SCHEDULE:
+        if frame_conditionings is None:
+            raise ValueError("prompt_schedule rendering requires frame_conditionings")
+        if len(frame_conditionings) != len(coefficients):
+            raise ValueError("frame_conditionings must contain one package per rendered frame")
     chain = get_render_chain(schedule, render_indices)
 
     context: ContextManager[Any]
@@ -224,14 +226,18 @@ def render_morph(
                 alpha,
                 output_dtype=output_dtype,
             )
-            conditioning = select_render_conditioning(
-                selected_mode,
-                alpha,
-                source_conditioning=source_conditioning,
-                target_conditioning=target_conditioning,
-                bridge_conditioning=bridge_conditioning,
-                conditioning_interpolator=conditioning_interpolator,
-            )
+            if selected_mode is RenderConditioningMode.PROMPT_SCHEDULE:
+                assert frame_conditionings is not None
+                conditioning = frame_conditionings[index]
+            else:
+                conditioning = select_render_conditioning(
+                    selected_mode,
+                    alpha,
+                    source_conditioning=source_conditioning,
+                    target_conditioning=target_conditioning,
+                    bridge_conditioning=bridge_conditioning,
+                    conditioning_interpolator=conditioning_interpolator,
+                )
             start_state = endpoint.state
             final_latent = render_latent_trajectory(
                 start_state,
