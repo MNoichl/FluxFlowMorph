@@ -143,6 +143,7 @@ cells = [
         RIFE_MULTIPLIER = 4
         RIFE_SCALE = 1.0
         RIFE_USE_FP16 = True
+        RIFE_RETRY_WITH_FP32 = True  # Automatically retry once when the fp16 runner fails.
         RIFE_FINAL_FPS = 24.0
         RIFE_SSIM_ANALYSIS_SIZE = 192
         RIFE_SSIM_WEIGHT_FLOOR = 1e-6
@@ -1268,6 +1269,8 @@ cells = [
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for RIFE")
+        torch.cuda.set_device(0)
+        device = torch.device("cuda:0")
         sys.path.insert(0, str(Path(args.model).resolve().parent))
         sys.path.insert(0, str(Path(args.repo).resolve()))
         from train_log.IFNet_HDv3 import IFNet
@@ -1280,7 +1283,10 @@ cells = [
 
         class InferenceModel:
             def __init__(self, model_directory):
-                self.flownet = IFNet().to("cuda")
+                # Load on CPU first, then move the complete initialized module to
+                # one explicit CUDA device. This avoids mixed CPU/CUDA parameters
+                # with newer torch/checkpoint combinations.
+                self.flownet = IFNet()
                 state = torch.load(
                     str(Path(model_directory) / "flownet.pkl"), map_location="cpu", weights_only=True
                 )
@@ -1288,7 +1294,7 @@ cells = [
                 load_result = self.flownet.load_state_dict(state, strict=False)
                 if load_result.missing_keys:
                     raise RuntimeError(f"RIFE checkpoint missing keys: {load_result.missing_keys}")
-                self.flownet.eval()
+                self.flownet.to(device).eval()
 
             def inference(self, image0, image1, timestep, scale):
                 inputs = torch.cat((image0, image1), dim=1)
@@ -1299,7 +1305,17 @@ cells = [
         model = InferenceModel(args.model)
         if args.fp16:
             model.flownet.half()
-        device = torch.device("cuda")
+        model_dtype = next(model.flownet.parameters()).dtype
+        model_device = next(model.flownet.parameters()).device
+        if model_device != device:
+            raise RuntimeError(f"RIFE model resolved to {model_device}, expected {device}")
+        print({
+            "cuda_device": torch.cuda.get_device_name(device),
+            "torch": torch.__version__,
+            "model_device": str(model_device),
+            "model_dtype": str(model_dtype),
+            "input_pairs": len(input_paths) - 1,
+        }, flush=True)
         first_image = Image.open(input_paths[0]).convert("RGB")
         height, width = first_image.height, first_image.width
         block = max(128, int(128 / args.scale))
@@ -1312,9 +1328,8 @@ cells = [
             if image.size != (width, height):
                 raise ValueError(f"Mismatched input dimensions at {path}: {image.size}")
             array = np.asarray(image, dtype=np.uint8).copy()
-            tensor = torch.from_numpy(array.transpose(2, 0, 1)).unsqueeze(0).to(device).float() / 255.0
-            if args.fp16:
-                tensor = tensor.half()
+            tensor = torch.from_numpy(array.transpose(2, 0, 1)).unsqueeze(0)
+            tensor = tensor.to(device=device, dtype=model_dtype) / 255.0
             return F.pad(tensor, padding)
 
         def save_tensor(tensor, path):
@@ -1378,7 +1393,7 @@ cells = [
                 RIFE_INPUT_DIRECTORY / f"{len(export_frames):07d}.png",
             )
             command = [
-                sys.executable, str(RIFE_RUNNER_PATH),
+                sys.executable, "-u", str(RIFE_RUNNER_PATH),
                 "--repo", str(rife_root),
                 "--model", str(RIFE_MODEL_DIRECTORY),
                 "--input", str(RIFE_INPUT_DIRECTORY),
@@ -1389,7 +1404,43 @@ cells = [
             if RIFE_USE_FP16:
                 command.append("--fp16")
             print(f"Interpolating {len(export_frames)} cyclic pairs at {RIFE_MULTIPLIER}× density...")
-            subprocess.check_call(command)
+
+            def run_rife(command_to_run, label):
+                print(f"RIFE attempt: {label}", flush=True)
+                process = subprocess.Popen(
+                    command_to_run,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                log_lines = []
+                assert process.stdout is not None
+                for line in process.stdout:
+                    log_lines.append(line)
+                    print(line, end="", flush=True)
+                return_code = process.wait()
+                log_text = "".join(log_lines) or "(RIFE produced no subprocess output)"
+                if not log_lines:
+                    print(log_text)
+                return return_code, log_text
+
+            return_code, rife_log = run_rife(
+                command,
+                "fp16" if "--fp16" in command else "fp32",
+            )
+            if return_code != 0 and "--fp16" in command and RIFE_RETRY_WITH_FP32:
+                print("The fp16 RIFE attempt failed; retrying once in fp32.")
+                RIFE_DENSE_DIRECTORY = RIFE_WORK_DIRECTORY / "dense_frames_fp32_retry"
+                retry_command = [item for item in command if item != "--fp16"]
+                output_index = retry_command.index("--output") + 1
+                retry_command[output_index] = str(RIFE_DENSE_DIRECTORY)
+                return_code, rife_log = run_rife(retry_command, "fp32 fallback")
+            if return_code != 0:
+                raise RuntimeError(
+                    "RIFE failed after the available attempt(s). The complete child-process "
+                    "traceback is printed immediately above. Last output:\n" + rife_log[-6000:]
+                )
 
             dense_with_duplicate = sorted(
                 RIFE_DENSE_DIRECTORY.glob("*.png"), key=lambda path: int(path.stem)
