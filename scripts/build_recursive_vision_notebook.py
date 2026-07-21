@@ -1567,7 +1567,12 @@ cells = [
                 raise RuntimeError("SSIM resampling produced duplicate selections")
 
             selected_directory = RIFE_WORK_DIRECTORY / "ssim_resampled_frames"
-            selected_directory.mkdir(parents=True, exist_ok=False)
+            selected_directory.mkdir(parents=True, exist_ok=True)
+            # This is a generated, run-local staging directory. Clear numbered
+            # frames so rerunning this cell cannot leave stale PNGs behind when
+            # timing settings or the selected frame count change.
+            for stale_frame in selected_directory.glob("*.png"):
+                stale_frame.unlink()
             for output_index, dense_index in enumerate(selected_indices):
                 source = RIFE_DENSE_PATHS[dense_index]
                 destination = selected_directory / f"{output_index:07d}.png"
