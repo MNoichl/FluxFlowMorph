@@ -1273,7 +1273,50 @@ cells = [
         device = torch.device("cuda:0")
         sys.path.insert(0, str(Path(args.model).resolve().parent))
         sys.path.insert(0, str(Path(args.repo).resolve()))
+        import train_log.IFNet_HDv3 as rife_ifnet_module
         from train_log.IFNet_HDv3 import IFNet
+
+        # Practical-RIFE's pinned warplayer builds its cached sampling grid in
+        # float32. torch.grid_sample requires input and grid to share a dtype,
+        # so that implementation fails when the network runs in fp16. Replace
+        # the function in IFNet's module namespace with a device/dtype-aware
+        # equivalent while retaining the pinned model and weights.
+        rife_grid_cache = {}
+
+        def dtype_safe_warp(tensor_input, tensor_flow):
+            cache_key = (
+                str(tensor_flow.device),
+                str(tensor_flow.dtype),
+                tuple(tensor_flow.shape),
+            )
+            if cache_key not in rife_grid_cache:
+                horizontal = torch.linspace(
+                    -1.0, 1.0, tensor_flow.shape[3],
+                    device=tensor_flow.device, dtype=tensor_flow.dtype,
+                ).view(1, 1, 1, tensor_flow.shape[3]).expand(
+                    tensor_flow.shape[0], -1, tensor_flow.shape[2], -1
+                )
+                vertical = torch.linspace(
+                    -1.0, 1.0, tensor_flow.shape[2],
+                    device=tensor_flow.device, dtype=tensor_flow.dtype,
+                ).view(1, 1, tensor_flow.shape[2], 1).expand(
+                    tensor_flow.shape[0], -1, -1, tensor_flow.shape[3]
+                )
+                rife_grid_cache[cache_key] = torch.cat((horizontal, vertical), dim=1)
+            normalized_flow = torch.cat((
+                tensor_flow[:, 0:1] / ((tensor_input.shape[3] - 1.0) / 2.0),
+                tensor_flow[:, 1:2] / ((tensor_input.shape[2] - 1.0) / 2.0),
+            ), dim=1)
+            grid = (rife_grid_cache[cache_key] + normalized_flow).permute(0, 2, 3, 1)
+            return F.grid_sample(
+                tensor_input,
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=True,
+            )
+
+        rife_ifnet_module.warp = dtype_safe_warp
 
         input_paths = sorted(Path(args.input).glob("*.png"), key=lambda path: int(path.stem))
         if len(input_paths) < 2:
