@@ -80,7 +80,9 @@ cells = [
         OPENAI_MODEL = "gpt-5.6"
         OPENAI_REASONING_EFFORT = "medium"
         OPENAI_IMAGE_DETAIL = "high"  # "low", "high", "original", or "auto"
-        OPENAI_MAX_OUTPUT_TOKENS = 1400
+        # Includes hidden reasoning plus visible structured JSON. 5000 avoids
+        # cutting a valid proposal off in the middle of its prompt string.
+        OPENAI_MAX_OUTPUT_TOKENS = 5000
         OPENAI_MAX_ATTEMPTS = 3
         VISION_IMAGE_MAX_SIDE = 1024
         VISION_JPEG_QUALITY = 90
@@ -738,7 +740,7 @@ cells = [
         import hashlib
         import io
         import time
-        from pydantic import BaseModel, Field
+        from pydantic import BaseModel, Field, ValidationError
 
         class MidpointProposal(BaseModel):
             science_connection: str = Field(min_length=20, max_length=800)
@@ -847,35 +849,49 @@ cells = [
             correction = ""
             last_error = None
             for attempt in range(1, OPENAI_MAX_ATTEMPTS + 1):
-                response = OPENAI_CLIENT.responses.parse(
-                    model=OPENAI_MODEL,
-                    reasoning={"effort": OPENAI_REASONING_EFFORT},
-                    store=False,
-                    max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-                    input=[
-                        {"role": "system", "content": MIDPOINT_SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "input_text", "text": request_text + correction},
-                                {"type": "input_text", "text": "Painting A:"},
-                                {
-                                    "type": "input_image",
-                                    "image_url": image_data_url(left["path"]),
-                                    "detail": OPENAI_IMAGE_DETAIL,
-                                },
-                                {"type": "input_text", "text": "Painting B:"},
-                                {
-                                    "type": "input_image",
-                                    "image_url": image_data_url(right["path"]),
-                                    "detail": OPENAI_IMAGE_DETAIL,
-                                },
-                            ],
-                        },
-                    ],
-                    text_format=MidpointProposal,
-                )
-                proposal = extract_parsed_proposal(response)
+                try:
+                    response = OPENAI_CLIENT.responses.parse(
+                        model=OPENAI_MODEL,
+                        reasoning={"effort": OPENAI_REASONING_EFFORT},
+                        store=False,
+                        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+                        input=[
+                            {"role": "system", "content": MIDPOINT_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": request_text + correction},
+                                    {"type": "input_text", "text": "Painting A:"},
+                                    {
+                                        "type": "input_image",
+                                        "image_url": image_data_url(left["path"]),
+                                        "detail": OPENAI_IMAGE_DETAIL,
+                                    },
+                                    {"type": "input_text", "text": "Painting B:"},
+                                    {
+                                        "type": "input_image",
+                                        "image_url": image_data_url(right["path"]),
+                                        "detail": OPENAI_IMAGE_DETAIL,
+                                    },
+                                ],
+                            },
+                        ],
+                        text_format=MidpointProposal,
+                    )
+                    proposal = extract_parsed_proposal(response)
+                except (ValidationError, json.JSONDecodeError) as error:
+                    last_error = error
+                    correction = (
+                        "\n\nThe previous response was truncated or was not complete valid JSON. "
+                        "Return a shorter complete response: concise audit fields and a literal image "
+                        "prompt below 1,200 characters. Close every JSON string and object."
+                    )
+                    if attempt < OPENAI_MAX_ATTEMPTS:
+                        time.sleep(min(2 ** (attempt - 1), 4))
+                        continue
+                    raise RuntimeError(
+                        f"OpenAI returned incomplete structured JSON after {attempt} attempts"
+                    ) from error
                 try:
                     clean_prompt = validate_midpoint_prompt(proposal.prompt)
                 except ValueError as error:
