@@ -1661,7 +1661,7 @@ cells = [
             display(plot_preview)
             del plot_preview
             display(Video(
-                filename=str(RIFE_FINAL_VIDEO_PATH),
+                str(RIFE_FINAL_VIDEO_PATH),
                 embed=False,
                 width=RIFE_DISPLAY_WIDTH,
                 html_attributes="controls loop muted playsinline",
