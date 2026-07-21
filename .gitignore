@@ -13,5 +13,7 @@ hf_cache/
 
 # Local art-project notebooks and prompt specifications.
 notebooks/StillLife_Loop_Runware_Art.ipynb
+notebooks/StillLife_Recursive_Vision_Interpolation.ipynb
+old_interpol_project.ipynb
 art_projects/prompts/*.json
 !art_projects/prompts/example_still_life_loop.json
