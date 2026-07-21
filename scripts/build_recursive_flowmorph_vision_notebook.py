@@ -109,6 +109,38 @@ settings = replace_once(
 )
 notebook["cells"][2]["source"] = settings.splitlines(keepends=True)
 
+dependency_setup = "".join(notebook["cells"][6]["source"])
+dependency_setup = replace_once(
+    dependency_setup,
+    "try:\n    import openai\n    from openai import OpenAI\n",
+    "# FlowMorph evaluates every completed pair with LPIPS. The broad FLUX import\n"
+    "# probe above can succeed in a stock Colab runtime even when this late-stage\n"
+    "# metric dependency is absent, so install and initialize it before any costly fit.\n"
+    "lpips_probe = subprocess.run(\n"
+    "    [sys.executable, \"-c\", \"import lpips\"],\n"
+    "    capture_output=True,\n"
+    "    text=True,\n"
+    ")\n"
+    "if lpips_probe.returncode != 0:\n"
+    "    print(\"Installing required FlowMorph metric dependency: lpips==0.1.4\")\n"
+    "    subprocess.check_call([\n"
+    "        sys.executable, \"-m\", \"pip\", \"install\", \"lpips==0.1.4\"\n"
+    "    ])\n"
+    "try:\n"
+    "    import lpips\n"
+    "    lpips_preflight_model = lpips.LPIPS(net=\"alex\").eval()\n"
+    "except Exception as error:\n"
+    "    raise RuntimeError(\n"
+    "        \"LPIPS/AlexNet preflight failed before FlowMorph fitting. \"\n"
+    "        \"Resolve this dependency before continuing.\"\n"
+    "    ) from error\n"
+    "else:\n"
+    "    del lpips_preflight_model\n"
+    "    print(\"LPIPS 0.1.4 and its AlexNet weights are ready.\")\n\n"
+    "try:\n    import openai\n    from openai import OpenAI\n",
+)
+notebook["cells"][6]["source"] = dependency_setup.splitlines(keepends=True)
+
 validation = "".join(notebook["cells"][10]["source"])
 validation = replace_once(
     validation,
