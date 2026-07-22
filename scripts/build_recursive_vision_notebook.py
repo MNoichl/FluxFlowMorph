@@ -1108,12 +1108,16 @@ cells = [
     ),
     code(
         r"""
+        import json
         import imageio_ffmpeg
         import numpy as np
         import shutil
         import subprocess
         import tempfile
-        from IPython.display import Video
+        from pathlib import Path
+        from PIL import Image
+        from IPython.display import Markdown, Video, display
+        from flowmorph_klein.visualization import make_contact_sheet
 
         # A Colab reconnect clears Python variables while completed manifests and
         # images remain on Drive. Recover the final sequence before auditing it.
