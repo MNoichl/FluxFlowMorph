@@ -129,6 +129,7 @@ cells = [
         CONTACT_SHEET_COLUMNS = 8
         CONTACT_SHEET_DISPLAY_MAX_WIDTH = 1100
         LOOP_PREVIEW_DISPLAY_WIDTH = 768
+        LOOP_PREVIEW_RENDER_MAX_SIDE = 512  # Reduced streaming preview; source PNGs stay untouched.
 
         # Cyclic sequence and RIFE/SSIM finishing.
         SOURCE_SEQUENCE_FPS = 12.0
@@ -1107,53 +1108,94 @@ cells = [
     ),
     code(
         r"""
+        import imageio_ffmpeg
         import numpy as np
-        from flowmorph_klein.video import export_previews
+        import shutil
+        import subprocess
+        import tempfile
+        from IPython.display import Video
 
         if len(FINAL_RECORDS) < 3:
             raise RuntimeError("A cyclic preview needs at least three images")
+        if LOOP_PREVIEW_RENDER_MAX_SIDE < 128:
+            raise ValueError("LOOP_PREVIEW_RENDER_MAX_SIDE must be at least 128")
 
-        canonical_frames = [Image.open(item["path"]).convert("RGB") for item in FINAL_RECORDS]
+        canonical_paths = [Path(item["path"]) for item in FINAL_RECORDS]
 
-        def metric_array(image, size):
-            sample = image.convert("RGB").copy()
-            sample.thumbnail((size, size))
-            return np.asarray(sample, dtype=np.float32) / 255.0
+        def metric_array(path, size):
+            with Image.open(path) as opened:
+                sample = opened.convert("RGB")
+                sample.thumbnail((size, size))
+                return np.asarray(sample, dtype=np.uint8).copy()
 
-        metric_frames = [metric_array(frame, LOOP_SEAM_ANALYSIS_SIZE) for frame in canonical_frames]
+        def mean_absolute_delta(left, right):
+            difference = left.astype(np.int16) - right.astype(np.int16)
+            return float(np.mean(np.abs(difference)) / 255.0)
+
+        print(f"Reading {len(canonical_paths)} small seam-analysis thumbnails (not full frames)...")
+        metric_frames = [metric_array(path, LOOP_SEAM_ANALYSIS_SIZE) for path in canonical_paths]
         edge_scores = [
-            float(np.mean(np.abs(metric_frames[index] - metric_frames[index - 1])))
+            mean_absolute_delta(metric_frames[index], metric_frames[index - 1])
             for index in range(len(metric_frames))
         ]
         quietest_cut_index = int(np.argmin(edge_scores))
         export_cut_index = quietest_cut_index if LOOP_AUTO_ROTATE_TO_QUIETEST_CUT else 0
-        export_frames = canonical_frames[export_cut_index:] + canonical_frames[:export_cut_index]
+        EXPORT_FRAME_PATHS = canonical_paths[export_cut_index:] + canonical_paths[:export_cut_index]
         EXPORT_RECORDS = FINAL_RECORDS[export_cut_index:] + FINAL_RECORDS[:export_cut_index]
         export_metrics = metric_frames[export_cut_index:] + metric_frames[:export_cut_index]
 
-        seam_delta = float(np.mean(np.abs(export_metrics[0] - export_metrics[-1])))
+        seam_delta = mean_absolute_delta(export_metrics[0], export_metrics[-1])
         median_delta = float(np.median(edge_scores))
         seam_ratio = seam_delta / median_delta if median_delta else 0.0
-        incoming_motion = export_metrics[0] - export_metrics[-1]
-        outgoing_motion = export_metrics[1] - export_metrics[0]
-        motion_mismatch = float(np.mean(np.abs(outgoing_motion - incoming_motion)))
+        incoming_motion = export_metrics[0].astype(np.int16) - export_metrics[-1].astype(np.int16)
+        outgoing_motion = export_metrics[1].astype(np.int16) - export_metrics[0].astype(np.int16)
+        motion_mismatch = float(np.mean(np.abs(outgoing_motion - incoming_motion)) / 255.0)
 
         preview_directory = RUN_DIRECTORY / "previews" / "generated_loop"
         preview_directory.mkdir(parents=True, exist_ok=True)
-        preview_paths = export_previews(
-            export_frames, preview_directory, fps=SOURCE_SEQUENCE_FPS, hold_frames=0
-        )
+        preview_video_path = preview_directory / "generated_loop_reduced.mp4"
+        preview_stage = Path(tempfile.mkdtemp(prefix="flowmorph_preview_"))
+        try:
+            for index, source_path in enumerate(EXPORT_FRAME_PATHS):
+                staged_path = preview_stage / f"{index:07d}.png"
+                try:
+                    staged_path.symlink_to(source_path.resolve())
+                except OSError:
+                    shutil.copy2(source_path, staged_path)
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            subprocess.check_call([
+                ffmpeg, "-y", "-framerate", str(SOURCE_SEQUENCE_FPS),
+                "-i", str(preview_stage / "%07d.png"),
+                "-vf", (
+                    f"scale={LOOP_PREVIEW_RENDER_MAX_SIDE}:{LOOP_PREVIEW_RENDER_MAX_SIDE}:"
+                    "force_original_aspect_ratio=decrease:force_divisible_by=2"
+                ),
+                "-an", "-c:v", "libx264", "-preset", "veryfast",
+                "-crf", "22", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                str(preview_video_path),
+            ])
+        finally:
+            shutil.rmtree(preview_stage, ignore_errors=True)
+
         seam_sheet_path = preview_directory / "seam_audit.png"
-        make_contact_sheet(
-            [export_frames[-1], export_frames[0], export_frames[1]],
-            seam_sheet_path,
-            columns=3,
-            labels=["last before wrap", "playback start", "first after start"],
-        )
+        seam_images = []
+        try:
+            for path in (EXPORT_FRAME_PATHS[-1], EXPORT_FRAME_PATHS[0], EXPORT_FRAME_PATHS[1]):
+                with Image.open(path) as opened:
+                    seam_images.append(opened.convert("RGB"))
+            make_contact_sheet(
+                seam_images,
+                seam_sheet_path,
+                columns=3,
+                labels=["last before wrap", "playback start", "first after start"],
+            )
+        finally:
+            for image in seam_images:
+                image.close()
         seam_report = {
             "cyclic": True,
             "duplicate_terminal_frame": False,
-            "frame_count": len(export_frames),
+            "frame_count": len(EXPORT_FRAME_PATHS),
             "auto_rotate": LOOP_AUTO_ROTATE_TO_QUIETEST_CUT,
             "cut_index": export_cut_index,
             "quietest_cut_index": quietest_cut_index,
@@ -1171,15 +1213,20 @@ cells = [
         display(Markdown("### Loop seam: last → playback start → next"))
         display(seam_preview)
         del seam_preview
-        from IPython.display import Image as DisplayImage
         display(Markdown("### Generated-image loop before RIFE"))
-        display(DisplayImage(filename=str(preview_paths["gif"]), width=LOOP_PREVIEW_DISPLAY_WIDTH))
+        display(Video(
+            str(preview_video_path),
+            embed=False,
+            width=LOOP_PREVIEW_DISPLAY_WIDTH,
+            html_attributes="controls loop muted playsinline",
+        ))
+        del metric_frames, export_metrics, incoming_motion, outgoing_motion
         print({
-            "frames": len(export_frames),
+            "frames": len(EXPORT_FRAME_PATHS),
             "cut_index": export_cut_index,
             "seam_vs_median": round(seam_ratio, 4),
             "motion_mismatch": round(motion_mismatch, 6),
-            "preview_directory": str(preview_directory),
+            "preview_video": str(preview_video_path),
         })
         """
     ),
@@ -1436,11 +1483,11 @@ cells = [
             RIFE_INPUT_DIRECTORY.mkdir(parents=True, exist_ok=False)
             RIFE_RESULTS_DIRECTORY.mkdir(parents=True, exist_ok=False)
 
-            for index, frame in enumerate(export_frames):
-                frame.convert("RGB").save(RIFE_INPUT_DIRECTORY / f"{index:07d}.png", compress_level=4)
+            for index, source_path in enumerate(EXPORT_FRAME_PATHS):
+                shutil.copy2(source_path, RIFE_INPUT_DIRECTORY / f"{index:07d}.png")
             shutil.copy2(
                 RIFE_INPUT_DIRECTORY / "0000000.png",
-                RIFE_INPUT_DIRECTORY / f"{len(export_frames):07d}.png",
+                RIFE_INPUT_DIRECTORY / f"{len(EXPORT_FRAME_PATHS):07d}.png",
             )
             command = [
                 sys.executable, "-u", str(RIFE_RUNNER_PATH),
@@ -1453,7 +1500,7 @@ cells = [
             ]
             if RIFE_USE_FP16:
                 command.append("--fp16")
-            print(f"Interpolating {len(export_frames)} cyclic pairs at {RIFE_MULTIPLIER}× density...")
+            print(f"Interpolating {len(EXPORT_FRAME_PATHS)} cyclic pairs at {RIFE_MULTIPLIER}× density...")
 
             def run_rife(command_to_run, label):
                 print(f"RIFE attempt: {label}", flush=True)
@@ -1495,7 +1542,7 @@ cells = [
             dense_with_duplicate = sorted(
                 RIFE_DENSE_DIRECTORY.glob("*.png"), key=lambda path: int(path.stem)
             )
-            expected = len(export_frames) * RIFE_MULTIPLIER + 1
+            expected = len(EXPORT_FRAME_PATHS) * RIFE_MULTIPLIER + 1
             if len(dense_with_duplicate) != expected:
                 raise RuntimeError(f"RIFE wrote {len(dense_with_duplicate)} frames; expected {expected}")
             with Image.open(dense_with_duplicate[0]) as opened:
@@ -1506,7 +1553,7 @@ cells = [
                 raise RuntimeError("RIFE terminal image is not pixel-identical to the opening image")
             RIFE_DENSE_PATHS = dense_with_duplicate[:-1]
             print({
-                "base_cyclic_frames": len(export_frames),
+                "base_cyclic_frames": len(EXPORT_FRAME_PATHS),
                 "dense_unique_frames": len(RIFE_DENSE_PATHS),
                 "removed_exact_terminal_duplicate": True,
                 "local_work_directory": str(RIFE_WORK_DIRECTORY),
@@ -1546,7 +1593,7 @@ cells = [
             frame_positions[1:] = np.cumsum(motion_weights[1:])
             total_motion = float(frame_positions[-1] + motion_weights[0])
 
-            canonical_duration = len(export_frames) / float(SOURCE_SEQUENCE_FPS)
+            canonical_duration = len(EXPORT_FRAME_PATHS) / float(SOURCE_SEQUENCE_FPS)
             target_frame_count = int(round(canonical_duration * RIFE_FINAL_FPS))
             if target_frame_count < 3:
                 raise ValueError("Final video needs at least three frames")
@@ -1619,7 +1666,7 @@ cells = [
                 "rife_multiplier": RIFE_MULTIPLIER,
                 "rife_scale": RIFE_SCALE,
                 "rife_fp16": RIFE_USE_FP16,
-                "base_frames": len(export_frames),
+                "base_frames": len(EXPORT_FRAME_PATHS),
                 "dense_unique_frames": len(RIFE_DENSE_PATHS),
                 "final_unique_frames": target_frame_count,
                 "source_fps": SOURCE_SEQUENCE_FPS,
