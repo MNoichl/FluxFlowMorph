@@ -1475,6 +1475,59 @@ cells = [
     code(
         r"""
         if RUN_RIFE_POSTPROCESS:
+            # A Colab reconnect clears Python variables even though completed images and
+            # manifests remain on Drive. Restore the ordered export paths when needed.
+            if "EXPORT_FRAME_PATHS" not in globals():
+                restored_records = globals().get("FINAL_RECORDS")
+                if not restored_records:
+                    restored_manifest_path = Path(
+                        globals().get(
+                            "FINAL_SEQUENCE_MANIFEST",
+                            RUN_DIRECTORY / "metadata" / "final_recursive_sequence.json",
+                        )
+                    )
+                    if not restored_manifest_path.is_file():
+                        raise RuntimeError(
+                            "The generated sequence is not available in memory and its saved "
+                            f"manifest was not found at {restored_manifest_path}. Set "
+                            "RESUME_RUN_DIRECTORY to the completed Drive run and rerun the "
+                            "setup/assembly cells before RIFE."
+                        )
+                    restored_payload = json.loads(restored_manifest_path.read_text(encoding="utf-8"))
+                    restored_records = restored_payload["records"]
+
+                restored_cut_index = 0
+                restored_seam_report_path = (
+                    RUN_DIRECTORY / "previews" / "generated_loop" / "seam_audit.json"
+                )
+                if restored_seam_report_path.is_file():
+                    restored_seam_report = json.loads(
+                        restored_seam_report_path.read_text(encoding="utf-8")
+                    )
+                    restored_cut_index = int(restored_seam_report.get("cut_index", 0))
+                elif LOOP_AUTO_ROTATE_TO_QUIETEST_CUT:
+                    print(
+                        "No saved seam report was found; using canonical circular order. "
+                        "Run section 10 first if you want automatic quietest-cut rotation."
+                    )
+
+                restored_cut_index %= len(restored_records)
+                EXPORT_RECORDS = (
+                    restored_records[restored_cut_index:] + restored_records[:restored_cut_index]
+                )
+                EXPORT_FRAME_PATHS = [Path(item["path"]) for item in EXPORT_RECORDS]
+                missing_export_paths = [path for path in EXPORT_FRAME_PATHS if not path.is_file()]
+                if missing_export_paths:
+                    raise FileNotFoundError(
+                        "The restored sequence references missing image files; first missing path: "
+                        f"{missing_export_paths[0]}"
+                    )
+                print({
+                    "restored_export_sequence": True,
+                    "frames": len(EXPORT_FRAME_PATHS),
+                    "cut_index": restored_cut_index,
+                })
+
             postprocess_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             RIFE_WORK_DIRECTORY = Path(LOCAL_ASSET_ROOT) / PROJECT_NAME / "rife_work" / postprocess_stamp
             RIFE_INPUT_DIRECTORY = RIFE_WORK_DIRECTORY / "cyclic_input"
