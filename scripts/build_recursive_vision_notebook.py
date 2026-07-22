@@ -1,8 +1,7 @@
-"""Build the local recursive vision-interpolation art notebook.
+"""Build the tracked recursive vision-interpolation art notebook.
 
-The generated notebook is intentionally ignored by Git. Keeping the builder
-tracked makes the notebook reproducible without publishing keys, outputs, or
-the user's editable working copy.
+The builder keeps the notebook reproducible, while the generated ``.ipynb``
+is committed normally. Secret values remain in external files, never cells.
 """
 
 from __future__ import annotations

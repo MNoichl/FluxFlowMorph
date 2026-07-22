@@ -2,7 +2,7 @@
 
 This builder deliberately reuses the broad, validated structure of the first
 recursive notebook, then replaces standalone midpoint generation with actual
-three-frame FlowMorph fits. The generated working notebook remains ignored.
+three-frame FlowMorph fits. The generated working notebook is tracked normally.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def restore_literal_assignment(source: str, name: str, value: object) -> str:
 
 
 # These values describe the user's local Drive layout and active resume target.
-# Preserve them when regenerating the ignored working notebook from this builder.
+# Preserve them when regenerating the tracked working notebook from this builder.
 preserved_local_settings: dict[str, object] = {}
 if OUTPUT.is_file():
     try:
