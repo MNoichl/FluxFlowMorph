@@ -7,7 +7,9 @@ three-frame FlowMorph fits. The generated working notebook remains ignored.
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 import runpy
 from pathlib import Path
 from textwrap import dedent
@@ -27,6 +29,51 @@ def replace_once(source: str, old: str, new: str) -> str:
     if source.count(old) != 1:
         raise RuntimeError(f"Expected exactly one builder replacement target: {old!r}")
     return source.replace(old, new, 1)
+
+
+def literal_assignments(source: str, names: set[str]) -> dict[str, object]:
+    """Read selected user-local settings without executing notebook code."""
+
+    values: dict[str, object] = {}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return values
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in names:
+            continue
+        try:
+            values[target.id] = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            continue
+    return values
+
+
+def restore_literal_assignment(source: str, name: str, value: object) -> str:
+    pattern = rf"(?m)^{re.escape(name)}\s*=.*$"
+    replacement = f"{name} = {value!r}"
+    restored, count = re.subn(pattern, replacement, source, count=1)
+    if count != 1:
+        raise RuntimeError(f"Could not restore local notebook setting {name}")
+    return restored
+
+
+# These values describe the user's local Drive layout and active resume target.
+# Preserve them when regenerating the ignored working notebook from this builder.
+preserved_local_settings: dict[str, object] = {}
+if OUTPUT.is_file():
+    try:
+        existing_notebook = json.loads(OUTPUT.read_text(encoding="utf-8"))
+        existing_settings = "".join(existing_notebook["cells"][2]["source"])
+        preserved_local_settings = literal_assignments(
+            existing_settings,
+            {"DRIVE_PROJECT_BASE", "OPENAI_KEY_FILENAME", "RESUME_RUN_DIRECTORY"},
+        )
+    except (KeyError, IndexError, json.JSONDecodeError):
+        preserved_local_settings = {}
 
 
 runpy.run_path(str(BASE_BUILDER), run_name="__main__")
@@ -117,6 +164,8 @@ settings = replace_once(
     "REFERENCE_BACKGROUND = (116, 105, 91)\n"
     "SAVE_SOFT_REFERENCES = True  # Inspect in base_frames/soft_references and its preview sheet.\n",
 )
+for setting_name, setting_value in preserved_local_settings.items():
+    settings = restore_literal_assignment(settings, setting_name, setting_value)
 notebook["cells"][2]["source"] = settings.splitlines(keepends=True)
 
 notebook["cells"][10]["source"] = lines(

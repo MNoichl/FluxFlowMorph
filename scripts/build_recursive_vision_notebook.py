@@ -73,7 +73,7 @@ cells = [
         # Drive and secret. Put only the token text in this file (one line).
         MOUNT_DRIVE = True
         DRIVE_PROJECT_BASE = "/content/drive/MyDrive/FluxFlowMorphArt"
-        OPENAI_KEY_FILENAME = "openai_api_key.txt"
+        OPENAI_KEY_FILENAME = "openaiapikey.txt"
         RESUME_RUN_DIRECTORY = None  # Example: "/content/drive/MyDrive/FluxFlowMorphArt/science_path_recursive_vision/..."
 
         # OpenAI vision prompt generation.
