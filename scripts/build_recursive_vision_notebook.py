@@ -732,6 +732,36 @@ cells = [
         display(base_preview)
         del base_preview, base_images
         print("Full-resolution anchors and contact sheet:", BASE_DIRECTORY)
+
+        saved_reference_paths = [
+            Path(item["soft_reference_path"])
+            for item in BASE_RECORDS
+            if item.get("soft_reference_path") and Path(item["soft_reference_path"]).is_file()
+        ]
+        if saved_reference_paths:
+            reference_contact_sheet_path = (
+                RUN_DIRECTORY / "previews" / "anchor_soft_reference_contact_sheet.png"
+            )
+            reference_images = []
+            for path in saved_reference_paths:
+                with Image.open(path) as opened:
+                    thumbnail = opened.convert("RGB")
+                    thumbnail.thumbnail((192, 192))
+                    reference_images.append(thumbnail)
+            make_contact_sheet(
+                reference_images,
+                reference_contact_sheet_path,
+                columns=min(CONTACT_SHEET_COLUMNS, len(reference_images)),
+                labels=[path.stem for path in saved_reference_paths],
+            )
+            for image in reference_images:
+                image.close()
+            reference_preview = Image.open(reference_contact_sheet_path).convert("RGB")
+            reference_preview.thumbnail((CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000))
+            display(Markdown("### Blurred/grained anchor initialization images"))
+            display(reference_preview)
+            reference_preview.close()
+            print("Full-resolution anchor initialization images:", saved_reference_paths[0].parent)
         """
     ),
     markdown(
@@ -1127,17 +1157,39 @@ cells = [
                     "RUN_DIRECTORY is not initialized. Set RESUME_RUN_DIRECTORY to the "
                     "completed Drive run, then rerun the setup cells before section 10."
                 )
-            restored_manifest_path = Path(
-                globals().get(
-                    "FINAL_SEQUENCE_MANIFEST",
-                    RUN_DIRECTORY / "metadata" / "final_recursive_sequence.json",
-                )
+            restored_manifest_candidates = []
+            explicit_manifest = globals().get("FINAL_SEQUENCE_MANIFEST")
+            if explicit_manifest:
+                restored_manifest_candidates.append(Path(explicit_manifest))
+            restored_manifest_candidates.extend([
+                RUN_DIRECTORY / "metadata" / "final_recursive_flowmorph_sequence.json",
+                RUN_DIRECTORY / "metadata" / "final_recursive_sequence.json",
+            ])
+            restored_manifest_path = next(
+                (path for path in restored_manifest_candidates if path.is_file()),
+                None,
             )
-            if not restored_manifest_path.is_file():
+            if restored_manifest_path is None:
+                discovered_manifests = sorted(
+                    [
+                        *RUN_DIRECTORY.parent.glob(
+                            "*/metadata/final_recursive_flowmorph_sequence.json"
+                        ),
+                        *RUN_DIRECTORY.parent.glob("*/metadata/final_recursive_sequence.json"),
+                    ],
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )
+                discovery_note = (
+                    " Completed manifests in sibling runs: "
+                    + ", ".join(str(path.parent.parent) for path in discovered_manifests[:5])
+                    if discovered_manifests
+                    else " No completed sibling-run manifest was found."
+                )
                 raise RuntimeError(
                     "FINAL_RECORDS is not in memory and the saved sequence manifest was "
-                    f"not found at {restored_manifest_path}. Set RESUME_RUN_DIRECTORY to "
-                    "the completed Drive run and rerun the setup cells."
+                    f"not found in {RUN_DIRECTORY / 'metadata'}. Set RESUME_RUN_DIRECTORY "
+                    "to the completed Drive run and rerun the setup cells." + discovery_note
                 )
             restored_payload = json.loads(restored_manifest_path.read_text(encoding="utf-8"))
             FINAL_RECORDS = restored_payload["records"]
@@ -1513,16 +1565,22 @@ cells = [
             if "EXPORT_FRAME_PATHS" not in globals():
                 restored_records = globals().get("FINAL_RECORDS")
                 if not restored_records:
-                    restored_manifest_path = Path(
-                        globals().get(
-                            "FINAL_SEQUENCE_MANIFEST",
-                            RUN_DIRECTORY / "metadata" / "final_recursive_sequence.json",
-                        )
+                    restored_manifest_candidates = []
+                    explicit_manifest = globals().get("FINAL_SEQUENCE_MANIFEST")
+                    if explicit_manifest:
+                        restored_manifest_candidates.append(Path(explicit_manifest))
+                    restored_manifest_candidates.extend([
+                        RUN_DIRECTORY / "metadata" / "final_recursive_flowmorph_sequence.json",
+                        RUN_DIRECTORY / "metadata" / "final_recursive_sequence.json",
+                    ])
+                    restored_manifest_path = next(
+                        (path for path in restored_manifest_candidates if path.is_file()),
+                        None,
                     )
-                    if not restored_manifest_path.is_file():
+                    if restored_manifest_path is None:
                         raise RuntimeError(
                             "The generated sequence is not available in memory and its saved "
-                            f"manifest was not found at {restored_manifest_path}. Set "
+                            f"manifest was not found in {RUN_DIRECTORY / 'metadata'}. Set "
                             "RESUME_RUN_DIRECTORY to the completed Drive run and rerun the "
                             "setup/assembly cells before RIFE."
                         )

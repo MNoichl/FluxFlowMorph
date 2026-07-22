@@ -115,7 +115,7 @@ settings = replace_once(
     "BASE_REFERENCE_BLUR = 16.0\n"
     "BASE_REFERENCE_GRAIN_STRENGTH = 0.035  # Normalized monochrome noise sigma; 0 disables.\n"
     "REFERENCE_BACKGROUND = (116, 105, 91)\n"
-    "SAVE_SOFT_REFERENCES = False\n",
+    "SAVE_SOFT_REFERENCES = True  # Inspect in base_frames/soft_references and its preview sheet.\n",
 )
 notebook["cells"][2]["source"] = settings.splitlines(keepends=True)
 
