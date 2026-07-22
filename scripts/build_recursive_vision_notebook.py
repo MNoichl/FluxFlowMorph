@@ -1115,6 +1115,35 @@ cells = [
         import tempfile
         from IPython.display import Video
 
+        # A Colab reconnect clears Python variables while completed manifests and
+        # images remain on Drive. Recover the final sequence before auditing it.
+        if "FINAL_RECORDS" not in globals():
+            if "RUN_DIRECTORY" not in globals():
+                raise RuntimeError(
+                    "RUN_DIRECTORY is not initialized. Set RESUME_RUN_DIRECTORY to the "
+                    "completed Drive run, then rerun the setup cells before section 10."
+                )
+            restored_manifest_path = Path(
+                globals().get(
+                    "FINAL_SEQUENCE_MANIFEST",
+                    RUN_DIRECTORY / "metadata" / "final_recursive_sequence.json",
+                )
+            )
+            if not restored_manifest_path.is_file():
+                raise RuntimeError(
+                    "FINAL_RECORDS is not in memory and the saved sequence manifest was "
+                    f"not found at {restored_manifest_path}. Set RESUME_RUN_DIRECTORY to "
+                    "the completed Drive run and rerun the setup cells."
+                )
+            restored_payload = json.loads(restored_manifest_path.read_text(encoding="utf-8"))
+            FINAL_RECORDS = restored_payload["records"]
+            FINAL_SEQUENCE_MANIFEST = restored_manifest_path
+            print({
+                "restored_final_sequence": True,
+                "frames": len(FINAL_RECORDS),
+                "manifest": str(FINAL_SEQUENCE_MANIFEST),
+            })
+
         if len(FINAL_RECORDS) < 3:
             raise RuntimeError("A cyclic preview needs at least three images")
         if LOOP_PREVIEW_RENDER_MAX_SIDE < 128:
