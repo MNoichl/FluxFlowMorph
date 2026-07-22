@@ -688,7 +688,9 @@ notebook["cells"][19]["source"] = lines(
         "output.save_webp": False,
         "output.save_gif": False,
         "output.save_mp4": False,
-        "output.create_zip": False,
+        # Required by the reusable config validator. The sequence session does
+        # not call FlowMorphRunner.run(), so no research archive is created.
+        "output.create_zip": True,
     }
     session_template = load_config(CONFIG_PATH, overrides=session_overrides)
     session_profile = select_hardware_profile(
