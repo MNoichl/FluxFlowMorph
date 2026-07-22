@@ -103,6 +103,7 @@ settings = replace_once(
     "BASE_CONTINUITY_ENABLED = True\n"
     "BASE_REFERENCE_STRENGTH = 0.12\n"
     "BASE_REFERENCE_BLUR = 16.0\n"
+    "BASE_REFERENCE_GRAIN_STRENGTH = 0.035  # Normalized monochrome noise sigma; 0 disables.\n"
     "MIDPOINT_CONDITIONING_ENABLED = True\n"
     "MIDPOINT_REFERENCE_STRENGTH = 0.08\n"
     "MIDPOINT_REFERENCE_BLUR = 18.0\n"
@@ -112,6 +113,7 @@ settings = replace_once(
     "BASE_CONTINUITY_ENABLED = True\n"
     "BASE_REFERENCE_STRENGTH = 0.12\n"
     "BASE_REFERENCE_BLUR = 16.0\n"
+    "BASE_REFERENCE_GRAIN_STRENGTH = 0.035  # Normalized monochrome noise sigma; 0 disables.\n"
     "REFERENCE_BACKGROUND = (116, 105, 91)\n"
     "SAVE_SOFT_REFERENCES = False\n",
 )
@@ -145,6 +147,8 @@ notebook["cells"][10]["source"] = lines(
         raise ValueError("IMAGE_LORA_SCALE must lie in (0, 4]")
     if not 0 < BASE_REFERENCE_STRENGTH <= 0.35:
         raise ValueError("BASE_REFERENCE_STRENGTH must lie in (0, 0.35]")
+    if not 0 <= BASE_REFERENCE_GRAIN_STRENGTH <= 0.25:
+        raise ValueError("BASE_REFERENCE_GRAIN_STRENGTH must lie in [0, 0.25]")
     if OPENAI_IMAGE_DETAIL not in {"low", "high", "original", "auto"}:
         raise ValueError("OPENAI_IMAGE_DETAIL must be low, high, original, or auto")
     if FLOWMORPH_START_TIMESTEP_INDEX != FLOWMORPH_RENDER_INDICES[0]:

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from PIL import Image, ImageFilter
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -42,6 +43,7 @@ class ContinuityConfig(ArtLoopModel):
     enabled: bool = True
     reference_blend: float = Field(default=0.15, gt=0.0, le=0.35)
     blur_radius: float = Field(default=12.0, ge=0.0, le=64.0)
+    grain_strength: float = Field(default=0.0, ge=0.0, le=0.25)
     background_rgb: tuple[int, int, int] = (127, 127, 127)
 
     @field_validator("background_rgb")
@@ -197,18 +199,38 @@ def make_soft_reference(
     *,
     reference_blend: float = 0.15,
     blur_radius: float = 12.0,
+    grain_strength: float = 0.0,
+    grain_seed: int | None = None,
     background_rgb: tuple[int, int, int] = (127, 127, 127),
 ) -> Image.Image:
-    """Reduce a previous mainframe to a faint, blurred structural reference."""
+    """Reduce a previous frame to a faint blurred reference with optional grain.
+
+    ``grain_strength`` is the standard deviation of monochrome Gaussian grain
+    on a normalized 0–1 intensity scale. Grain is applied after the background
+    blend so its visible amplitude is not accidentally attenuated twice.
+    """
 
     if not 0.0 < reference_blend <= 0.35:
         raise ValueError("reference_blend must lie in (0, 0.35]")
     if blur_radius < 0.0:
         raise ValueError("blur_radius cannot be negative")
+    if not 0.0 <= grain_strength <= 0.25:
+        raise ValueError("grain_strength must lie in [0, 0.25]")
     image = previous.convert("RGB")
     softened = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     background = Image.new("RGB", image.size, background_rgb)
-    return Image.blend(background, softened, reference_blend)
+    reference = Image.blend(background, softened, reference_blend)
+    if grain_strength == 0.0:
+        return reference
+    array = np.asarray(reference, dtype=np.float32)
+    rng = np.random.default_rng(grain_seed)
+    grain = rng.normal(
+        loc=0.0,
+        scale=255.0 * grain_strength,
+        size=(array.shape[0], array.shape[1], 1),
+    )
+    grained = np.clip(array + grain, 0.0, 255.0).round().astype(np.uint8)
+    return Image.fromarray(grained, mode="RGB")
 
 
 def apply_prompt_prefix(prefix: str, prompt: str) -> str:
@@ -259,6 +281,8 @@ def generate_mainframes(
                 previous,
                 reference_blend=continuity.reference_blend,
                 blur_radius=continuity.blur_radius,
+                grain_strength=continuity.grain_strength,
+                grain_seed=seed,
                 background_rgb=continuity.background_rgb,
             )
             soft_reference_path = reference_directory / f"reference_{index:03d}_{mainframe.id}.png"

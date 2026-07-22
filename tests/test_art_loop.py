@@ -56,6 +56,44 @@ def test_soft_reference_is_faint_blurred_previous_image() -> None:
     assert tuple(np.asarray(reference)[0, 0]) == (131, 80, 80)
 
 
+def test_soft_reference_grain_is_seeded_and_visible() -> None:
+    previous = Image.new("RGB", (32, 32), (150, 100, 50))
+    first = make_soft_reference(
+        previous,
+        reference_blend=0.2,
+        blur_radius=4.0,
+        grain_strength=0.04,
+        grain_seed=123,
+    )
+    repeated = make_soft_reference(
+        previous,
+        reference_blend=0.2,
+        blur_radius=4.0,
+        grain_strength=0.04,
+        grain_seed=123,
+    )
+    different = make_soft_reference(
+        previous,
+        reference_blend=0.2,
+        blur_radius=4.0,
+        grain_strength=0.04,
+        grain_seed=124,
+    )
+
+    assert np.array_equal(np.asarray(first), np.asarray(repeated))
+    assert not np.array_equal(np.asarray(first), np.asarray(different))
+    assert float(np.asarray(first, dtype=np.float32).std()) > 0.0
+
+
+@pytest.mark.parametrize("grain_strength", [-0.01, 0.251])
+def test_soft_reference_rejects_invalid_grain(grain_strength: float) -> None:
+    with pytest.raises(ValueError, match="grain_strength"):
+        make_soft_reference(
+            Image.new("RGB", (8, 8), "gray"),
+            grain_strength=grain_strength,
+        )
+
+
 def test_prompt_prefix_is_applied_once() -> None:
     assert apply_prompt_prefix("RIJKSOIL", "a table") == "RIJKSOIL, a table"
     assert apply_prompt_prefix("RIJKSOIL", "RIJKSOIL, a table") == "RIJKSOIL, a table"

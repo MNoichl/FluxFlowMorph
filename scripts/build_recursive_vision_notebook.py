@@ -37,7 +37,7 @@ def code(source: str) -> dict:
 
 cells = [
     markdown(
-        r'''
+        r"""
         # Recursive science still-life loop — image-aware prompt interpolation
 
         This local working notebook generates a closed sequence without an uploaded prompt JSON and without the old twenty-prompt FlowMorph schedules.
@@ -50,19 +50,19 @@ cells = [
         6. Finish the duplicate-free cyclic sequence with Practical-RIFE, circular SSIM motion equalization, and H.264 export.
 
         Google Drive is mounted first. The OpenAI key is read from a standalone text file in the Drive project base directory, never printed, never placed in an environment variable, and never copied into run outputs. When Drive persistence is enabled, the auto-numbered timestamped run directory itself lives on Drive, so every completed image and manifest is persistent as soon as it is written.
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 1. Editable run, model, API, image, and video settings
 
         The recursive count grows quickly. With `N` anchors, `M` inserted images per gap, and `R` rounds, the final sequence contains `N × (M + 1)^R` images. The default is `15 × 2² = 60` FLUX images and 45 OpenAI vision calls.
 
         `MIDPOINT_REFERENCE_STRENGTH` is deliberately low. If generated images look double-exposed or alpha-blended, lower it toward `0.04`, increase the blur, or disable midpoint image conditioning; the LLM prompt still carries the visual correspondence.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         PROJECT_ROOT = "/content/FlowMorphKlein9B"
         REPOSITORY_URL = "https://github.com/MNoichl/FluxFlowMorph.git"
         UPDATE_REPOSITORY = True
@@ -114,6 +114,7 @@ cells = [
         BASE_CONTINUITY_ENABLED = True
         BASE_REFERENCE_STRENGTH = 0.12
         BASE_REFERENCE_BLUR = 16.0
+        BASE_REFERENCE_GRAIN_STRENGTH = 0.035  # Normalized monochrome noise sigma; 0 disables.
         MIDPOINT_CONDITIONING_ENABLED = True
         MIDPOINT_REFERENCE_STRENGTH = 0.08
         MIDPOINT_REFERENCE_BLUR = 18.0
@@ -151,17 +152,17 @@ cells = [
         RIFE_KEEP_WORK_FRAMES = False
         RIFE_DISPLAY_WIDTH = 768
         DOWNLOAD_FINAL_VIDEO = False
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 2. Editable anchor sciences and prompts
 
         Edit these dictionaries directly. `science` is sent to the vision model as conceptual context; `prompt` is sent to FLUX. Every prompt must be a literal visual description and must contain the LoRA trigger `RIJKSOIL`. Avoid production-language such as “bridge frame,” “keep,” “same,” or “transition.”
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         BASE_STAGES = [
             {
                 "id": "nuclear_atomic_optical_physics",
@@ -239,17 +240,17 @@ cells = [
                 "prompt": "RIJKSOIL, a medium-wide vertical alchemical Baroque still life rising through a coiled glass alembic with amber reagent drops and descending across a spectroscopy prism, charred leaf, clear polymer film, porous biomaterial mesh, blue solar cell, copper battery plate and pure-water vial; pale soapstone bears old amber rings beneath burnt-orange fabric and a tar-black wall; firelit left illumination refracts through glass and oxidized copper, rich layered paint and fiery chiaroscuro; no people, no readable text.",
             },
         ]
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 3. GPU, repository, and compatible dependencies
 
         This checks the actual imports needed by the notebook. It does not reject a healthy Diffusers install merely because editable-install provenance metadata is absent. A core reinstall happens only if a clean Python process cannot import the FLUX.2 Klein pipeline and required packages; in that case restart the kernel once after installation.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         import platform
         import subprocess
         import sys
@@ -315,17 +316,17 @@ cells = [
             "flowmorph_source": flowmorph_klein.__file__,
             "openai_sdk": openai.__version__,
         })
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 4. Mount Drive, reserve the run directory, and load the API key
 
         Create `openai_api_key.txt` directly inside `DRIVE_PROJECT_BASE`. The file should contain only the API key and a final newline is optional. It is read into the OpenAI client and then the temporary string is deleted. The notebook prints the path it read, never the key or any key fragment.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         import json
         import re
         from datetime import datetime, timezone
@@ -410,17 +411,17 @@ cells = [
         print("OpenAI client initialized from the Drive key file (credential value not displayed).")
         print("Run directory:", RUN_DIRECTORY)
         print("Every generated image and manifest is written directly into this persistent directory.")
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 5. Validate settings and preview the recursive cost
 
         The validation also catches accidental missing or duplicated LoRA triggers in anchor prompts. It does not rewrite your text.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         if not 3 <= BASE_PROMPT_COUNT <= len(BASE_STAGES):
             raise ValueError(f"BASE_PROMPT_COUNT must be between 3 and {len(BASE_STAGES)}")
         if not 0 <= INTERPOLATION_ROUNDS <= 4:
@@ -443,6 +444,8 @@ cells = [
         ):
             if not 0 < strength <= 0.35:
                 raise ValueError(f"{name} must lie in (0, 0.35]")
+        if not 0 <= BASE_REFERENCE_GRAIN_STRENGTH <= 0.25:
+            raise ValueError("BASE_REFERENCE_GRAIN_STRENGTH must lie in [0, 0.25]")
         if OPENAI_IMAGE_DETAIL not in {"low", "high", "original", "auto"}:
             raise ValueError("OPENAI_IMAGE_DETAIL must be low, high, original, or auto")
 
@@ -469,17 +472,17 @@ cells = [
             "cyclic_gaps_per_round": round_counts[:-1],
         })
         print("Anchor order:", " → ".join(ids), "→", ids[0])
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 6. Load and fuse the RIJKSOIL LoRA; optional trial image
 
         LoRA weights are fused into the transformer before CPU offload. This avoids the CPU/CUDA matrix mismatch that can occur when PEFT adapter matrices remain attached during repeated offloaded calls. Rerunning this cell reuses a same-scale pipeline and rebuilds it if the scale changed.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         import gc
         import os
         import random
@@ -610,17 +613,17 @@ cells = [
             del trial_result, trial_image, preview
         else:
             print("Trial skipped.")
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 7. Generate the cyclic anchor paintings
 
         The first anchor is text-to-image. Later anchors receive only a faint blurred trace of the previous anchor. Images are not individually displayed; the following cell renders one compact contact sheet.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         from flowmorph_klein.art_loop import make_soft_reference
 
         BASE_DIRECTORY = RUN_DIRECTORY / "base_frames"
@@ -665,6 +668,8 @@ cells = [
                         previous,
                         reference_blend=BASE_REFERENCE_STRENGTH,
                         blur_radius=BASE_REFERENCE_BLUR,
+                        grain_strength=BASE_REFERENCE_GRAIN_STRENGTH,
+                        grain_seed=seed,
                         background_rgb=REFERENCE_BACKGROUND,
                     )
                     kwargs["image"] = reference
@@ -688,6 +693,8 @@ cells = [
                     "seed": seed,
                     "path": str(output_path),
                     "soft_reference_path": str(reference_path) if reference_path else None,
+                    "soft_reference_grain_strength": BASE_REFERENCE_GRAIN_STRENGTH,
+                    "soft_reference_grain_seed": seed if previous is not None else None,
                 }
                 BASE_RECORDS.append(record)
                 BASE_MANIFEST_PATH.write_text(json.dumps({
@@ -702,10 +709,10 @@ cells = [
         if len(BASE_RECORDS) != len(ACTIVE_BASE_STAGES):
             raise RuntimeError("The anchor manifest is incomplete; regenerate or select the correct resume run.")
         print(f"Prepared {len(BASE_RECORDS)} cyclic anchors in {BASE_DIRECTORY}")
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         from flowmorph_klein.visualization import make_contact_sheet
 
         base_contact_sheet_path = RUN_DIRECTORY / "previews" / "base_contact_sheet.png"
@@ -724,16 +731,16 @@ cells = [
         display(base_preview)
         del base_preview, base_images
         print("Full-resolution anchors and contact sheet:", BASE_DIRECTORY)
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 8. Define the image-aware midpoint prompt contract
 
         Each API call receives both actual endpoint images, both literal prompts, both science descriptions, and the requested fractional position. The model returns structured fields, but only its standalone descriptive `prompt` is sent to FLUX. Explanatory fields are saved for audit.
 
         Semantic validation rejects common failure modes from the earlier hand-authored JSONs: production jargon, instructions to keep things “the same,” and missing/duplicated LoRA triggers. Failed semantic outputs are retried with a concise correction.
-        '''
+        """
     ),
     code(
         r'''
@@ -924,14 +931,14 @@ cells = [
         '''
     ),
     markdown(
-        r'''
+        r"""
         ## 9. Run recursive midpoint prompt and image generation
 
         Every round treats the sequence as circular, including the final-to-first gap. Round 2 therefore sees the actual round-1 paintings and descriptions, not just the original anchors. Each successful proposal is saved before FLUX generation; if generation is interrupted, rerunning with `REUSE_EXISTING_MIDPOINTS=True` avoids paying for completed API calls again.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         def usage_payload(response):
             usage = getattr(response, "usage", None)
             if usage is None:
@@ -1089,17 +1096,17 @@ cells = [
         }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print({"final_images": len(FINAL_RECORDS), "manifest": str(FINAL_SEQUENCE_MANIFEST)})
         release_flux_pipeline()
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 10. Assemble, preview, and audit the generated cyclic sequence
 
         No endpoint is duplicated. The measured wrap edge is part of the cycle, and optional rotation places the playback boundary at the quietest neighboring pair. This changes only where playback starts, not the circular order.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         import numpy as np
         from flowmorph_klein.video import export_previews
 
@@ -1174,14 +1181,14 @@ cells = [
             "motion_mismatch": round(motion_mismatch, 6),
             "preview_directory": str(preview_directory),
         })
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 11. Prepare pinned Practical-RIFE and its v4.25 model
 
         RIFE operates on the lossless generated PNG sequence, including a final-to-first pair. Its large temporary dense-frame lattice stays on local Colab storage; only diagnostics and the final video are written to the persistent run directory.
-        '''
+        """
     ),
     code(
         r"""
@@ -1412,14 +1419,14 @@ cells = [
         """
     ),
     markdown(
-        r'''
+        r"""
         ## 12. Interpolate the circular PNG sequence with RIFE
 
         The opening image is appended once as a temporary terminal input so RIFE explicitly processes the wraparound pair. The exact duplicate is verified and removed before resampling and export.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         if RUN_RIFE_POSTPROCESS:
             postprocess_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             RIFE_WORK_DIRECTORY = Path(LOCAL_ASSET_ROOT) / PROJECT_NAME / "rife_work" / postprocess_stamp
@@ -1505,17 +1512,17 @@ cells = [
                 "local_work_directory": str(RIFE_WORK_DIRECTORY),
                 "persistent_results_directory": str(RIFE_RESULTS_DIRECTORY),
             })
-        '''
+        """
     ),
     markdown(
-        r'''
+        r"""
         ## 13. Circular SSIM motion equalization and final H.264 loop
 
         Dense RIFE frames are weighted by circular `1 − SSIM`. Monotonic unique selection places more final frames where visual motion is larger while preserving duration and the cyclic wrap. The MP4, report, and motion plot are written directly to Drive; large temporary PNG lattices are deleted only after successful export when `RIFE_KEEP_WORK_FRAMES=False`.
-        '''
+        """
     ),
     code(
-        r'''
+        r"""
         if RUN_RIFE_POSTPROCESS:
             import imageio_ffmpeg
             import matplotlib.pyplot as plt
@@ -1695,7 +1702,7 @@ cells = [
                     raise RuntimeError(f"Refusing to remove unexpected RIFE directory: {target}")
                 shutil.rmtree(target)
                 print("Removed temporary local RIFE PNGs after successful persistent export.")
-        '''
+        """
     ),
 ]
 
