@@ -35,7 +35,7 @@ if len(notebook["cells"]) != 28:
     raise RuntimeError("The base recursive notebook structure changed unexpectedly")
 
 notebook["cells"][0]["source"] = lines(
-    r'''
+    r"""
     # Recursive science still-life loop — vision prompts + true FlowMorph midpoints
 
     This local working notebook keeps the useful structure of the recursive vision notebook while making FlowMorph the interpolation mechanism.
@@ -43,22 +43,22 @@ notebook["cells"][0]["source"] = lines(
     1. Edit the anchor sciences and prompts directly in section 2.
     2. Generate only the anchor paintings with FLUX.2 Klein and weak previous-anchor continuity.
     3. For every cyclic neighbor pair, send both actual paintings, prompts, and science descriptions to the OpenAI vision model. It returns one literal midpoint prompt describing an interdisciplinary and optical middle ground.
-    4. Fit both endpoint images with the project FlowMorph implementation and render exactly three alpha positions using `[source prompt, midpoint prompt, target prompt]`.
-    5. Insert the actual decoded FlowMorph α=0.5 image, then repeat the process on the denser cyclic sequence. Defaults: 15 anchors → 30 images → 60 images.
+    4. Prepare one sequence-level FlowMorph model, run one backward probe, and fit every unique image endpoint only once for reuse on both neighboring gaps.
+    5. Round 1 inserts one explicitly prompted α=0.5 frame per gap. Round 2 inserts ten alpha positions per gap while reusing one image-aware interpolation prompt across those ten renders. Defaults: 15 anchors → 30 images → 330 images.
     6. Finish the duplicate-free cyclic sequence with Practical-RIFE, circular SSIM motion equalization, and H.264 export.
 
-    Standalone FLUX generation is never used for recursive midpoint images. At the default one midpoint per gap, every insertion is `raw_frames/frame_001.png` from a completed three-frame FlowMorph run. With multiple midpoints, all ordered interior raw frames come from one FlowMorph run for that gap. Pair runs and checkpoints are written directly into the auto-numbered timestamped Google Drive run directory, so interrupted work can be resumed.
-    '''
+    Standalone FLUX generation is never used for recursive midpoint images. Only requested interior alphas are rendered; redundant reconstructed endpoints, per-pair model reloads, per-pair backward probes, LPIPS audits, and pair archives are omitted in this explicit art-production mode. Endpoint checkpoints and pair manifests are written directly into the auto-numbered timestamped Google Drive run directory, so interrupted work can be resumed.
+    """
 )
 
 notebook["cells"][1]["source"] = lines(
-    r'''
+    r"""
     ## 1. Editable run, model, API, FlowMorph, image, and video settings
 
-    The recursive count grows quickly. With `N` anchors, `M` inserted FlowMorph midpoints per gap, and `R` rounds, the final sequence contains `N × (M + 1)^R` images. The default is 15 standalone anchor generations plus 45 complete three-frame FlowMorph pair runs, producing a 60-image cyclic sequence before RIFE.
+    The two rounds intentionally use different schedules. Round 1 makes one explicitly prompted midpoint in each of 15 gaps. Round 2 sees the resulting 30 images, generates one shared interpolation prompt per gap, and renders ten interior alphas from each cached endpoint pair. This produces 330 unique images before RIFE while fitting only 30 unique endpoints.
 
-    FlowMorph renders `MIDPOINTS_PER_GAP + 2` linear alpha positions. With the default, the only inserted image is alpha `0.5`; alpha `0.0` and `1.0` remain audit reconstructions of the source and target endpoints. Fit and render parameters are exposed below.
-    '''
+    The research defaults use 100 optimization steps per endpoint. This art-production notebook starts at 30, keeps one model loaded, probes it once, and checkpoints every 10 steps. Increase the fit steps only if a one-pair comparison shows a visible benefit.
+    """
 )
 
 settings = "".join(notebook["cells"][2]["source"])
@@ -71,24 +71,32 @@ settings = replace_once(
 )
 settings = replace_once(
     settings,
+    "INTERPOLATION_ROUNDS = 2\nMIDPOINTS_PER_GAP = 1\n",
+    "FLOWMORPH_ROUND_SPECS = [\n"
+    '    {"midpoint_count": 1, "prompt_mode": "explicit_midpoint"},\n'
+    '    {"midpoint_count": 10, "prompt_mode": "shared_midpoint"},\n'
+    "]\n"
+    "INTERPOLATION_ROUNDS = len(FLOWMORPH_ROUND_SPECS)\n",
+)
+settings = replace_once(
+    settings,
     "REUSE_EXISTING_MIDPOINTS = True\n",
     "REUSE_EXISTING_MIDPOINTS = True\n"
-    "RESUME_FLOWMORPH_PAIR_RUNS = True\n\n"
-    "# True FlowMorph fitting/rendering. frame_count is MIDPOINTS_PER_GAP + 2 (default: 3).\n"
+    "RESUME_FLOWMORPH_SEQUENCE = True\n\n"
+    "# Sequence-native true FlowMorph fitting/rendering.\n"
     "FLOWMORPH_FIT_LORA_SCALE = 1.2\n"
     "FLOWMORPH_RENDER_LORA_SCALE = 1.2\n"
     "FLOWMORPH_GUIDANCE_SCALE = 3.6\n"
     "FLOWMORPH_SCHEDULER_POINTS = 100\n"
     "FLOWMORPH_START_TIMESTEP_INDEX = 35\n"
-    "FLOWMORPH_SOURCE_OPTIMIZATION_STEPS = 100\n"
-    "FLOWMORPH_TARGET_OPTIMIZATION_STEPS = 100\n"
+    "FLOWMORPH_SOURCE_OPTIMIZATION_STEPS = 30\n"
+    "FLOWMORPH_TARGET_OPTIMIZATION_STEPS = 30\n"
     "FLOWMORPH_PRED_LEARNING_RATE = 0.04\n"
     "FLOWMORPH_U_LEARNING_RATE = 0.01\n"
     "FLOWMORPH_RENDER_INDICES = [*range(35, 100, 5), 99]\n"
-    "FLOWMORPH_CHECKPOINT_EVERY = 25\n"
-    "FLOWMORPH_SAVE_PAIR_CONTACT_SHEETS = False\n"
-    "FLOWMORPH_SAVE_PAIR_ANIMATIONS = False\n",
+    "FLOWMORPH_CHECKPOINT_EVERY = 10\n",
 )
+settings = replace_once(settings, "RIFE_MULTIPLIER = 4\n", "RIFE_MULTIPLIER = 2\n")
 settings = replace_once(
     settings,
     "# Weak continuity for anchors; pair conditioning for recursive midpoints.\n"
@@ -109,108 +117,99 @@ settings = replace_once(
 )
 notebook["cells"][2]["source"] = settings.splitlines(keepends=True)
 
-dependency_setup = "".join(notebook["cells"][6]["source"])
-dependency_setup = replace_once(
-    dependency_setup,
-    "try:\n    import openai\n    from openai import OpenAI\n",
-    "# FlowMorph evaluates every completed pair with LPIPS. The broad FLUX import\n"
-    "# probe above can succeed in a stock Colab runtime even when this late-stage\n"
-    "# metric dependency is absent, so install and initialize it before any costly fit.\n"
-    "lpips_probe = subprocess.run(\n"
-    "    [sys.executable, \"-c\", \"import lpips\"],\n"
-    "    capture_output=True,\n"
-    "    text=True,\n"
-    ")\n"
-    "if lpips_probe.returncode != 0:\n"
-    "    print(\"Installing required FlowMorph metric dependency: lpips==0.1.4\")\n"
-    "    subprocess.check_call([\n"
-    "        sys.executable, \"-m\", \"pip\", \"install\", \"lpips==0.1.4\"\n"
-    "    ])\n"
-    "try:\n"
-    "    import lpips\n"
-    "    lpips_preflight_model = lpips.LPIPS(net=\"alex\").eval()\n"
-    "except Exception as error:\n"
-    "    raise RuntimeError(\n"
-    "        \"LPIPS/AlexNet preflight failed before FlowMorph fitting. \"\n"
-    "        \"Resolve this dependency before continuing.\"\n"
-    "    ) from error\n"
-    "else:\n"
-    "    del lpips_preflight_model\n"
-    "    print(\"LPIPS 0.1.4 and its AlexNet weights are ready.\")\n\n"
-    "try:\n    import openai\n    from openai import OpenAI\n",
-)
-notebook["cells"][6]["source"] = dependency_setup.splitlines(keepends=True)
-
-validation = "".join(notebook["cells"][10]["source"])
-validation = replace_once(
-    validation,
-    "openai_calls = round_counts[-1] - round_counts[0]\n",
-    "openai_calls = round_counts[-1] - round_counts[0]\n"
-    "flowmorph_pair_runs = sum(round_counts[:-1])\n",
-)
-validation = replace_once(
-    validation,
-    "for name, strength in (\n"
-    "    (\"BASE_REFERENCE_STRENGTH\", BASE_REFERENCE_STRENGTH),\n"
-    "    (\"MIDPOINT_REFERENCE_STRENGTH\", MIDPOINT_REFERENCE_STRENGTH),\n"
-    "):\n"
-    "    if not 0 < strength <= 0.35:\n"
-    "        raise ValueError(f\"{name} must lie in (0, 0.35]\")\n",
-    "if not 0 < BASE_REFERENCE_STRENGTH <= 0.35:\n"
-    "    raise ValueError(\"BASE_REFERENCE_STRENGTH must lie in (0, 0.35]\")\n",
-)
-validation = replace_once(
-    validation,
-    "    \"openai_vision_calls\": openai_calls,\n"
-    "    \"total_flux_images\": round_counts[-1],\n"
-    "    \"cyclic_gaps_per_round\": round_counts[:-1],\n",
-    "    \"openai_vision_calls\": openai_calls,\n"
-    "    \"standalone_flux_anchor_images\": round_counts[0],\n"
-    "    \"flowmorph_pair_runs\": flowmorph_pair_runs,\n"
-    "    \"final_generated_sequence_images\": round_counts[-1],\n"
-    "    \"cyclic_gaps_per_round\": round_counts[:-1],\n",
-)
-validation += dedent(
-    r'''
-
+notebook["cells"][10]["source"] = lines(
+    r"""
+    if not 3 <= BASE_PROMPT_COUNT <= len(BASE_STAGES):
+        raise ValueError(f"BASE_PROMPT_COUNT must be between 3 and {len(BASE_STAGES)}")
+    if len(FLOWMORPH_ROUND_SPECS) != 2:
+        raise ValueError("This notebook expects exactly two FlowMorph rounds")
+    allowed_prompt_modes = {"explicit_midpoint", "shared_midpoint"}
+    for index, spec in enumerate(FLOWMORPH_ROUND_SPECS, start=1):
+        if spec.get("prompt_mode") not in allowed_prompt_modes:
+            raise ValueError(f"Invalid prompt mode in round {index}: {spec}")
+        if not 1 <= int(spec.get("midpoint_count", 0)) <= 20:
+            raise ValueError(f"Round {index} midpoint_count must be between 1 and 20")
+    if FLOWMORPH_ROUND_SPECS[0] != {"midpoint_count": 1, "prompt_mode": "explicit_midpoint"}:
+        raise ValueError("Round 1 must use one explicitly prompted midpoint")
+    if FLOWMORPH_ROUND_SPECS[1] != {"midpoint_count": 10, "prompt_mode": "shared_midpoint"}:
+        raise ValueError("Round 2 must use ten renders sharing one interpolation prompt")
+    if not (256 <= IMAGE_WIDTH <= 2048 and IMAGE_WIDTH % 16 == 0):
+        raise ValueError("IMAGE_WIDTH must be 256–2048 and divisible by 16")
+    if not (256 <= IMAGE_HEIGHT <= 2048 and IMAGE_HEIGHT % 16 == 0):
+        raise ValueError("IMAGE_HEIGHT must be 256–2048 and divisible by 16")
+    if not 1 <= IMAGE_INFERENCE_STEPS <= 100:
+        raise ValueError("IMAGE_INFERENCE_STEPS must be between 1 and 100")
+    if not 0 <= IMAGE_GUIDANCE_SCALE <= 20:
+        raise ValueError("IMAGE_GUIDANCE_SCALE must be between 0 and 20")
+    if not 0 < IMAGE_LORA_SCALE <= 4:
+        raise ValueError("IMAGE_LORA_SCALE must lie in (0, 4]")
+    if not 0 < BASE_REFERENCE_STRENGTH <= 0.35:
+        raise ValueError("BASE_REFERENCE_STRENGTH must lie in (0, 0.35]")
+    if OPENAI_IMAGE_DETAIL not in {"low", "high", "original", "auto"}:
+        raise ValueError("OPENAI_IMAGE_DETAIL must be low, high, original, or auto")
     if FLOWMORPH_START_TIMESTEP_INDEX != FLOWMORPH_RENDER_INDICES[0]:
-        raise ValueError("The first FLOWMORPH_RENDER_INDICES value must equal FLOWMORPH_START_TIMESTEP_INDEX")
+        raise ValueError("The first render index must equal the FlowMorph start index")
     if FLOWMORPH_RENDER_INDICES != sorted(set(FLOWMORPH_RENDER_INDICES)):
         raise ValueError("FLOWMORPH_RENDER_INDICES must be strictly increasing")
     if FLOWMORPH_RENDER_INDICES[-1] >= FLOWMORPH_SCHEDULER_POINTS:
-        raise ValueError("FLOWMORPH_RENDER_INDICES must be smaller than FLOWMORPH_SCHEDULER_POINTS")
-    if FLOWMORPH_SOURCE_OPTIMIZATION_STEPS < 1 or FLOWMORPH_TARGET_OPTIMIZATION_STEPS < 1:
+        raise ValueError("FLOWMORPH_RENDER_INDICES must be smaller than scheduler points")
+    if FLOWMORPH_SOURCE_OPTIMIZATION_STEPS != FLOWMORPH_TARGET_OPTIMIZATION_STEPS:
+        raise ValueError("Sequence-cached endpoints require one shared optimization-step count")
+    if FLOWMORPH_SOURCE_OPTIMIZATION_STEPS < 1:
         raise ValueError("FlowMorph optimization steps must be positive")
-    flowmorph_frame_count = MIDPOINTS_PER_GAP + 2
-    flowmorph_alphas = [index / (flowmorph_frame_count - 1) for index in range(flowmorph_frame_count)]
+
+    ACTIVE_BASE_STAGES = BASE_STAGES[:BASE_PROMPT_COUNT]
+    ids = [item["id"] for item in ACTIVE_BASE_STAGES]
+    if len(ids) != len(set(ids)) or any(not re.fullmatch(r"[a-z0-9_]+", item) for item in ids):
+        raise ValueError("Anchor IDs must be unique lowercase snake_case values")
+    for item in ACTIVE_BASE_STAGES:
+        if not item["science"].strip() or not item["prompt"].strip():
+            raise ValueError(f"Blank science or prompt in {item['id']}")
+        if item["prompt"].casefold().count(LORA_TRIGGER.casefold()) != 1:
+            raise ValueError(f"{item['id']} must contain the LoRA trigger exactly once")
+
+    round_counts = [BASE_PROMPT_COUNT]
+    for spec in FLOWMORPH_ROUND_SPECS:
+        round_counts.append(round_counts[-1] * (int(spec["midpoint_count"]) + 1))
+    pair_renders = sum(round_counts[:-1])
+    openai_calls = pair_renders  # One image-aware prompt per gap in both modes.
+    unique_endpoint_fits = round_counts[-2]
     print({
-        "flowmorph_frames_per_pair": flowmorph_frame_count,
-        "flowmorph_alphas": flowmorph_alphas,
-        "inserted_frame_indices": list(range(1, flowmorph_frame_count - 1)),
+        "anchor_images": BASE_PROMPT_COUNT,
+        "sequence_counts": round_counts,
+        "openai_vision_calls": openai_calls,
+        "sequence_pair_renders": pair_renders,
+        "unique_endpoint_fits": unique_endpoint_fits,
+        "final_generated_sequence_images": round_counts[-1],
+        "round_specs": FLOWMORPH_ROUND_SPECS,
+        "rife_multiplier": RIFE_MULTIPLIER,
     })
-    '''
+    print("Anchor order:", " → ".join(ids), "→", ids[0])
+    """
 )
-notebook["cells"][10]["source"] = validation.splitlines(keepends=True)
 
 contract = "".join(notebook["cells"][17]["source"])
 pair_reference_marker = "\ndef pair_soft_reference(left_path, right_path, fraction):\n"
 if pair_reference_marker not in contract:
     raise RuntimeError("Could not locate obsolete standalone midpoint reference helper")
-contract = contract.split(pair_reference_marker, 1)[0].rstrip() + "\n\nprint(\"Image-aware structured midpoint prompt contract ready for FlowMorph.\")\n"
+contract = (
+    contract.split(pair_reference_marker, 1)[0].rstrip()
+    + '\n\nprint("Image-aware structured midpoint prompt contract ready for FlowMorph.")\n'
+)
 notebook["cells"][17]["source"] = contract.splitlines(keepends=True)
 
 notebook["cells"][18]["source"] = lines(
-    r'''
+    r"""
     ## 9. Recursively fit and insert true FlowMorph midpoint images
 
     Every cyclic gap receives one FlowMorph run. With the default one midpoint, the OpenAI model supplies the alpha-0.5 prompt and FlowMorph renders `[source, midpoint, target]` at alphas `[0.0, 0.5, 1.0]`. If `MIDPOINTS_PER_GAP` is larger, all requested fractional prompts are generated first and one `(M + 2)`-frame FlowMorph run renders the ordered schedule `[source, midpoint 1, …, midpoint M, target]`; the interior raw frames are inserted.
 
     Pair run directories live directly under this run's Drive folder and include staged inputs, source and target endpoint checkpoints, optimization histories, raw/display frames, metrics, provenance, and the validated archive. Proposal and FlowMorph fingerprints prevent stale reuse when images, prompts, or numerical settings change. No individual pair images are displayed; each completed round ends with one compact contact sheet.
-    '''
+    """
 )
 
 notebook["cells"][19]["source"] = lines(
-    r'''
+    r"""
     import gc
     from flowmorph_klein.cli import select_hardware_profile
     from flowmorph_klein.config import ProjectTemplateConfig, load_config, resolve_config
@@ -537,15 +536,521 @@ notebook["cells"][19]["source"] = lines(
         "true_flowmorph_interior_images": len(FINAL_RECORDS) - len(BASE_RECORDS),
         "manifest": str(FINAL_SEQUENCE_MANIFEST),
     })
-    '''
+    """
+)
+
+# Replace the earlier pair-run implementation with the sequence-native art path.
+notebook["cells"][18]["source"] = lines(
+    r"""
+    ## 9. Sequence-native FlowMorph: cached endpoints, one model, one probe
+
+    Round 1 generates one image-aware midpoint prompt and one true α=0.5 FlowMorph render per anchor gap. Round 2 analyzes each of the resulting 30 neighboring pairs once, then reuses that one interpolation prompt across ten true interior-alpha renders (`1/11` through `10/11`).
+
+    The FLUX.2 model is loaded once. Every unique input image is encoded and fitted once, its endpoint checkpoint is reused for both neighboring gaps, and the production backward probe runs once for the live model. Only requested interior frames are rendered; this art path intentionally omits redundant endpoint reconstructions, pair-level LPIPS, pair archives, and repeated model setup. All endpoint checkpoints, prompts, rendered PNGs, and completion manifests remain resumable in the Drive run directory.
+    """
+)
+
+notebook["cells"][19]["source"] = lines(
+    r"""
+    import gc
+    from flowmorph_klein.cli import select_hardware_profile
+    from flowmorph_klein.config import ProjectTemplateConfig, load_config, resolve_config
+    from flowmorph_klein.pipeline import FlowMorphRunner
+    from flowmorph_klein.sequence import FlowMorphSequenceSession
+
+    # Explicit art-mode contract: preserve the numerical and geometry safety
+    # checks while allowing the sequence engine to render interior alphas only.
+    def validate_sequence_flowmorph_contract(config):
+        for name, value in (("width", config.input.width), ("height", config.input.height)):
+            if not 256 <= value <= 2048 or value % 16 != 0:
+                raise ValueError(f"input.{name} must be 256–2048 and divisible by 16")
+        if config.flowmorph.frame_count < 3:
+            raise ValueError("The bootstrap FlowMorph config needs at least three prompt slots")
+        if config.flowmorph.render_conditioning_mode.value != "prompt_schedule":
+            raise ValueError("Sequence FlowMorph requires prompt_schedule conditioning")
+        if len(config.input.bridge_prompts or ()) != config.flowmorph.frame_count:
+            raise ValueError("Bootstrap prompt schedule length must equal frame_count")
+
+    ProjectTemplateConfig._validate_full_shape_contract = validate_sequence_flowmorph_contract
+    print("Sequence-native experimental FlowMorph contract enabled.")
+
+    # The standalone anchor pipeline is fused and CPU-offloaded. Release it;
+    # the sequence session loads one unfused differentiable model and retains it.
+    release_flux_pipeline()
+
+    def usage_payload(response):
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        return usage.model_dump(mode="json") if hasattr(usage, "model_dump") else str(usage)
+
+    def stable_fingerprint(payload):
+        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(serialized).hexdigest()
+
+    def load_or_create_shared_prompt(left, right, round_number, gap_index, prompt_mode, path):
+        request_fingerprint, request_contract = midpoint_request_fingerprint(left, right, 0.5)
+        prompt_contract = {
+            "request_fingerprint": request_fingerprint,
+            "round": round_number,
+            "gap_index": gap_index,
+            "prompt_mode": prompt_mode,
+            "one_prompt_reused_for_every_rendered_alpha": prompt_mode == "shared_midpoint",
+        }
+        combined_fingerprint = stable_fingerprint(prompt_contract)
+        if REUSE_EXISTING_MIDPOINTS and path.is_file():
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if saved.get("combined_fingerprint") == combined_fingerprint:
+                return (
+                    MidpointProposal.model_validate(saved["proposal"]),
+                    saved.get("openai_response_id"),
+                    saved.get("usage"),
+                    combined_fingerprint,
+                )
+        proposal, response = propose_midpoint(left, right, 0.5)
+        usage = usage_payload(response)
+        path.write_text(json.dumps({
+            "round": round_number,
+            "gap_index": gap_index,
+            "left_uid": left["uid"],
+            "right_uid": right["uid"],
+            "prompt_mode": prompt_mode,
+            "combined_fingerprint": combined_fingerprint,
+            "prompt_contract": prompt_contract,
+            "request_contract": request_contract,
+            "proposal": proposal.model_dump(mode="json"),
+            "openai_model": OPENAI_MODEL,
+            "openai_response_id": response.id,
+            "usage": usage,
+            "image_inputs_stored_in_manifest": False,
+        }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return proposal, response.id, usage, combined_fingerprint
+
+    SEQUENCE_ROOT = RUN_DIRECTORY / "flowmorph_sequence"
+    SEQUENCE_SESSION_DIRECTORY = SEQUENCE_ROOT / "session"
+    SEQUENCE_ENDPOINT_ROOT = SEQUENCE_ROOT / "endpoints"
+    SEQUENCE_ASSET_ROOT = SEQUENCE_ROOT / "encoded_inputs"
+    for directory in (SEQUENCE_ROOT, SEQUENCE_ENDPOINT_ROOT, SEQUENCE_ASSET_ROOT):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    bootstrap_left = BASE_RECORDS[0]
+    bootstrap_right = BASE_RECORDS[1]
+    bootstrap_schedule = [
+        bootstrap_left["prompt"],
+        bootstrap_left["prompt"],
+        bootstrap_right["prompt"],
+    ]
+    session_overrides = {
+        "run_mode": "experimental",
+        "project.name": f"{PROJECT_NAME}_sequence_session",
+        "model.id": MODEL_ID,
+        "model.revision": MODEL_REVISION,
+        "lora.source": str(LOCAL_LORA_PATH),
+        "lora.revision": None,
+        "lora.weight_name": LOCAL_LORA_PATH.name,
+        "lora.adapter_name": LORA_ADAPTER_NAME,
+        "lora.fit_scale": FLOWMORPH_FIT_LORA_SCALE,
+        "lora.render_scale": FLOWMORPH_RENDER_LORA_SCALE,
+        "lora.require_base_9b_compatibility": False,
+        "lora.allow_distilled_9b": True,
+        "input.source_image": str(bootstrap_left["path"]),
+        "input.target_image": str(bootstrap_right["path"]),
+        "input.source_prompt": bootstrap_left["prompt"],
+        "input.target_prompt": bootstrap_right["prompt"],
+        "input.bridge_prompt": None,
+        "input.bridge_prompts": bootstrap_schedule,
+        "input.width": IMAGE_WIDTH,
+        "input.height": IMAGE_HEIGHT,
+        "flowmorph.scheduler_points": FLOWMORPH_SCHEDULER_POINTS,
+        "flowmorph.start_timestep_index": FLOWMORPH_START_TIMESTEP_INDEX,
+        "flowmorph.optimization_steps_source": FLOWMORPH_SOURCE_OPTIMIZATION_STEPS,
+        "flowmorph.optimization_steps_target": FLOWMORPH_TARGET_OPTIMIZATION_STEPS,
+        "flowmorph.pred_learning_rate": FLOWMORPH_PRED_LEARNING_RATE,
+        "flowmorph.u_learning_rate": FLOWMORPH_U_LEARNING_RATE,
+        "flowmorph.frame_count": len(bootstrap_schedule),
+        "flowmorph.render_indices": FLOWMORPH_RENDER_INDICES,
+        "flowmorph.alpha_schedule": "linear",
+        "flowmorph.render_conditioning_mode": "prompt_schedule",
+        "flowmorph.checkpoint_every": FLOWMORPH_CHECKPOINT_EVERY,
+        "guidance.scale": FLOWMORPH_GUIDANCE_SCALE,
+        "reproducibility.seed": BASE_SEED,
+        "paths.input_root": str(RUN_DIRECTORY),
+        "paths.work_root": str(Path(LOCAL_ASSET_ROOT) / PROJECT_NAME / "sequence_work"),
+        "paths.result_root": str(SEQUENCE_ROOT),
+        "paths.hf_cache": HF_CACHE_DIR,
+        "paths.drive_root": None,
+        "output.fps": int(SOURCE_SEQUENCE_FPS),
+        "output.save_contact_sheet": False,
+        "output.save_webp": False,
+        "output.save_gif": False,
+        "output.save_mp4": False,
+        "output.create_zip": False,
+    }
+    session_template = load_config(CONFIG_PATH, overrides=session_overrides)
+    session_profile = select_hardware_profile(
+        PROFILE if PROFILE != "auto" else session_template.model.profile
+    )
+    session_config = resolve_config(
+        session_template,
+        selected_profile=session_profile,
+        check_input_files=True,
+    )
+    session_resume = (
+        RESUME_FLOWMORPH_SEQUENCE
+        and (SEQUENCE_SESSION_DIRECTORY / "run_manifest.json").is_file()
+    )
+    SEQUENCE_RUNNER = FlowMorphRunner.from_config(
+        session_config,
+        run_directory=SEQUENCE_SESSION_DIRECTORY,
+    )
+    SEQUENCE_RUNNER.prepare(resume=session_resume)
+    SEQUENCE_SESSION = FlowMorphSequenceSession(SEQUENCE_RUNNER)
+    PROBE_REPORT = SEQUENCE_SESSION.run_backward_probe_once()
+    print({
+        "model_loads": 1,
+        "backward_probes": 1,
+        "fit_steps_per_unique_endpoint": FLOWMORPH_SOURCE_OPTIMIZATION_STEPS,
+        "probe_peak_reserved_gib": round(PROBE_REPORT.peak_reserved_vram_bytes / (1024 ** 3), 3),
+    })
+
+    IMAGE_ASSET_CACHE, PROMPT_CONDITIONING_CACHE = SEQUENCE_SESSION.seed_prepared_assets(
+        bootstrap_left["uid"],
+        bootstrap_right["uid"],
+    )
+    ENDPOINT_CACHE = {}
+    ENDPOINT_FINGERPRINTS = {}
+    ROUND_MANIFESTS = []
+    FLOWMORPH_PAIR_RENDER_COUNT = 0
+    OPENAI_SHARED_PROMPT_COUNT = 0
+    UNIQUE_ENDPOINT_FIT_COUNT = 0
+    CURRENT_RECORDS = list(BASE_RECORDS)
+
+    def endpoint_fingerprint(record):
+        return stable_fingerprint({
+            "uid": record["uid"],
+            "image_sha256": file_sha256(record["path"]),
+            "prompt": record["prompt"],
+            "model_id": MODEL_ID,
+            "model_revision": MODEL_REVISION,
+            "lora_sha256": file_sha256(LOCAL_LORA_PATH),
+            "fit_lora_scale": FLOWMORPH_FIT_LORA_SCALE,
+            "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
+            "scheduler_points": FLOWMORPH_SCHEDULER_POINTS,
+            "start_timestep_index": FLOWMORPH_START_TIMESTEP_INDEX,
+            "optimization_steps": FLOWMORPH_SOURCE_OPTIMIZATION_STEPS,
+            "pred_learning_rate": FLOWMORPH_PRED_LEARNING_RATE,
+            "u_learning_rate": FLOWMORPH_U_LEARNING_RATE,
+            "width": IMAGE_WIDTH,
+            "height": IMAGE_HEIGHT,
+        })
+
+    for round_number, round_spec in enumerate(FLOWMORPH_ROUND_SPECS, start=1):
+        midpoint_count = int(round_spec["midpoint_count"])
+        prompt_mode = str(round_spec["prompt_mode"])
+        fractions = [index / (midpoint_count + 1) for index in range(1, midpoint_count + 1)]
+        round_directory = RUN_DIRECTORY / "rounds" / f"round_{round_number:02d}"
+        image_directory = round_directory / "images"
+        proposal_directory = round_directory / "proposals"
+        for directory in (round_directory, image_directory, proposal_directory):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        incoming = list(CURRENT_RECORDS)
+        gap_count = len(incoming)
+        pair_jobs = []
+
+        # One image-aware LLM proposal per gap. In round 2 it is reused for all
+        # ten alpha positions instead of making ten calls or inventing ten prompts.
+        for gap_index, left in enumerate(incoming):
+            right = incoming[(gap_index + 1) % gap_count]
+            pair_uid = f"r{round_number:02d}_g{gap_index:04d}"
+            proposal_path = proposal_directory / f"{pair_uid}_shared.json"
+            proposal, response_id, usage, proposal_fingerprint = load_or_create_shared_prompt(
+                left,
+                right,
+                round_number,
+                gap_index,
+                prompt_mode,
+                proposal_path,
+            )
+            OPENAI_SHARED_PROMPT_COUNT += 1
+            frame_records = []
+            for midpoint_index, fraction in enumerate(fractions, start=1):
+                uid = f"{pair_uid}_m{midpoint_index:02d}"
+                frame_records.append({
+                    "uid": uid,
+                    "fraction": fraction,
+                    "output_path": image_directory / f"{uid}.png",
+                })
+            pair_contract = {
+                "method": "sequence-cached FlowMorph interior-alpha rendering",
+                "round": round_number,
+                "prompt_mode": prompt_mode,
+                "left_uid": left["uid"],
+                "left_image_sha256": file_sha256(left["path"]),
+                "left_prompt": left["prompt"],
+                "right_uid": right["uid"],
+                "right_image_sha256": file_sha256(right["path"]),
+                "right_prompt": right["prompt"],
+                "proposal_fingerprint": proposal_fingerprint,
+                "shared_midpoint_prompt": proposal.prompt,
+                "alphas": fractions,
+                "render_indices": list(FLOWMORPH_RENDER_INDICES),
+                "render_lora_scale": FLOWMORPH_RENDER_LORA_SCALE,
+                "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
+            }
+            pair_fingerprint = stable_fingerprint(pair_contract)
+            completion_path = image_directory / f"{pair_uid}.flowmorph.json"
+            completion = None
+            completed = False
+            if completion_path.is_file() and all(item["output_path"].is_file() for item in frame_records):
+                completion = json.loads(completion_path.read_text(encoding="utf-8"))
+                completed = completion.get("pair_fingerprint") == pair_fingerprint
+            pair_jobs.append({
+                "pair_uid": pair_uid,
+                "left": left,
+                "right": right,
+                "proposal": proposal,
+                "proposal_path": proposal_path,
+                "response_id": response_id,
+                "usage": usage,
+                "frame_records": frame_records,
+                "pair_contract": pair_contract,
+                "pair_fingerprint": pair_fingerprint,
+                "completion_path": completion_path,
+                "completion": completion,
+                "completed": completed,
+            })
+
+        missing_prompts = []
+        for record in incoming:
+            if record["prompt"] not in PROMPT_CONDITIONING_CACHE:
+                missing_prompts.append(record["prompt"])
+        for job in pair_jobs:
+            prompt = job["proposal"].prompt
+            if prompt not in PROMPT_CONDITIONING_CACHE:
+                missing_prompts.append(prompt)
+        missing_images = {
+            record["uid"]: (
+                record["path"],
+                SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
+            )
+            for record in incoming
+            if record["uid"] not in IMAGE_ASSET_CACHE
+        }
+        if missing_prompts or missing_images:
+            new_prompts, new_images = SEQUENCE_SESSION.encode_missing_assets(
+                prompts=missing_prompts,
+                images=missing_images,
+            )
+            PROMPT_CONDITIONING_CACHE.update(new_prompts)
+            IMAGE_ASSET_CACHE.update(new_images)
+        print({
+            "round": round_number,
+            "encoded_unique_images_total": len(IMAGE_ASSET_CACHE),
+            "encoded_unique_prompts_total": len(PROMPT_CONDITIONING_CACHE),
+        })
+
+        # Fit each unique incoming image once. An anchor fitted in round 1 is
+        # reused in round 2 and on both its left and right neighboring gaps.
+        for fit_index, record in enumerate(incoming, start=1):
+            uid = record["uid"]
+            if uid in ENDPOINT_CACHE:
+                continue
+            fingerprint = endpoint_fingerprint(record)
+            checkpoint_directory = SEQUENCE_ENDPOINT_ROOT / f"{uid}_{fingerprint[:12]}"
+            result = SEQUENCE_SESSION.fit_endpoint(
+                endpoint_key=uid,
+                asset=IMAGE_ASSET_CACHE[uid],
+                conditioning=PROMPT_CONDITIONING_CACHE[record["prompt"]],
+                checkpoint_directory=checkpoint_directory,
+                resume=RESUME_FLOWMORPH_SEQUENCE and checkpoint_directory.exists(),
+            )
+            ENDPOINT_CACHE[uid] = result.endpoint
+            ENDPOINT_FINGERPRINTS[uid] = fingerprint
+            UNIQUE_ENDPOINT_FIT_COUNT += 1
+            print(
+                f"Round {round_number} endpoint {fit_index}/{len(incoming)}: {uid}; "
+                f"steps={result.completed_steps}; checkpoint_reused={result.resumed}"
+            )
+
+        # Render every pending pair while the transformer remains resident.
+        pending_frames = []
+        pending_paths = []
+        pending_jobs = []
+        for pair_index, job in enumerate(pair_jobs, start=1):
+            FLOWMORPH_PAIR_RENDER_COUNT += 1
+            if job["completed"]:
+                print(f"Reusing completed pair {job['pair_uid']}")
+                continue
+            left = job["left"]
+            right = job["right"]
+            shared = PROMPT_CONDITIONING_CACHE[job["proposal"].prompt]
+            rendered = SEQUENCE_SESSION.render_midpoints(
+                source=ENDPOINT_CACHE[left["uid"]],
+                target=ENDPOINT_CACHE[right["uid"]],
+                source_conditioning=PROMPT_CONDITIONING_CACHE[left["prompt"]],
+                target_conditioning=PROMPT_CONDITIONING_CACHE[right["prompt"]],
+                midpoint_conditionings=[shared] * midpoint_count,
+                alphas=fractions,
+            )
+            start_index = len(pending_frames)
+            pending_frames.extend(rendered)
+            pending_paths.extend(item["output_path"] for item in job["frame_records"])
+            job["pending_slice"] = (start_index, start_index + len(rendered))
+            pending_jobs.append(job)
+            print(
+                f"Rendered pair {pair_index}/{len(pair_jobs)}: {job['pair_uid']} "
+                f"({midpoint_count} interior frame(s))"
+            )
+
+        # One component swap and streaming VAE decode for the entire round.
+        if pending_frames:
+            SEQUENCE_SESSION.decode_frames_to_paths(
+                pending_frames,
+                pending_paths,
+                restore_transformer=False,
+            )
+        for job in pending_jobs:
+            start_index, end_index = job["pending_slice"]
+            inserted = [
+                {
+                    "alpha": item["fraction"],
+                    "image": str(item["output_path"]),
+                    "shared_prompt": job["proposal"].prompt,
+                }
+                for item in job["frame_records"]
+            ]
+            completion = {
+                "status": "complete",
+                "pair_uid": job["pair_uid"],
+                "pair_fingerprint": job["pair_fingerprint"],
+                "pair_contract": job["pair_contract"],
+                "sequence_session_directory": str(SEQUENCE_SESSION_DIRECTORY),
+                "left_endpoint_checkpoint_fingerprint": ENDPOINT_FINGERPRINTS[job["left"]["uid"]],
+                "right_endpoint_checkpoint_fingerprint": ENDPOINT_FINGERPRINTS[job["right"]["uid"]],
+                "rendered_latent_count": end_index - start_index,
+                "inserted": inserted,
+            }
+            job["completion_path"].write_text(
+                json.dumps(completion, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            job["completion"] = completion
+            job["completed"] = True
+        del pending_frames
+        gc.collect()
+
+        outgoing = []
+        for job in pair_jobs:
+            left = job["left"]
+            right = job["right"]
+            proposal = job["proposal"]
+            outgoing.append(left)
+            for frame_record in job["frame_records"]:
+                outgoing.append({
+                    "uid": frame_record["uid"],
+                    "kind": "flowmorph_midpoint",
+                    "round": round_number,
+                    "prompt_mode": prompt_mode,
+                    "fraction": frame_record["fraction"],
+                    "alpha": frame_record["fraction"],
+                    "left_uid": left["uid"],
+                    "right_uid": right["uid"],
+                    "science": proposal.science_connection,
+                    "visual_correspondence": proposal.visual_correspondence,
+                    "prompt": proposal.prompt,
+                    "path": str(frame_record["output_path"]),
+                    "proposal_path": str(job["proposal_path"]),
+                    "flowmorph_completion_path": str(job["completion_path"]),
+                    "flowmorph_sequence_session": str(SEQUENCE_SESSION_DIRECTORY),
+                    "flowmorph_fingerprint": job["pair_fingerprint"],
+                    "openai_response_id": job["response_id"],
+                    "usage": job["usage"],
+                })
+
+        CURRENT_RECORDS = outgoing
+        round_manifest_path = round_directory / "sequence_manifest.json"
+        round_manifest_path.write_text(json.dumps({
+            "round": round_number,
+            "cyclic": True,
+            "interpolation_method": "sequence-cached true FlowMorph interior-alpha renders",
+            "prompt_mode": prompt_mode,
+            "one_shared_prompt_per_gap": True,
+            "input_count": len(incoming),
+            "midpoints_per_gap": midpoint_count,
+            "alphas": fractions,
+            "output_count": len(outgoing),
+            "records": outgoing,
+        }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        ROUND_MANIFESTS.append(str(round_manifest_path))
+
+        # Contact sheets use small thumbnails; never allocate a 330 × 1024px mosaic.
+        round_contact_sheet = round_directory / "contact_sheet.png"
+        round_images = []
+        for item in outgoing:
+            preview_image = Image.open(item["path"]).convert("RGB")
+            preview_image.thumbnail((160, 160))
+            round_images.append(preview_image)
+        make_contact_sheet(
+            round_images,
+            round_contact_sheet,
+            columns=min(CONTACT_SHEET_COLUMNS, len(round_images)),
+            labels=[item["uid"] for item in outgoing],
+        )
+        for image in round_images:
+            image.close()
+        preview = Image.open(round_contact_sheet).convert("RGB")
+        preview.thumbnail((CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000))
+        display(Markdown(f"### Sequence FlowMorph round {round_number}: {len(outgoing)} cyclic images"))
+        display(preview)
+        preview.close()
+
+    FINAL_RECORDS = CURRENT_RECORDS
+    FINAL_SEQUENCE_MANIFEST = RUN_DIRECTORY / "metadata" / "final_recursive_flowmorph_sequence.json"
+    FINAL_SEQUENCE_MANIFEST.write_text(json.dumps({
+        "project": PROJECT_NAME,
+        "cyclic": True,
+        "interpolation_method": "one-model sequence-cached true FlowMorph",
+        "anchor_count": len(BASE_RECORDS),
+        "round_specs": FLOWMORPH_ROUND_SPECS,
+        "model_loads": 1,
+        "backward_probes": 1,
+        "unique_endpoint_fits": UNIQUE_ENDPOINT_FIT_COUNT,
+        "pair_renders": FLOWMORPH_PAIR_RENDER_COUNT,
+        "one_openai_prompt_per_gap": True,
+        "openai_prompt_count": OPENAI_SHARED_PROMPT_COUNT,
+        "final_count": len(FINAL_RECORDS),
+        "round_manifests": ROUND_MANIFESTS,
+        "records": FINAL_RECORDS,
+    }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print({
+        "final_images": len(FINAL_RECORDS),
+        "unique_endpoint_fits": UNIQUE_ENDPOINT_FIT_COUNT,
+        "pair_renders": FLOWMORPH_PAIR_RENDER_COUNT,
+        "model_loads": 1,
+        "backward_probes": 1,
+        "manifest": str(FINAL_SEQUENCE_MANIFEST),
+    })
+
+    # Free the retained 9B model before the RIFE subprocess claims the GPU.
+    for component_name in ("transformer", "vae", "text_encoder"):
+        component = getattr(SEQUENCE_RUNNER.pipeline, component_name, None)
+        if component is not None and callable(getattr(component, "to", None)):
+            component.to("cpu")
+    del ENDPOINT_CACHE, IMAGE_ASSET_CACHE, PROMPT_CONDITIONING_CACHE
+    del SEQUENCE_SESSION, SEQUENCE_RUNNER, session_config, session_template
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Released the sequence FlowMorph model; RIFE can now use the GPU.")
+    """
 )
 
 notebook["cells"][20]["source"] = lines(
-    r'''
+    r"""
     ## 10. Assemble, preview, and audit the generated cyclic FlowMorph sequence
 
-    No endpoint is duplicated. Every inserted image is a true FlowMorph interior-alpha render; the default is alpha 0.5. The final-to-first gap is included in every recursive round, and optional rotation places the playback boundary at the quietest neighboring pair without changing circular order.
-    '''
+    No endpoint is duplicated. Round 1 contributes one α=0.5 render per gap; round 2 contributes ten renders per gap at `1/11 … 10/11`, all driven by the gap's single shared image-aware prompt. The final-to-first gap is included in both rounds, and optional rotation places the playback boundary at the quietest neighboring pair without changing circular order.
+    """
 )
 
 final_video_cell = "".join(notebook["cells"][27]["source"])
