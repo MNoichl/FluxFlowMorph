@@ -307,6 +307,21 @@ def interpolate_conditioning(
     )
 
 
+def interpolate_conditioning_through_midpoint(
+    source: ConditioningPackage,
+    midpoint: ConditioningPackage,
+    target: ConditioningPackage,
+    alpha: float,
+) -> ConditioningPackage:
+    """Interpolate source→midpoint→target embeddings over the unit interval."""
+
+    if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be finite and lie in [0, 1]")
+    if alpha <= 0.5:
+        return interpolate_conditioning(source, midpoint, alpha * 2.0)
+    return interpolate_conditioning(midpoint, target, (alpha - 0.5) * 2.0)
+
+
 def select_render_conditioning(
     cache: ConditioningCache,
     mode: str,

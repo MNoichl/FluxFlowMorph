@@ -7,12 +7,28 @@ is committed normally. Secret values remain in external files, never cells.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from textwrap import dedent
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = ROOT / "notebooks" / "StillLife_Recursive_Vision_Interpolation.ipynb"
+OUTPUT = Path(
+    os.environ.get(
+        "FLOWMORPH_BASE_NOTEBOOK_OUTPUT",
+        ROOT / "notebooks" / "StillLife_Recursive_Vision_Interpolation.ipynb",
+    )
+)
+if (
+    "FLOWMORPH_BASE_NOTEBOOK_OUTPUT" not in os.environ
+    and OUTPUT.exists()
+    and os.environ.get("FLOWMORPH_ALLOW_NOTEBOOK_OVERWRITE") != "1"
+):
+    raise RuntimeError(
+        "Refusing to overwrite the tracked working notebook. Set a temporary "
+        "FLOWMORPH_BASE_NOTEBOOK_OUTPUT, or explicitly set "
+        "FLOWMORPH_ALLOW_NOTEBOOK_OVERWRITE=1."
+    )
 
 
 def _lines(source: str) -> list[str]:
@@ -322,7 +338,7 @@ cells = [
         r"""
         ## 4. Mount Drive, reserve the run directory, and load the API key
 
-        Create `openai_api_key.txt` directly inside `DRIVE_PROJECT_BASE`. The file should contain only the API key and a final newline is optional. It is read into the OpenAI client and then the temporary string is deleted. The notebook prints the path it read, never the key or any key fragment.
+        Create `openaiapikey.txt` directly inside `DRIVE_PROJECT_BASE`. The file should contain only the API key and a final newline is optional. It is read into the OpenAI client and then the temporary string is deleted. The notebook prints the path it read, never the key or any key fragment.
         """
     ),
     code(

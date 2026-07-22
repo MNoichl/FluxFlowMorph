@@ -10,10 +10,10 @@ from flowmorph_klein.renderer import RenderedLatentFrame
 from flowmorph_klein.sequence import FlowMorphSequenceSession
 
 
-def conditioning(prompt: str) -> ConditioningPackage:
+def conditioning(prompt: str, value: float = 0.0) -> ConditioningPackage:
     return ConditioningPackage(
         prompt,
-        torch.zeros((1, 2, 4)),
+        torch.full((1, 2, 4), value),
         torch.zeros((1, 2, 4), dtype=torch.long),
     )
 
@@ -58,7 +58,7 @@ def test_sequence_session_requires_prepared_runner():
         FlowMorphSequenceSession(runner)
 
 
-def test_render_midpoints_uses_only_requested_interior_alphas(monkeypatch):
+def test_render_midpoints_uses_piecewise_endpoint_midpoint_conditioning(monkeypatch):
     runner = FakeRunner()
     session = FlowMorphSequenceSession(runner)
     observed = {}
@@ -77,24 +77,22 @@ def test_render_midpoints_uses_only_requested_interior_alphas(monkeypatch):
         )
 
     monkeypatch.setattr("flowmorph_klein.sequence.render_morph", fake_render_morph)
-    shared = conditioning("one shared prompt")
-    alphas = (1 / 11, 2 / 11, 10 / 11)
+    shared = conditioning("one shared prompt", 2.0)
+    alphas = (0.25, 0.5, 0.75)
     frames = session.render_midpoints(
         source=endpoint(0.0),
         target=endpoint(1.0),
-        source_conditioning=conditioning("left"),
-        target_conditioning=conditioning("right"),
+        source_conditioning=conditioning("left", 0.0),
+        target_conditioning=conditioning("right", 1.0),
         midpoint_conditionings=(shared, shared, shared),
         alphas=alphas,
     )
 
     assert runner.scales == [1.25]
     assert observed["alphas"] == alphas
-    assert [item.prompt for item in observed["frame_conditionings"]] == [
-        "one shared prompt",
-        "one shared prompt",
-        "one shared prompt",
-    ]
+    scheduled = observed["frame_conditionings"]
+    assert [float(item.prompt_embeds.mean()) for item in scheduled] == [1.0, 2.0, 1.5]
+    assert all(isinstance(item.prompt, tuple) and item.prompt[0].startswith("interpolated:") for item in scheduled)
     assert [frame.alpha for frame in frames] == list(alphas)
 
 

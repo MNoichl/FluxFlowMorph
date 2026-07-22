@@ -24,7 +24,11 @@ from .checkpoints import (
     save_endpoint_checkpoint,
     unflatten_optimizer_state,
 )
-from .conditioning import ConditioningPackage, encode_prompt_conditioning
+from .conditioning import (
+    ConditioningPackage,
+    encode_prompt_conditioning,
+    interpolate_conditioning_through_midpoint,
+)
 from .diagnostics import release_cuda_memory
 from .endpoint_optimizer import (
     EndpointOptimizationResult,
@@ -431,6 +435,19 @@ class FlowMorphSequenceSession:
             raise PipelineError("prepared runner lacks schedule")
         runner._set_lora_scale(runner.config.lora.render_scale)
         predictor = runner._bound_predictor()
+        piecewise_conditionings = tuple(
+            interpolate_conditioning_through_midpoint(
+                source_conditioning,
+                midpoint_conditioning,
+                target_conditioning,
+                float(alpha),
+            ).to(self.device)
+            for midpoint_conditioning, alpha in zip(
+                midpoint_conditionings,
+                alphas,
+                strict=True,
+            )
+        )
         frames = render_morph(
             source.to(self.device, dtype=torch.float32),
             target.to(self.device, dtype=torch.float32),
@@ -438,7 +455,7 @@ class FlowMorphSequenceSession:
             predictor=predictor,
             source_conditioning=source_conditioning.to(self.device),
             target_conditioning=target_conditioning.to(self.device),
-            frame_conditionings=tuple(item.to(self.device) for item in midpoint_conditionings),
+            frame_conditionings=piecewise_conditionings,
             alphas=alphas,
             render_indices=runner.config.flowmorph.render_indices,
             conditioning_mode=RenderConditioningMode.PROMPT_SCHEDULE,
@@ -455,7 +472,7 @@ class FlowMorphSequenceSession:
             )
             for frame in frames
         )
-        del predictor, frames
+        del predictor, frames, piecewise_conditionings
         return output
 
     def decode_frames(

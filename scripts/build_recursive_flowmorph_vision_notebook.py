@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import runpy
 from pathlib import Path
@@ -17,12 +18,46 @@ from textwrap import dedent
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE_BUILDER = ROOT / "scripts" / "build_recursive_vision_notebook.py"
-BASE_NOTEBOOK = ROOT / "notebooks" / "StillLife_Recursive_Vision_Interpolation.ipynb"
-OUTPUT = ROOT / "notebooks" / "StillLife_Recursive_FlowMorph_Vision.ipynb"
+BASE_NOTEBOOK = Path(
+    os.environ.get(
+        "FLOWMORPH_BASE_NOTEBOOK_OUTPUT",
+        ROOT / "notebooks" / "StillLife_Recursive_Vision_Interpolation.ipynb",
+    )
+)
+OUTPUT = Path(
+    os.environ.get(
+        "FLOWMORPH_NOTEBOOK_OUTPUT",
+        ROOT / "notebooks" / "StillLife_Recursive_FlowMorph_Vision.ipynb",
+    )
+)
+if (
+    "FLOWMORPH_NOTEBOOK_OUTPUT" not in os.environ
+    and OUTPUT.exists()
+    and os.environ.get("FLOWMORPH_ALLOW_NOTEBOOK_OVERWRITE") != "1"
+):
+    raise RuntimeError(
+        "Refusing to overwrite the tracked working notebook. Generate a reference with "
+        "FLOWMORPH_NOTEBOOK_OUTPUT, or explicitly set "
+        "FLOWMORPH_ALLOW_NOTEBOOK_OVERWRITE=1."
+    )
 
 
 def lines(source: str) -> list[str]:
     return (dedent(source).strip("\n") + "\n").splitlines(keepends=True)
+
+
+def markdown(source: str) -> dict:
+    return {"cell_type": "markdown", "metadata": {}, "source": lines(source)}
+
+
+def code(source: str) -> dict:
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": lines(source),
+    }
 
 
 def replace_once(source: str, old: str, new: str) -> str:
@@ -91,7 +126,7 @@ notebook["cells"][0]["source"] = lines(
     2. Generate only the anchor paintings with FLUX.2 Klein and weak previous-anchor continuity.
     3. For every cyclic neighbor pair, send both actual paintings, prompts, and science descriptions to the OpenAI vision model. It returns one literal midpoint prompt describing an interdisciplinary and optical middle ground.
     4. Prepare one sequence-level FlowMorph model, run one backward probe, and fit every unique image endpoint only once for reuse on both neighboring gaps.
-    5. Round 1 inserts one explicitly prompted α=0.5 frame per gap. Round 2 inserts ten alpha positions per gap while reusing one image-aware interpolation prompt across those ten renders. Defaults: 15 anchors → 30 images → 330 images.
+    5. Round 1 inserts one explicitly prompted α=0.5 frame per gap. Round 2 inserts ten alpha positions per gap using piecewise source→shared-midpoint→target embedding conditioning. Defaults: 15 anchors → 30 images → 330 images.
     6. Finish the duplicate-free cyclic sequence with Practical-RIFE, circular SSIM motion equalization, and H.264 export.
 
     Standalone FLUX generation is never used for recursive midpoint images. Only requested interior alphas are rendered; redundant reconstructed endpoints, per-pair model reloads, per-pair backward probes, LPIPS audits, and pair archives are omitted in this explicit art-production mode. Endpoint checkpoints and pair manifests are written directly into the auto-numbered timestamped Google Drive run directory, so interrupted work can be resumed.
@@ -102,9 +137,9 @@ notebook["cells"][1]["source"] = lines(
     r"""
     ## 1. Editable run, model, API, FlowMorph, image, and video settings
 
-    The two rounds intentionally use different schedules. Round 1 makes one explicitly prompted midpoint in each of 15 gaps. Round 2 sees the resulting 30 images, generates one shared interpolation prompt per gap, and renders ten interior alphas from each cached endpoint pair. This produces 330 unique images before RIFE while fitting only 30 unique endpoints.
+    The two rounds intentionally use different schedules. Round 1 makes one explicitly prompted midpoint in each of 15 gaps. Round 2 sees the resulting 30 images, generates one shared interpolation prompt per gap, and renders ten interior alphas while blending conditioning source→midpoint→target. This produces 330 unique images before RIFE while fitting only 30 unique endpoints.
 
-    The research defaults use 100 optimization steps per endpoint. This art-production notebook starts at 30, keeps one model loaded, probes it once, and checkpoints every 10 steps. Increase the fit steps only if a one-pair comparison shows a visible benefit.
+    The quality-first defaults use 100 optimization steps per endpoint, keep one model loaded, probe it once, and checkpoint every 25 steps. An optional one-gap quality gate renders before the full recursion, and completed PNGs stream to Drive in small pair chunks during the full run.
     """
 )
 
@@ -131,19 +166,29 @@ settings = replace_once(
     "REUSE_EXISTING_MIDPOINTS = True\n"
     "RESUME_FLOWMORPH_SEQUENCE = True\n\n"
     "# Sequence-native true FlowMorph fitting/rendering.\n"
-    "FLOWMORPH_FIT_LORA_SCALE = 1.2\n"
-    "FLOWMORPH_RENDER_LORA_SCALE = 1.2\n"
-    "FLOWMORPH_GUIDANCE_SCALE = 3.6\n"
+    "FLOWMORPH_FIT_LORA_SCALE = 1.0\n"
+    "FLOWMORPH_RENDER_LORA_SCALE = 1.0\n"
+    "FLOWMORPH_GUIDANCE_SCALE = 4.0\n"
     "FLOWMORPH_SCHEDULER_POINTS = 100\n"
     "FLOWMORPH_START_TIMESTEP_INDEX = 35\n"
-    "FLOWMORPH_SOURCE_OPTIMIZATION_STEPS = 30\n"
-    "FLOWMORPH_TARGET_OPTIMIZATION_STEPS = 30\n"
+    "FLOWMORPH_SOURCE_OPTIMIZATION_STEPS = 100\n"
+    "FLOWMORPH_TARGET_OPTIMIZATION_STEPS = 100\n"
     "FLOWMORPH_PRED_LEARNING_RATE = 0.04\n"
     "FLOWMORPH_U_LEARNING_RATE = 0.01\n"
     "FLOWMORPH_RENDER_INDICES = [*range(35, 100, 5), 99]\n"
-    "FLOWMORPH_CHECKPOINT_EVERY = 10\n",
+    "FLOWMORPH_CHECKPOINT_EVERY = 25\n"
+    "FLOWMORPH_STREAM_PAIRS_PER_CHUNK = 3\n"
+    "FLOWMORPH_STREAM_DISPLAY_PROGRESS = True\n",
 )
 settings = replace_once(settings, "RIFE_MULTIPLIER = 4\n", "RIFE_MULTIPLIER = 2\n")
+settings = replace_once(
+    settings,
+    "TRIAL_DISPLAY_MAX_WIDTH = 768\n",
+    "TRIAL_DISPLAY_MAX_WIDTH = 768\n"
+    "RUN_FLOWMORPH_ONE_GAP_TEST = True\n"
+    "FLOWMORPH_ONE_GAP_TEST_INDEX = 0\n"
+    "FLOWMORPH_ONE_GAP_TEST_ALPHAS = [0.25, 0.5, 0.75]\n",
+)
 settings = replace_once(
     settings,
     "# Weak continuity for anchors; pair conditioning for recursive midpoints.\n"
@@ -167,6 +212,14 @@ settings = replace_once(
 for setting_name, setting_value in preserved_local_settings.items():
     settings = restore_literal_assignment(settings, setting_name, setting_value)
 notebook["cells"][2]["source"] = settings.splitlines(keepends=True)
+
+notebook["cells"][11]["source"] = lines(
+    r"""
+    ## 6. Load and fuse the RIJKSOIL LoRA; optional generation and FlowMorph tests
+
+    The first optional trial checks standalone anchor-generation settings. The one-gap FlowMorph quality gate is configured beside it, then runs at the start of section 9 after two real anchor images exist and the reusable FlowMorph model has loaded. It displays and saves `source | α=.25 | α=.5 | α=.75 | target` before the full recursive cell is run.
+    """
+)
 
 notebook["cells"][10]["source"] = lines(
     r"""
@@ -210,6 +263,24 @@ notebook["cells"][10]["source"] = lines(
         raise ValueError("Sequence-cached endpoints require one shared optimization-step count")
     if FLOWMORPH_SOURCE_OPTIMIZATION_STEPS < 1:
         raise ValueError("FlowMorph optimization steps must be positive")
+    if FLOWMORPH_SOURCE_OPTIMIZATION_STEPS != 100:
+        raise ValueError("This quality-first notebook requires 100 endpoint fitting steps")
+    if FLOWMORPH_FIT_LORA_SCALE != IMAGE_LORA_SCALE:
+        raise ValueError("FlowMorph fit LoRA scale must match IMAGE_LORA_SCALE")
+    if FLOWMORPH_RENDER_LORA_SCALE != IMAGE_LORA_SCALE:
+        raise ValueError("FlowMorph render LoRA scale must match IMAGE_LORA_SCALE")
+    if FLOWMORPH_GUIDANCE_SCALE != IMAGE_GUIDANCE_SCALE:
+        raise ValueError("FlowMorph guidance must match IMAGE_GUIDANCE_SCALE")
+    if FLOWMORPH_STREAM_PAIRS_PER_CHUNK < 1:
+        raise ValueError("FLOWMORPH_STREAM_PAIRS_PER_CHUNK must be positive")
+    if not 0 <= FLOWMORPH_ONE_GAP_TEST_INDEX < BASE_PROMPT_COUNT:
+        raise ValueError("FLOWMORPH_ONE_GAP_TEST_INDEX is outside the active anchor range")
+    if (
+        not FLOWMORPH_ONE_GAP_TEST_ALPHAS
+        or FLOWMORPH_ONE_GAP_TEST_ALPHAS != sorted(set(FLOWMORPH_ONE_GAP_TEST_ALPHAS))
+        or any(not 0.0 < alpha < 1.0 for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS)
+    ):
+        raise ValueError("FLOWMORPH_ONE_GAP_TEST_ALPHAS must be unique sorted interior values")
 
     ACTIVE_BASE_STAGES = BASE_STAGES[:BASE_PROMPT_COUNT]
     ids = [item["id"] for item in ACTIVE_BASE_STAGES]
@@ -680,7 +751,27 @@ notebook["cells"][19]["source"] = lines(
         return proposal, response.id, usage, combined_fingerprint
 
     SEQUENCE_ROOT = RUN_DIRECTORY / "flowmorph_sequence"
-    SEQUENCE_SESSION_DIRECTORY = SEQUENCE_ROOT / "session"
+    SEQUENCE_SESSION_CONTRACT = {
+        "model_id": MODEL_ID,
+        "model_revision": MODEL_REVISION,
+        "lora_sha256": file_sha256(LOCAL_LORA_PATH),
+        "fit_lora_scale": FLOWMORPH_FIT_LORA_SCALE,
+        "render_lora_scale": FLOWMORPH_RENDER_LORA_SCALE,
+        "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
+        "scheduler_points": FLOWMORPH_SCHEDULER_POINTS,
+        "start_timestep_index": FLOWMORPH_START_TIMESTEP_INDEX,
+        "optimization_steps": FLOWMORPH_SOURCE_OPTIMIZATION_STEPS,
+        "pred_learning_rate": FLOWMORPH_PRED_LEARNING_RATE,
+        "u_learning_rate": FLOWMORPH_U_LEARNING_RATE,
+        "render_indices": list(FLOWMORPH_RENDER_INDICES),
+        "width": IMAGE_WIDTH,
+        "height": IMAGE_HEIGHT,
+        "conditioning": "piecewise_source_midpoint_target_embeddings",
+    }
+    SEQUENCE_SESSION_FINGERPRINT = stable_fingerprint(SEQUENCE_SESSION_CONTRACT)
+    SEQUENCE_SESSION_DIRECTORY = (
+        SEQUENCE_ROOT / "sessions" / f"session_{SEQUENCE_SESSION_FINGERPRINT[:12]}"
+    )
     SEQUENCE_ENDPOINT_ROOT = SEQUENCE_ROOT / "endpoints"
     SEQUENCE_ASSET_ROOT = SEQUENCE_ROOT / "encoded_inputs"
     for directory in (SEQUENCE_ROOT, SEQUENCE_ENDPOINT_ROOT, SEQUENCE_ASSET_ROOT):
@@ -728,7 +819,12 @@ notebook["cells"][19]["source"] = lines(
         "guidance.scale": FLOWMORPH_GUIDANCE_SCALE,
         "reproducibility.seed": BASE_SEED,
         "paths.input_root": str(RUN_DIRECTORY),
-        "paths.work_root": str(Path(LOCAL_ASSET_ROOT) / PROJECT_NAME / "sequence_work"),
+        "paths.work_root": str(
+            Path(LOCAL_ASSET_ROOT)
+            / PROJECT_NAME
+            / "sequence_work"
+            / SEQUENCE_SESSION_FINGERPRINT[:12]
+        ),
         "paths.result_root": str(SEQUENCE_ROOT),
         "paths.hf_cache": HF_CACHE_DIR,
         "paths.drive_root": None,
@@ -799,6 +895,164 @@ notebook["cells"][19]["source"] = lines(
             "height": IMAGE_HEIGHT,
         })
 
+    def ensure_sequence_assets(records, prompts=()):
+        missing_prompts = [
+            prompt for prompt in prompts
+            if prompt not in PROMPT_CONDITIONING_CACHE
+        ]
+        missing_images = {
+            record["uid"]: (
+                record["path"],
+                SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
+            )
+            for record in records
+            if record["uid"] not in IMAGE_ASSET_CACHE
+        }
+        record_prompts = [
+            record["prompt"] for record in records
+            if record["prompt"] not in PROMPT_CONDITIONING_CACHE
+        ]
+        if record_prompts or missing_prompts or missing_images:
+            new_prompts, new_images = SEQUENCE_SESSION.encode_missing_assets(
+                prompts=[*record_prompts, *missing_prompts],
+                images=missing_images,
+            )
+            PROMPT_CONDITIONING_CACHE.update(new_prompts)
+            IMAGE_ASSET_CACHE.update(new_images)
+
+    def fit_sequence_endpoint(record, progress_label):
+        global UNIQUE_ENDPOINT_FIT_COUNT
+        uid = record["uid"]
+        if uid in ENDPOINT_CACHE:
+            return ENDPOINT_CACHE[uid]
+        fingerprint = endpoint_fingerprint(record)
+        checkpoint_directory = SEQUENCE_ENDPOINT_ROOT / f"{uid}_{fingerprint[:12]}"
+        result = SEQUENCE_SESSION.fit_endpoint(
+            endpoint_key=uid,
+            asset=IMAGE_ASSET_CACHE[uid],
+            conditioning=PROMPT_CONDITIONING_CACHE[record["prompt"]],
+            checkpoint_directory=checkpoint_directory,
+            resume=RESUME_FLOWMORPH_SEQUENCE and checkpoint_directory.exists(),
+        )
+        ENDPOINT_CACHE[uid] = result.endpoint
+        ENDPOINT_FINGERPRINTS[uid] = fingerprint
+        UNIQUE_ENDPOINT_FIT_COUNT += 1
+        print(
+            f"{progress_label}: {uid}; steps={result.completed_steps}; "
+            f"checkpoint_reused={result.resumed}"
+        )
+        return result.endpoint
+
+    if RUN_FLOWMORPH_ONE_GAP_TEST:
+        import numpy as np
+
+        test_gap_index = FLOWMORPH_ONE_GAP_TEST_INDEX % len(BASE_RECORDS)
+        test_left = BASE_RECORDS[test_gap_index]
+        test_right = BASE_RECORDS[(test_gap_index + 1) % len(BASE_RECORDS)]
+        test_pair_uid = f"r01_g{test_gap_index:04d}"
+        test_round_directory = RUN_DIRECTORY / "rounds" / "round_01"
+        test_proposal_directory = test_round_directory / "proposals"
+        test_proposal_directory.mkdir(parents=True, exist_ok=True)
+        test_proposal_path = test_proposal_directory / f"{test_pair_uid}_shared.json"
+        test_proposal, _, _, _ = load_or_create_shared_prompt(
+            test_left,
+            test_right,
+            1,
+            test_gap_index,
+            str(FLOWMORPH_ROUND_SPECS[0]["prompt_mode"]),
+            test_proposal_path,
+        )
+        ensure_sequence_assets(
+            [test_left, test_right],
+            prompts=[test_proposal.prompt],
+        )
+        test_source_endpoint = fit_sequence_endpoint(test_left, "One-gap source fit")
+        test_target_endpoint = fit_sequence_endpoint(test_right, "One-gap target fit")
+        test_frames = SEQUENCE_SESSION.render_midpoints(
+            source=test_source_endpoint,
+            target=test_target_endpoint,
+            source_conditioning=PROMPT_CONDITIONING_CACHE[test_left["prompt"]],
+            target_conditioning=PROMPT_CONDITIONING_CACHE[test_right["prompt"]],
+            midpoint_conditionings=[
+                PROMPT_CONDITIONING_CACHE[test_proposal.prompt]
+            ] * len(FLOWMORPH_ONE_GAP_TEST_ALPHAS),
+            alphas=FLOWMORPH_ONE_GAP_TEST_ALPHAS,
+        )
+        test_directory = RUN_DIRECTORY / "trials" / "flowmorph_one_gap"
+        test_directory.mkdir(parents=True, exist_ok=True)
+        test_output_paths = [
+            test_directory / f"alpha_{alpha:.4f}.png"
+            for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS
+        ]
+        SEQUENCE_SESSION.decode_frames_to_paths(test_frames, test_output_paths)
+
+        test_sheet_paths = [Path(test_left["path"]), *test_output_paths, Path(test_right["path"])]
+        test_sheet_images = []
+        for path in test_sheet_paths:
+            with Image.open(path) as opened:
+                thumbnail = opened.convert("RGB")
+                thumbnail.thumbnail((256, 256))
+                test_sheet_images.append(thumbnail)
+        test_sheet_path = test_directory / "one_gap_quality_sheet.png"
+        make_contact_sheet(
+            test_sheet_images,
+            test_sheet_path,
+            columns=len(test_sheet_images),
+            labels=[
+                "source",
+                *[f"alpha={alpha:.2f}" for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS],
+                "target",
+            ],
+        )
+        for image in test_sheet_images:
+            image.close()
+
+        def one_gap_image_statistics(path):
+            with Image.open(path) as opened:
+                array = np.asarray(opened.convert("RGB"), dtype=np.float32) / 255.0
+            luminance = 0.2126 * array[..., 0] + 0.7152 * array[..., 1] + 0.0722 * array[..., 2]
+            edge_energy = float(
+                np.abs(np.diff(luminance, axis=0)).mean()
+                + np.abs(np.diff(luminance, axis=1)).mean()
+            )
+            return {
+                "mean_luminance": float(luminance.mean()),
+                "rms_contrast": float(luminance.std()),
+                "edge_energy": edge_energy,
+            }
+
+        test_report = {
+            "left_uid": test_left["uid"],
+            "right_uid": test_right["uid"],
+            "alphas": FLOWMORPH_ONE_GAP_TEST_ALPHAS,
+            "conditioning": "piecewise source→shared midpoint→target embeddings",
+            "endpoint_optimization_steps": FLOWMORPH_SOURCE_OPTIMIZATION_STEPS,
+            "fit_lora_scale": FLOWMORPH_FIT_LORA_SCALE,
+            "render_lora_scale": FLOWMORPH_RENDER_LORA_SCALE,
+            "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
+            "images": {
+                path.name: one_gap_image_statistics(path)
+                for path in test_sheet_paths
+            },
+        }
+        (test_directory / "quality_report.json").write_text(
+            json.dumps(test_report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        test_preview = Image.open(test_sheet_path).convert("RGB")
+        test_preview.thumbnail((CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000))
+        display(Markdown("### One-gap FlowMorph quality gate"))
+        display(test_preview)
+        test_preview.close()
+        print({
+            "quality_report": str(test_directory / "quality_report.json"),
+            "quality_sheet": str(test_sheet_path),
+            "full_recursive_run": "Run the next cell only after accepting this preview.",
+        })
+        del test_frames
+    else:
+        print("One-gap FlowMorph quality test skipped.")
+
     for round_number, round_spec in enumerate(FLOWMORPH_ROUND_SPECS, start=1):
         midpoint_count = int(round_spec["midpoint_count"])
         prompt_mode = str(round_spec["prompt_mode"])
@@ -848,7 +1102,13 @@ notebook["cells"][19]["source"] = lines(
                 "right_prompt": right["prompt"],
                 "proposal_fingerprint": proposal_fingerprint,
                 "shared_midpoint_prompt": proposal.prompt,
+                "conditioning_mode": "piecewise_source_midpoint_target_embeddings",
                 "alphas": fractions,
+                "left_endpoint_fingerprint": endpoint_fingerprint(left),
+                "right_endpoint_fingerprint": endpoint_fingerprint(right),
+                "fit_lora_scale": FLOWMORPH_FIT_LORA_SCALE,
+                "endpoint_optimization_steps": FLOWMORPH_SOURCE_OPTIMIZATION_STEPS,
+                "start_timestep_index": FLOWMORPH_START_TIMESTEP_INDEX,
                 "render_indices": list(FLOWMORPH_RENDER_INDICES),
                 "render_lora_scale": FLOWMORPH_RENDER_LORA_SCALE,
                 "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
@@ -905,95 +1165,122 @@ notebook["cells"][19]["source"] = lines(
             "encoded_unique_prompts_total": len(PROMPT_CONDITIONING_CACHE),
         })
 
-        # Fit each unique incoming image once. An anchor fitted in round 1 is
-        # reused in round 2 and on both its left and right neighboring gaps.
-        for fit_index, record in enumerate(incoming, start=1):
-            uid = record["uid"]
-            if uid in ENDPOINT_CACHE:
-                continue
-            fingerprint = endpoint_fingerprint(record)
-            checkpoint_directory = SEQUENCE_ENDPOINT_ROOT / f"{uid}_{fingerprint[:12]}"
-            result = SEQUENCE_SESSION.fit_endpoint(
-                endpoint_key=uid,
-                asset=IMAGE_ASSET_CACHE[uid],
-                conditioning=PROMPT_CONDITIONING_CACHE[record["prompt"]],
-                checkpoint_directory=checkpoint_directory,
-                resume=RESUME_FLOWMORPH_SEQUENCE and checkpoint_directory.exists(),
-            )
-            ENDPOINT_CACHE[uid] = result.endpoint
-            ENDPOINT_FINGERPRINTS[uid] = fingerprint
-            UNIQUE_ENDPOINT_FIT_COUNT += 1
-            print(
-                f"Round {round_number} endpoint {fit_index}/{len(incoming)}: {uid}; "
-                f"steps={result.completed_steps}; checkpoint_reused={result.resumed}"
-            )
-
-        # Render every pending pair while the transformer remains resident.
-        pending_frames = []
-        pending_paths = []
+        # Lazily fit endpoints and render/decode small chunks. The cache still fits
+        # every unique image only once, while the first PNGs arrive after the first
+        # few endpoints instead of after fitting the entire round.
         pending_jobs = []
-        for pair_index, job in enumerate(pair_jobs, start=1):
+        for job in pair_jobs:
             FLOWMORPH_PAIR_RENDER_COUNT += 1
             if job["completed"]:
                 print(f"Reusing completed pair {job['pair_uid']}")
                 continue
-            left = job["left"]
-            right = job["right"]
-            shared = PROMPT_CONDITIONING_CACHE[job["proposal"].prompt]
-            rendered = SEQUENCE_SESSION.render_midpoints(
-                source=ENDPOINT_CACHE[left["uid"]],
-                target=ENDPOINT_CACHE[right["uid"]],
-                source_conditioning=PROMPT_CONDITIONING_CACHE[left["prompt"]],
-                target_conditioning=PROMPT_CONDITIONING_CACHE[right["prompt"]],
-                midpoint_conditionings=[shared] * midpoint_count,
-                alphas=fractions,
-            )
-            start_index = len(pending_frames)
-            pending_frames.extend(rendered)
-            pending_paths.extend(item["output_path"] for item in job["frame_records"])
-            job["pending_slice"] = (start_index, start_index + len(rendered))
             pending_jobs.append(job)
-            print(
-                f"Rendered pair {pair_index}/{len(pair_jobs)}: {job['pair_uid']} "
-                f"({midpoint_count} interior frame(s))"
-            )
 
-        # One component swap and streaming VAE decode for the entire round.
-        if pending_frames:
-            SEQUENCE_SESSION.decode_frames_to_paths(
-                pending_frames,
-                pending_paths,
-                restore_transformer=False,
-            )
-        for job in pending_jobs:
-            start_index, end_index = job["pending_slice"]
-            inserted = [
-                {
-                    "alpha": item["fraction"],
-                    "image": str(item["output_path"]),
-                    "shared_prompt": job["proposal"].prompt,
-                }
-                for item in job["frame_records"]
+        progress_directory = round_directory / "streaming_progress"
+        progress_directory.mkdir(parents=True, exist_ok=True)
+        for chunk_start in range(0, len(pending_jobs), FLOWMORPH_STREAM_PAIRS_PER_CHUNK):
+            chunk_jobs = pending_jobs[
+                chunk_start:chunk_start + FLOWMORPH_STREAM_PAIRS_PER_CHUNK
             ]
-            completion = {
-                "status": "complete",
-                "pair_uid": job["pair_uid"],
-                "pair_fingerprint": job["pair_fingerprint"],
-                "pair_contract": job["pair_contract"],
-                "sequence_session_directory": str(SEQUENCE_SESSION_DIRECTORY),
-                "left_endpoint_checkpoint_fingerprint": ENDPOINT_FINGERPRINTS[job["left"]["uid"]],
-                "right_endpoint_checkpoint_fingerprint": ENDPOINT_FINGERPRINTS[job["right"]["uid"]],
-                "rendered_latent_count": end_index - start_index,
-                "inserted": inserted,
-            }
-            job["completion_path"].write_text(
-                json.dumps(completion, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
+            chunk_frames = []
+            chunk_paths = []
+            for job in chunk_jobs:
+                left = job["left"]
+                right = job["right"]
+                fit_sequence_endpoint(
+                    left,
+                    f"Round {round_number} streaming fit",
+                )
+                fit_sequence_endpoint(
+                    right,
+                    f"Round {round_number} streaming fit",
+                )
+                shared = PROMPT_CONDITIONING_CACHE[job["proposal"].prompt]
+                rendered = SEQUENCE_SESSION.render_midpoints(
+                    source=ENDPOINT_CACHE[left["uid"]],
+                    target=ENDPOINT_CACHE[right["uid"]],
+                    source_conditioning=PROMPT_CONDITIONING_CACHE[left["prompt"]],
+                    target_conditioning=PROMPT_CONDITIONING_CACHE[right["prompt"]],
+                    midpoint_conditionings=[shared] * midpoint_count,
+                    alphas=fractions,
+                )
+                chunk_frames.extend(rendered)
+                chunk_paths.extend(item["output_path"] for item in job["frame_records"])
+                print(
+                    f"Rendered {job['pair_uid']} ({midpoint_count} interior frame(s)); "
+                    "decoding with this chunk..."
+                )
+
+            SEQUENCE_SESSION.decode_frames_to_paths(chunk_frames, chunk_paths)
+            for job in chunk_jobs:
+                inserted = [
+                    {
+                        "alpha": item["fraction"],
+                        "image": str(item["output_path"]),
+                        "shared_prompt": job["proposal"].prompt,
+                        "conditioning": "piecewise source→shared midpoint→target embeddings",
+                    }
+                    for item in job["frame_records"]
+                ]
+                completion = {
+                    "status": "complete",
+                    "pair_uid": job["pair_uid"],
+                    "pair_fingerprint": job["pair_fingerprint"],
+                    "pair_contract": job["pair_contract"],
+                    "sequence_session_directory": str(SEQUENCE_SESSION_DIRECTORY),
+                    "left_endpoint_checkpoint_fingerprint": ENDPOINT_FINGERPRINTS[job["left"]["uid"]],
+                    "right_endpoint_checkpoint_fingerprint": ENDPOINT_FINGERPRINTS[job["right"]["uid"]],
+                    "rendered_latent_count": len(job["frame_records"]),
+                    "inserted": inserted,
+                }
+                job["completion_path"].write_text(
+                    json.dumps(completion, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                job["completion"] = completion
+                job["completed"] = True
+
+            completed_count = min(
+                chunk_start + len(chunk_jobs),
+                len(pending_jobs),
             )
-            job["completion"] = completion
-            job["completed"] = True
-        del pending_frames
-        gc.collect()
+            print({
+                "round": round_number,
+                "new_pairs_saved": completed_count,
+                "new_pairs_total": len(pending_jobs),
+                "latest_png": str(chunk_paths[-1]),
+            })
+            if FLOWMORPH_STREAM_DISPLAY_PROGRESS:
+                representative_paths = [
+                    job["frame_records"][len(job["frame_records"]) // 2]["output_path"]
+                    for job in chunk_jobs
+                ]
+                representative_images = []
+                for path in representative_paths:
+                    with Image.open(path) as opened:
+                        thumbnail = opened.convert("RGB")
+                        thumbnail.thumbnail((256, 256))
+                        representative_images.append(thumbnail)
+                chunk_number = chunk_start // FLOWMORPH_STREAM_PAIRS_PER_CHUNK + 1
+                chunk_sheet_path = progress_directory / f"chunk_{chunk_number:03d}.png"
+                make_contact_sheet(
+                    representative_images,
+                    chunk_sheet_path,
+                    columns=len(representative_images),
+                    labels=[job["pair_uid"] for job in chunk_jobs],
+                )
+                for image in representative_images:
+                    image.close()
+                chunk_preview = Image.open(chunk_sheet_path).convert("RGB")
+                chunk_preview.thumbnail((CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000))
+                display(Markdown(
+                    f"### Round {round_number} streaming progress: "
+                    f"{completed_count}/{len(pending_jobs)} new pairs saved"
+                ))
+                display(chunk_preview)
+                chunk_preview.close()
+            del chunk_frames, chunk_paths
+            gc.collect()
 
         outgoing = []
         for job in pair_jobs:
@@ -1100,21 +1387,44 @@ notebook["cells"][19]["source"] = lines(
     """
 )
 
-notebook["cells"][20]["source"] = lines(
+# Keep setup + the one-gap quality gate in its own cell, so the user can inspect
+# it before deliberately running the expensive full recursive sequence cell.
+sequence_source = "".join(notebook["cells"][19]["source"])
+full_run_marker = "\nfor round_number, round_spec in enumerate(FLOWMORPH_ROUND_SPECS, start=1):\n"
+if sequence_source.count(full_run_marker) != 1:
+    raise RuntimeError("Could not split the one-gap quality gate from the full sequence")
+quality_setup_source, full_run_tail = sequence_source.split(full_run_marker, 1)
+notebook["cells"][19]["source"] = (quality_setup_source.rstrip() + "\n").splitlines(keepends=True)
+notebook["cells"].insert(
+    20,
+    markdown(
+        r"""
+        ### Full recursive FlowMorph run
+
+        Run the next cell only after accepting the one-gap quality sheet above. Endpoint fits created by the test are already cached and reused. New frames are rendered, decoded, saved to Drive, and previewed in small chunks rather than held until the end of a round.
+        """
+    ),
+)
+notebook["cells"].insert(
+    21,
+    code("for round_number, round_spec in enumerate(FLOWMORPH_ROUND_SPECS, start=1):\n" + full_run_tail),
+)
+
+notebook["cells"][22]["source"] = lines(
     r"""
     ## 10. Assemble, preview, and audit the generated cyclic FlowMorph sequence
 
-    No endpoint is duplicated. Round 1 contributes one α=0.5 render per gap; round 2 contributes ten renders per gap at `1/11 … 10/11`, all driven by the gap's single shared image-aware prompt. The final-to-first gap is included in both rounds, and optional rotation places the playback boundary at the quietest neighboring pair without changing circular order.
+    No endpoint is duplicated. Round 1 contributes one α=0.5 render per gap; round 2 contributes ten renders per gap at `1/11 … 10/11`, conditioned piecewise from source through the one shared image-aware midpoint prompt to target. The final-to-first gap is included in both rounds, and optional rotation places the playback boundary at the quietest neighboring pair without changing circular order.
     """
 )
 
-final_video_cell = "".join(notebook["cells"][27]["source"])
+final_video_cell = "".join(notebook["cells"][29]["source"])
 final_video_cell = replace_once(
     final_video_cell,
     '"recursive_vision_rife_ssim_loop.mp4"',
     '"recursive_flowmorph_vision_rife_ssim_loop.mp4"',
 )
-notebook["cells"][27]["source"] = final_video_cell.splitlines(keepends=True)
+notebook["cells"][29]["source"] = final_video_cell.splitlines(keepends=True)
 
 notebook["metadata"]["colab"]["name"] = OUTPUT.name
 OUTPUT.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
