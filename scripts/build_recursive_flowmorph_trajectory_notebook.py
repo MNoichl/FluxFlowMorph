@@ -122,13 +122,20 @@ settings = replace_once(
     'TRAJECTORY_INIT_DETAIL_STRENGTH = 1.0  # 1 keeps the selected frame intact.\n'
     'TRAJECTORY_INIT_BLUR = 0.0\n'
     'TRAJECTORY_INIT_GRAIN_STRENGTH = 0.0\n'
-    'TRAJECTORY_DENOISE_STRENGTH = 0.12  # Lower preserves more source composition.\n'
+    'TRAJECTORY_GUIDE_MODE = "activity_mask"\n'
+    'TRAJECTORY_MASK_THRESHOLD = 0.08\n'
+    'TRAJECTORY_MASK_SOFTNESS = 0.12\n'
+    'TRAJECTORY_MASK_BLUR = 12.0\n'
+    'TRAJECTORY_MASK_EXPANSION = 4\n'
+    'TRAJECTORY_GUIDE_CONTRAST = 0.32\n'
+    'TRAJECTORY_GUIDE_BACKGROUND = (238, 233, 218)\n'
+    'TRAJECTORY_DENOISE_STRENGTH = 0.45  # Higher repaints more; the guide carries layout only.\n'
     'TRAJECTORY_COMPOSITION_INSTRUCTION = (\n'
-    '    "Use the reference image as a strict spatial map: preserve the placement, "\n'
-    '    "scale, silhouette, occupied areas, and empty areas; do not recenter or symmetrize."\n'
+    '    "Treat the darker regions of the neutral reference as an occupancy map: build "\n'
+    '    "the fresco ornament inside those regions, follow their placement and silhouette, "\n'
+    '    "and leave pale regions mostly bare. Do not reproduce the guide as blobs or shading."\n'
     ')\n'
-    'TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True  # Prevent prompt text from fighting the init layout.\n'
-    'SAVE_TRAJECTORY_REFERENCES = True\n',
+    'TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True  # Prevent prompt text from fighting the init layout.\n',
 )
 notebook["cells"][2]["source"] = settings.splitlines(keepends=True)
 
@@ -198,6 +205,16 @@ validation = replace_once(
     '    raise ValueError("TRAJECTORY_INIT_GRAIN_STRENGTH must lie in [0, 0.25]")\n'
     'if not 0 < TRAJECTORY_DENOISE_STRENGTH <= 1:\n'
     '    raise ValueError("TRAJECTORY_DENOISE_STRENGTH must lie in (0, 1]")\n'
+    'if TRAJECTORY_GUIDE_MODE not in {"activity_mask", "original"}:\n'
+    '    raise ValueError("TRAJECTORY_GUIDE_MODE must be activity_mask or original")\n'
+    'if not 0 <= TRAJECTORY_MASK_THRESHOLD < 1:\n'
+    '    raise ValueError("TRAJECTORY_MASK_THRESHOLD must lie in [0, 1)")\n'
+    'if not 0 < TRAJECTORY_MASK_SOFTNESS <= 1:\n'
+    '    raise ValueError("TRAJECTORY_MASK_SOFTNESS must lie in (0, 1]")\n'
+    'if TRAJECTORY_MASK_BLUR < 0 or not 0 <= TRAJECTORY_MASK_EXPANSION <= 128:\n'
+    '    raise ValueError("Trajectory mask blur/expansion settings are invalid")\n'
+    'if not 0 < TRAJECTORY_GUIDE_CONTRAST <= 1:\n'
+    '    raise ValueError("TRAJECTORY_GUIDE_CONTRAST must lie in (0, 1]")\n'
     '\n'
     'def trajectory_generation_prompt(prompt):\n'
     '    base = prompt\n'
@@ -323,8 +340,40 @@ model_cell = replace_once(
     "from flowmorph_klein.lora import load_flux2_lora\n"
     "from flowmorph_klein.trajectory import (\n"
     "    make_strong_trajectory_reference,\n"
+    "    make_trajectory_activity_guide,\n"
     "    prepare_flux2_klein_img2img_inputs,\n"
     ")\n",
+)
+model_cell = replace_once(
+    model_cell,
+    ")\n\ntry:\n"
+    "    import peft.tuners.lora.torchao as peft_torchao_dispatch\n",
+    ")\n\n"
+    "def build_trajectory_guide(source, seed):\n"
+    "    activity = None\n"
+    '    if TRAJECTORY_GUIDE_MODE == "activity_mask":\n'
+    "        activity = make_trajectory_activity_guide(\n"
+    "            source,\n"
+    "            threshold=TRAJECTORY_MASK_THRESHOLD,\n"
+    "            softness=TRAJECTORY_MASK_SOFTNESS,\n"
+    "            blur_radius=TRAJECTORY_MASK_BLUR,\n"
+    "            expansion_radius=TRAJECTORY_MASK_EXPANSION,\n"
+    "            contrast=TRAJECTORY_GUIDE_CONTRAST,\n"
+    "            background_rgb=TRAJECTORY_GUIDE_BACKGROUND,\n"
+    "        )\n"
+    "        guide_source = activity.image\n"
+    "    else:\n"
+    '        guide_source = source.convert("RGB")\n'
+    "    reference = make_strong_trajectory_reference(\n"
+    "        guide_source,\n"
+    "        detail_strength=TRAJECTORY_INIT_DETAIL_STRENGTH,\n"
+    "        blur_radius=TRAJECTORY_INIT_BLUR,\n"
+    "        grain_strength=TRAJECTORY_INIT_GRAIN_STRENGTH,\n"
+    "        grain_seed=seed,\n"
+    "    )\n"
+    "    return reference, activity\n\n"
+    "try:\n"
+    "    import peft.tuners.lora.torchao as peft_torchao_dispatch\n",
 )
 trial_start = model_cell.index("if RUN_TRIAL_KEYFRAME:\n")
 model_cell = model_cell[:trial_start] + dedent(
@@ -342,13 +391,10 @@ model_cell = model_cell[:trial_start] + dedent(
         trial_stage = ACTIVE_BASE_STAGES[trial_index]
         trial_trajectory = TRAJECTORY_RECORDS[trial_index]
         with Image.open(trial_trajectory["path"]) as opened:
-            trial_reference = make_strong_trajectory_reference(
-                opened,
-                detail_strength=TRAJECTORY_INIT_DETAIL_STRENGTH,
-                blur_radius=TRAJECTORY_INIT_BLUR,
-                grain_strength=TRAJECTORY_INIT_GRAIN_STRENGTH,
-                grain_seed=trial_seed,
-            )
+            trial_source = opened.convert("RGB")
+        trial_reference, trial_activity = build_trajectory_guide(
+            trial_source, trial_seed
+        )
         trial_generator = torch.Generator(device="cuda").manual_seed(trial_seed)
         trial_img2img = prepare_flux2_klein_img2img_inputs(
             FLUX_PIPE,
@@ -377,9 +423,14 @@ model_cell = model_cell[:trial_start] + dedent(
         trial_directory = RUN_DIRECTORY / "trials" / f"{trial_stamp}_{trial_stage['id']}_{trial_seed}"
         trial_directory.mkdir(parents=True, exist_ok=False)
         trial_path = trial_directory / "trial.png"
+        trial_source_path = trial_directory / "trajectory_source.png"
         trial_reference_path = trial_directory / "trajectory_reference.png"
+        trial_mask_path = trial_directory / "trajectory_activity_mask.png"
         trial_image.save(trial_path)
+        trial_source.save(trial_source_path)
         trial_reference.save(trial_reference_path)
+        if trial_activity is not None:
+            trial_activity.mask.save(trial_mask_path)
         (trial_directory / "settings.json").write_text(json.dumps({
             "stage": trial_stage,
             "trajectory": trial_trajectory,
@@ -392,25 +443,51 @@ model_cell = model_cell[:trial_start] + dedent(
             "trajectory_init_blur": TRAJECTORY_INIT_BLUR,
             "trajectory_init_grain_strength": TRAJECTORY_INIT_GRAIN_STRENGTH,
             "trajectory_denoise_strength": TRAJECTORY_DENOISE_STRENGTH,
+            "trajectory_guide_mode": TRAJECTORY_GUIDE_MODE,
+            "trajectory_mask_threshold": TRAJECTORY_MASK_THRESHOLD,
+            "trajectory_mask_softness": TRAJECTORY_MASK_SOFTNESS,
+            "trajectory_mask_blur": TRAJECTORY_MASK_BLUR,
+            "trajectory_mask_expansion": TRAJECTORY_MASK_EXPANSION,
+            "trajectory_guide_contrast": TRAJECTORY_GUIDE_CONTRAST,
+            "activity_coverage_fraction": (
+                trial_activity.coverage_fraction if trial_activity is not None else None
+            ),
             "effective_start_sigma": trial_img2img.effective_start_sigma,
             "effective_denoising_steps": trial_img2img.denoising_steps,
             "generation_prompt": trial_generation_prompt,
         }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        source_preview = trial_source.copy()
+        mask_preview = (
+            trial_activity.mask.convert("RGB") if trial_activity is not None else None
+        )
         input_preview = trial_reference.copy()
         output_preview = trial_image.copy()
+        source_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
+        if mask_preview is not None:
+            mask_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
         input_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
         output_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
-        display(Markdown(f"### Trial trajectory input: `{trial_trajectory['member']}`"))
+        display(Markdown(f"### Trial source: `{trial_trajectory['member']}`"))
+        display(source_preview)
+        if mask_preview is not None:
+            display(Markdown("### Extracted activity mask"))
+            display(mask_preview)
+        display(Markdown("### Neutral activity-map guide used by FLUX"))
         display(input_preview)
         display(Markdown(f"### Trial regenerated anchor: `{trial_stage['id']}`"))
         display(output_preview)
         print({
             "path": str(trial_path),
+            "trajectory_source": str(trial_source_path),
             "trajectory_reference": str(trial_reference_path),
+            "trajectory_mask": (
+                str(trial_mask_path) if trial_activity is not None else None
+            ),
             "seed": trial_seed,
             "prompt_index": trial_index,
         })
-        del trial_result, trial_img2img, trial_image, trial_reference, input_preview, output_preview
+        del trial_result, trial_img2img, trial_image, trial_source, trial_reference
+        del source_preview, mask_preview, input_preview, output_preview, trial_activity
     else:
         print("Trial skipped.")
     '''
@@ -435,6 +512,7 @@ notebook["cells"][14]["source"] = lines(
 
     BASE_DIRECTORY = RUN_DIRECTORY / "base_frames"
     REFERENCE_DIRECTORY = BASE_DIRECTORY / "trajectory_references"
+    MASK_DIRECTORY = BASE_DIRECTORY / "trajectory_activity_masks"
     BASE_MANIFEST_PATH = RUN_DIRECTORY / "metadata" / "base_manifest.json"
     BASE_RECORDS = []
     expected_anchor_contract = [
@@ -446,6 +524,15 @@ notebook["cells"][14]["source"] = lines(
             "trajectory_member": trajectory["member"],
             "trajectory_member_sha256": trajectory["member_sha256"],
             "trajectory_denoise_strength": TRAJECTORY_DENOISE_STRENGTH,
+            "trajectory_guide_contract": {
+                "mode": TRAJECTORY_GUIDE_MODE,
+                "threshold": TRAJECTORY_MASK_THRESHOLD,
+                "softness": TRAJECTORY_MASK_SOFTNESS,
+                "blur": TRAJECTORY_MASK_BLUR,
+                "expansion": TRAJECTORY_MASK_EXPANSION,
+                "contrast": TRAJECTORY_GUIDE_CONTRAST,
+                "background": list(TRAJECTORY_GUIDE_BACKGROUND),
+            },
         }
         for index, (stage, trajectory) in enumerate(
             zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)
@@ -469,6 +556,9 @@ notebook["cells"][14]["source"] = lines(
                 "trajectory_denoise_strength": record.get(
                     "trajectory_denoise_strength"
                 ),
+                "trajectory_guide_contract": record.get(
+                    "trajectory_guide_contract"
+                ),
             }
             for record in BASE_RECORDS
         ]
@@ -484,21 +574,19 @@ notebook["cells"][14]["source"] = lines(
         print(f"Loaded {len(BASE_RECORDS)} existing trajectory-conditioned anchors.")
     else:
         REFERENCE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        MASK_DIRECTORY.mkdir(parents=True, exist_ok=True)
         for index, (stage, trajectory) in enumerate(
             zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)
         ):
             seed = BASE_SEED + index
             with Image.open(trajectory["path"]) as opened:
-                reference = make_strong_trajectory_reference(
-                    opened,
-                    detail_strength=TRAJECTORY_INIT_DETAIL_STRENGTH,
-                    blur_radius=TRAJECTORY_INIT_BLUR,
-                    grain_strength=TRAJECTORY_INIT_GRAIN_STRENGTH,
-                    grain_seed=seed,
-                )
+                source_image = opened.convert("RGB")
+            reference, activity = build_trajectory_guide(source_image, seed)
             reference_path = REFERENCE_DIRECTORY / f"reference_{index:03d}.png"
-            if SAVE_TRAJECTORY_REFERENCES:
-                reference.save(reference_path, format="PNG", compress_level=4)
+            mask_path = MASK_DIRECTORY / f"mask_{index:03d}.png"
+            reference.save(reference_path, format="PNG", compress_level=4)
+            if activity is not None:
+                activity.mask.save(mask_path, format="PNG", compress_level=4)
             generator = torch.Generator(device="cuda").manual_seed(seed)
             img2img = prepare_flux2_klein_img2img_inputs(
                 FLUX_PIPE,
@@ -541,12 +629,32 @@ notebook["cells"][14]["source"] = lines(
                 "trajectory_member_sha256": trajectory["member_sha256"],
                 "trajectory_source_path": trajectory["path"],
                 "trajectory_reference_path": (
-                    str(reference_path) if SAVE_TRAJECTORY_REFERENCES else None
+                    str(reference_path)
                 ),
                 "trajectory_init_detail_strength": TRAJECTORY_INIT_DETAIL_STRENGTH,
                 "trajectory_init_blur": TRAJECTORY_INIT_BLUR,
                 "trajectory_init_grain_strength": TRAJECTORY_INIT_GRAIN_STRENGTH,
                 "trajectory_denoise_strength": TRAJECTORY_DENOISE_STRENGTH,
+                "trajectory_guide_contract": {
+                    "mode": TRAJECTORY_GUIDE_MODE,
+                    "threshold": TRAJECTORY_MASK_THRESHOLD,
+                    "softness": TRAJECTORY_MASK_SOFTNESS,
+                    "blur": TRAJECTORY_MASK_BLUR,
+                    "expansion": TRAJECTORY_MASK_EXPANSION,
+                    "contrast": TRAJECTORY_GUIDE_CONTRAST,
+                    "background": list(TRAJECTORY_GUIDE_BACKGROUND),
+                },
+                "trajectory_activity_mask_path": (
+                    str(mask_path) if activity is not None else None
+                ),
+                "activity_coverage_fraction": (
+                    activity.coverage_fraction if activity is not None else None
+                ),
+                "estimated_source_background_rgb": (
+                    list(activity.estimated_background_rgb)
+                    if activity is not None
+                    else None
+                ),
                 "effective_start_sigma": img2img.effective_start_sigma,
                 "effective_denoising_steps": img2img.denoising_steps,
             }
@@ -562,8 +670,9 @@ notebook["cells"][14]["source"] = lines(
                 f"{output_path.name} ← {trajectory['member']}"
             )
             reference.close()
+            source_image.close()
             image.close()
-            del result, img2img
+            del result, img2img, activity
 
     if len(BASE_RECORDS) != len(ACTIVE_BASE_STAGES):
         raise RuntimeError("The anchor manifest is incomplete; regenerate or resume the correct run.")
@@ -575,6 +684,7 @@ notebook["cells"][15]["source"] = lines(
     from flowmorph_klein.visualization import make_contact_sheet
 
     trajectory_source_paths = [Path(item["trajectory_source_path"]) for item in BASE_RECORDS]
+    trajectory_guide_paths = [Path(item["trajectory_reference_path"]) for item in BASE_RECORDS]
     generated_anchor_paths = [Path(item["path"]) for item in BASE_RECORDS]
 
     def load_contact_thumbnails(paths, size=192):
@@ -600,6 +710,17 @@ notebook["cells"][15]["source"] = lines(
     for image in source_images:
         image.close()
 
+    guide_contact_sheet_path = RUN_DIRECTORY / "previews" / "trajectory_activity_guides.png"
+    guide_images = load_contact_thumbnails(trajectory_guide_paths)
+    make_contact_sheet(
+        guide_images,
+        guide_contact_sheet_path,
+        columns=min(CONTACT_SHEET_COLUMNS, len(guide_images)),
+        labels=[f"{index:02d} · guide" for index in range(len(guide_images))],
+    )
+    for image in guide_images:
+        image.close()
+
     base_contact_sheet_path = RUN_DIRECTORY / "previews" / "base_contact_sheet.png"
     base_images = load_contact_thumbnails(generated_anchor_paths)
     make_contact_sheet(
@@ -617,13 +738,18 @@ notebook["cells"][15]["source"] = lines(
     for index, record in enumerate(BASE_RECORDS):
         paired_images.extend(load_contact_thumbnails([
             Path(record["trajectory_source_path"]),
+            Path(record["trajectory_reference_path"]),
             Path(record["path"]),
         ]))
-        paired_labels.extend([f"{index:02d} source", f"{index:02d} generated"])
+        paired_labels.extend([
+            f"{index:02d} source",
+            f"{index:02d} activity guide",
+            f"{index:02d} generated",
+        ])
     make_contact_sheet(
         paired_images,
         paired_contact_sheet_path,
-        columns=2,
+        columns=3,
         labels=paired_labels,
     )
     for image in paired_images:
@@ -631,8 +757,9 @@ notebook["cells"][15]["source"] = lines(
 
     for heading, path in (
         ("### Regularly sampled trajectory inputs", source_contact_sheet_path),
+        ("### Neutral activity-map guides", guide_contact_sheet_path),
         ("### Regenerated anchor paintings", base_contact_sheet_path),
-        ("### Source → generated trajectory audit", paired_contact_sheet_path),
+        ("### Source → activity guide → generated audit", paired_contact_sheet_path),
     ):
         preview = Image.open(path).convert("RGB")
         preview.thumbnail((CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000))

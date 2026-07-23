@@ -13,6 +13,7 @@ from flowmorph_klein.trajectory import (
     TrajectoryArchiveError,
     list_image_members,
     make_strong_trajectory_reference,
+    make_trajectory_activity_guide,
     prepare_flux2_klein_img2img_inputs,
     regular_sample_indices,
     stage_regular_keyframes,
@@ -122,6 +123,50 @@ def test_strong_reference_preserves_color_and_seeded_grain() -> None:
         (180, 70, 20),
         atol=2.0,
     )
+
+
+def test_activity_guide_discards_source_color_but_preserves_occupancy() -> None:
+    source = np.full((64, 64, 3), (240, 235, 220), dtype=np.uint8)
+    source[12:36, 40:58] = (240, 20, 30)
+    result = make_trajectory_activity_guide(
+        Image.fromarray(source, mode="RGB"),
+        threshold=0.08,
+        softness=0.08,
+        blur_radius=0,
+        expansion_radius=0,
+        contrast=0.25,
+        background_rgb=(240, 235, 220),
+    )
+
+    guide = np.asarray(result.image)
+    mask = np.asarray(result.mask)
+    assert result.estimated_background_rgb == (240, 235, 220)
+    assert mask[20, 48] == 255
+    assert mask[4, 4] == 0
+    assert np.array_equal(guide[4, 4], (240, 235, 220))
+    assert guide[20, 48, 0] < guide[4, 4, 0]
+    assert np.allclose(
+        guide[20, 48] / guide[20, 48].sum(),
+        guide[4, 4] / guide[4, 4].sum(),
+        atol=0.01,
+    )
+    assert 0.09 < result.coverage_fraction < 0.12
+
+
+def test_activity_guide_uniform_frame_becomes_blank_background() -> None:
+    result = make_trajectory_activity_guide(
+        Image.new("RGB", (32, 32), (200, 210, 220)),
+        blur_radius=3,
+        expansion_radius=2,
+        background_rgb=(238, 233, 218),
+    )
+
+    assert np.asarray(result.mask).max() == 0
+    assert np.array_equal(
+        np.asarray(result.image),
+        np.full((32, 32, 3), (238, 233, 218), dtype=np.uint8),
+    )
+    assert result.coverage_fraction == 0.0
 
 
 class _FakeImageProcessor:

@@ -37,6 +37,16 @@ class Flux2KleinImg2ImgInputs:
     denoising_steps: int
 
 
+@dataclass(frozen=True)
+class TrajectoryActivityGuide:
+    """Neutral spatial guide derived from non-background source activity."""
+
+    image: Image.Image
+    mask: Image.Image
+    estimated_background_rgb: tuple[int, int, int]
+    coverage_fraction: float
+
+
 def natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
     """Return a deterministic numeric-aware key for nested member names."""
 
@@ -202,6 +212,76 @@ def make_strong_trajectory_reference(
     return Image.fromarray(np.clip(array + grain, 0.0, 255.0).astype(np.uint8), mode="RGB")
 
 
+def make_trajectory_activity_guide(
+    image: Image.Image,
+    *,
+    threshold: float = 0.1,
+    softness: float = 0.12,
+    blur_radius: float = 20.0,
+    expansion_radius: int = 6,
+    contrast: float = 0.25,
+    background_rgb: tuple[int, int, int] = (238, 233, 218),
+) -> TrajectoryActivityGuide:
+    """Convert a trajectory frame into a color-free soft occupancy guide.
+
+    The source background is estimated from its border. Pixel distance from
+    that background becomes an activity mask; the original color and texture
+    are discarded so they cannot survive as an underpainting.
+    """
+
+    if not 0.0 <= threshold < 1.0:
+        raise ValueError("activity threshold must lie in [0, 1)")
+    if not 0.0 < softness <= 1.0:
+        raise ValueError("activity softness must lie in (0, 1]")
+    if blur_radius < 0.0:
+        raise ValueError("activity blur_radius cannot be negative")
+    if not isinstance(expansion_radius, int) or not 0 <= expansion_radius <= 128:
+        raise ValueError("activity expansion_radius must be an integer in [0, 128]")
+    if not 0.0 < contrast <= 1.0:
+        raise ValueError("activity guide contrast must lie in (0, 1]")
+    if len(background_rgb) != 3 or any(not 0 <= channel <= 255 for channel in background_rgb):
+        raise ValueError("activity guide background_rgb must contain three values in [0, 255]")
+
+    source = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    height, width = source.shape[:2]
+    border_width = max(1, min(height, width) // 50)
+    border = np.concatenate(
+        [
+            source[:border_width, :, :].reshape(-1, 3),
+            source[-border_width:, :, :].reshape(-1, 3),
+            source[:, :border_width, :].reshape(-1, 3),
+            source[:, -border_width:, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    estimated_background = np.median(border, axis=0)
+    distance = np.sqrt(np.mean(np.square(source - estimated_background), axis=2))
+    mask_array = np.clip((distance - threshold) / softness, 0.0, 1.0)
+    mask_array = mask_array * mask_array * (3.0 - 2.0 * mask_array)
+    mask = Image.fromarray(np.round(mask_array * 255.0).astype(np.uint8), mode="L")
+    if expansion_radius:
+        mask = mask.filter(ImageFilter.MaxFilter(2 * expansion_radius + 1))
+    if blur_radius:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    softened_mask = np.asarray(mask, dtype=np.float32) / 255.0
+    background = np.asarray(background_rgb, dtype=np.float32)
+    active_tone = background * (1.0 - contrast)
+    guide_array = (
+        background[None, None, :] * (1.0 - softened_mask[:, :, None])
+        + active_tone[None, None, :] * softened_mask[:, :, None]
+    )
+    guide = Image.fromarray(np.round(guide_array).clip(0, 255).astype(np.uint8), mode="RGB")
+    return TrajectoryActivityGuide(
+        image=guide,
+        mask=mask,
+        estimated_background_rgb=tuple(
+            int(round(channel * 255.0)) for channel in estimated_background
+        ),
+        coverage_fraction=float(np.mean(softened_mask >= 0.5)),
+    )
+
+
 def prepare_flux2_klein_img2img_inputs(
     pipeline: Any,
     image: Image.Image,
@@ -288,9 +368,11 @@ def prepare_flux2_klein_img2img_inputs(
 __all__ = [
     "Flux2KleinImg2ImgInputs",
     "IMAGE_SUFFIXES",
+    "TrajectoryActivityGuide",
     "TrajectoryArchiveError",
     "list_image_members",
     "make_strong_trajectory_reference",
+    "make_trajectory_activity_guide",
     "natural_sort_key",
     "prepare_flux2_klein_img2img_inputs",
     "regular_sample_indices",

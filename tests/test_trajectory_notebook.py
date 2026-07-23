@@ -57,13 +57,16 @@ def test_trajectory_notebook_keeps_prompt_count_editable() -> None:
 
 def test_trajectory_notebook_uses_true_spatial_img2img() -> None:
     _, code = _load_notebook()
-    assert "TRAJECTORY_DENOISE_STRENGTH = 0.12" in code
+    assert "TRAJECTORY_DENOISE_STRENGTH = 0.45" in code
+    assert 'TRAJECTORY_GUIDE_MODE = "activity_mask"' in code
+    assert "make_trajectory_activity_guide(" in code
     assert "prepare_flux2_klein_img2img_inputs(" in code
     assert "sigmas=list(trial_img2img.sigmas)" in code
     assert "latents=trial_img2img.latents" in code
     assert "sigmas=list(img2img.sigmas)" in code
     assert "latents=img2img.latents" in code
-    assert "do not recenter or symmetrize" in code
+    assert "Do not reproduce the guide as blobs or shading" in code
+    assert "trajectory_activity_mask_path" in code
     assert "TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True" in code
     assert 'sys.modules.get("flowmorph_klein.trajectory")' in code
     assert "importlib.reload(trajectory_module)" in code
