@@ -42,8 +42,10 @@ def test_trajectory_notebook_samples_zip_and_uses_selected_frame_as_init() -> No
     ) in code
     assert "zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)" in code
     assert "make_strong_trajectory_reference(" in code
-    assert "image=reference" in code
-    assert "image=trial_reference" in code
+    assert "image=reference" not in code
+    assert "image=trial_reference" not in code
+    assert '"image": reference' not in code
+    assert '"image": trial_reference' not in code
     assert "make_soft_reference" not in code
 
 
@@ -57,21 +59,25 @@ def test_trajectory_notebook_keeps_prompt_count_editable() -> None:
 
 def test_trajectory_notebook_uses_true_spatial_img2img() -> None:
     _, code = _load_notebook()
-    assert "TRAJECTORY_DENOISE_STRENGTH = 0.45" in code
-    assert 'TRAJECTORY_GUIDE_MODE = "activity_mask"' in code
-    assert "TRAJECTORY_GUIDE_ACTIVE_IS_LIGHT = True" in code
-    assert "TRAJECTORY_OUTSIDE_CONTENT_OPACITY = 0.0" in code
-    assert "make_trajectory_activity_guide(" in code
-    assert "composite_generated_activity(" in code
+    assert "TRAJECTORY_DENOISE_STRENGTH = 0.55" in code
+    assert "TRAJECTORY_INIT_PROMPT_INSTRUCTION" in code
     assert "prepare_flux2_klein_img2img_inputs(" in code
     assert "sigmas=list(trial_img2img.sigmas)" in code
     assert "latents=trial_img2img.latents" in code
     assert "sigmas=list(img2img.sigmas)" in code
     assert "latents=img2img.latents" in code
-    assert "Treat the lighter regions" in code
-    assert "Do not reproduce the guide as blobs or shading" in code
-    assert "trajectory_activity_mask_path" in code
-    assert "raw_generation_path" in code
+    assert "Repaint the initialization image as the described artwork" in code
+    assert '"source_used_as_latent_init": True' in code
+    assert '"source_used_as_image_reference": False' in code
+    assert '"image": trial_reference' not in code
+    assert '"image": reference' not in code
+    assert "image=trial_reference" not in code
+    assert "image=reference" not in code
+    assert "make_trajectory_activity_guide(" not in code
+    assert "composite_generated_activity(" not in code
+    assert "trajectory_activity_mask_path" not in code
+    assert "raw_generation_path" not in code
+    assert "TRAJECTORY_GUIDE_MODE" not in code
     assert "TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True" in code
     assert 'sys.modules.get("flowmorph_klein.trajectory")' in code
     assert "importlib.reload(trajectory_module)" in code
