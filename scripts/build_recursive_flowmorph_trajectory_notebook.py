@@ -81,9 +81,9 @@ notebook["cells"][1]["source"] = lines(
     """
     ## 1. Editable run, trajectory ZIP, model, API, FlowMorph, image, and video settings
 
-    `BASE_PROMPT_COUNT` controls both the number of active prompts and the number of
-    regularly sampled trajectory keyframes. Strong-init defaults pass the selected
-    image without blur, grain, desaturation, or grey-background blending.
+    By default every entry in `BASE_STAGES` is used; there is no ten-prompt ceiling.
+    Set `BASE_PROMPT_COUNT` only when you intentionally want to use a shorter prefix.
+    True latent img2img plus the reference image preserve the sampled spatial layout.
     """
 )
 
@@ -92,6 +92,16 @@ settings = replace_once(
     settings,
     'PROJECT_NAME = "science_path_recursive_flowmorph"',
     'PROJECT_NAME = "science_path_trajectory_flowmorph"',
+)
+settings = replace_once(
+    settings,
+    "BASE_PROMPT_COUNT = 15",
+    "BASE_PROMPT_COUNT = None  # None uses every BASE_STAGES entry; an integer caps the list.",
+)
+settings = replace_once(
+    settings,
+    "TRIAL_KEYFRAME_INDEX = None  # None chooses randomly; otherwise 0..BASE_PROMPT_COUNT-1.",
+    "TRIAL_KEYFRAME_INDEX = None  # None chooses randomly from the active prompt list.",
 )
 settings = replace_once(
     settings,
@@ -112,6 +122,12 @@ settings = replace_once(
     'TRAJECTORY_INIT_DETAIL_STRENGTH = 1.0  # 1 keeps the selected frame intact.\n'
     'TRAJECTORY_INIT_BLUR = 0.0\n'
     'TRAJECTORY_INIT_GRAIN_STRENGTH = 0.0\n'
+    'TRAJECTORY_DENOISE_STRENGTH = 0.12  # Lower preserves more source composition.\n'
+    'TRAJECTORY_COMPOSITION_INSTRUCTION = (\n'
+    '    "Use the reference image as a strict spatial map: preserve the placement, "\n'
+    '    "scale, silhouette, occupied areas, and empty areas; do not recenter or symmetrize."\n'
+    ')\n'
+    'TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True  # Prevent prompt text from fighting the init layout.\n'
     'SAVE_TRAJECTORY_REFERENCES = True\n',
 )
 notebook["cells"][2]["source"] = settings.splitlines(keepends=True)
@@ -137,6 +153,19 @@ notebook["cells"][9]["source"] = lines(
 validation = source(notebook["cells"][10])
 validation = replace_once(
     validation,
+    'if not 3 <= BASE_PROMPT_COUNT <= len(BASE_STAGES):\n'
+    '    raise ValueError(f"BASE_PROMPT_COUNT must be between 3 and {len(BASE_STAGES)}")\n',
+    'ACTIVE_BASE_STAGES = (\n'
+    '    list(BASE_STAGES)\n'
+    '    if BASE_PROMPT_COUNT is None\n'
+    '    else list(BASE_STAGES[:max(0, int(BASE_PROMPT_COUNT))])\n'
+    ')\n'
+    'if not ACTIVE_BASE_STAGES:\n'
+    '    raise ValueError("BASE_STAGES must contain at least one active prompt")\n'
+    'BASE_PROMPT_COUNT = len(ACTIVE_BASE_STAGES)\n',
+)
+validation = replace_once(
+    validation,
     'if not 0 < BASE_REFERENCE_STRENGTH <= 1.0:\n'
     '    raise ValueError("BASE_REFERENCE_STRENGTH must lie in (0, 1]")\n'
     'if not 0 <= BASE_REFERENCE_GRAIN_STRENGTH <= 0.25:\n'
@@ -150,7 +179,20 @@ validation = replace_once(
     'if TRAJECTORY_INIT_BLUR < 0:\n'
     '    raise ValueError("TRAJECTORY_INIT_BLUR cannot be negative")\n'
     'if not 0 <= TRAJECTORY_INIT_GRAIN_STRENGTH <= 0.25:\n'
-    '    raise ValueError("TRAJECTORY_INIT_GRAIN_STRENGTH must lie in [0, 0.25]")\n',
+    '    raise ValueError("TRAJECTORY_INIT_GRAIN_STRENGTH must lie in [0, 0.25]")\n'
+    'if not 0 < TRAJECTORY_DENOISE_STRENGTH <= 1:\n'
+    '    raise ValueError("TRAJECTORY_DENOISE_STRENGTH must lie in (0, 1]")\n'
+    '\n'
+    'def trajectory_generation_prompt(prompt):\n'
+    '    base = prompt\n'
+    '    if TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE:\n'
+    '        base = re.sub(r"\\bsymmetr(?:ical|ically)\\b", "", base, flags=re.IGNORECASE)\n'
+    '    return " ".join(base.split()) + " " + TRAJECTORY_COMPOSITION_INSTRUCTION\n',
+)
+validation = replace_once(
+    validation,
+    "ACTIVE_BASE_STAGES = BASE_STAGES[:BASE_PROMPT_COUNT]\n",
+    "# ACTIVE_BASE_STAGES was resolved above without an upper prompt-count check.\n",
 )
 staging = r'''
 
@@ -263,7 +305,10 @@ model_cell = replace_once(
     model_cell,
     "from flowmorph_klein.lora import load_flux2_lora\n",
     "from flowmorph_klein.lora import load_flux2_lora\n"
-    "from flowmorph_klein.trajectory import make_strong_trajectory_reference\n",
+    "from flowmorph_klein.trajectory import (\n"
+    "    make_strong_trajectory_reference,\n"
+    "    prepare_flux2_klein_img2img_inputs,\n"
+    ")\n",
 )
 trial_start = model_cell.index("if RUN_TRIAL_KEYFRAME:\n")
 model_cell = model_cell[:trial_start] + dedent(
@@ -288,14 +333,27 @@ model_cell = model_cell[:trial_start] + dedent(
                 grain_strength=TRAJECTORY_INIT_GRAIN_STRENGTH,
                 grain_seed=trial_seed,
             )
+        trial_generator = torch.Generator(device="cuda").manual_seed(trial_seed)
+        trial_img2img = prepare_flux2_klein_img2img_inputs(
+            FLUX_PIPE,
+            trial_reference,
+            width=IMAGE_WIDTH,
+            height=IMAGE_HEIGHT,
+            num_inference_steps=IMAGE_INFERENCE_STEPS,
+            strength=TRAJECTORY_DENOISE_STRENGTH,
+            generator=trial_generator,
+        )
+        trial_generation_prompt = trajectory_generation_prompt(trial_stage["prompt"])
         trial_result = FLUX_PIPE(
-            prompt=trial_stage["prompt"],
+            prompt=trial_generation_prompt,
             image=trial_reference,
             height=IMAGE_HEIGHT,
             width=IMAGE_WIDTH,
             num_inference_steps=IMAGE_INFERENCE_STEPS,
+            sigmas=list(trial_img2img.sigmas),
+            latents=trial_img2img.latents,
             guidance_scale=IMAGE_GUIDANCE_SCALE,
-            generator=torch.Generator(device="cuda").manual_seed(trial_seed),
+            generator=trial_generator,
             output_type="pil",
         )
         trial_image = trial_result.images[0].convert("RGB")
@@ -317,6 +375,10 @@ model_cell = model_cell[:trial_start] + dedent(
             "trajectory_init_detail_strength": TRAJECTORY_INIT_DETAIL_STRENGTH,
             "trajectory_init_blur": TRAJECTORY_INIT_BLUR,
             "trajectory_init_grain_strength": TRAJECTORY_INIT_GRAIN_STRENGTH,
+            "trajectory_denoise_strength": TRAJECTORY_DENOISE_STRENGTH,
+            "effective_start_sigma": trial_img2img.effective_start_sigma,
+            "effective_denoising_steps": trial_img2img.denoising_steps,
+            "generation_prompt": trial_generation_prompt,
         }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         input_preview = trial_reference.copy()
         output_preview = trial_image.copy()
@@ -332,7 +394,7 @@ model_cell = model_cell[:trial_start] + dedent(
             "seed": trial_seed,
             "prompt_index": trial_index,
         })
-        del trial_result, trial_image, trial_reference, input_preview, output_preview
+        del trial_result, trial_img2img, trial_image, trial_reference, input_preview, output_preview
     else:
         print("Trial skipped.")
     '''
@@ -350,7 +412,10 @@ notebook["cells"][13]["source"] = lines(
 )
 notebook["cells"][14]["source"] = lines(
     r'''
-    from flowmorph_klein.trajectory import make_strong_trajectory_reference
+    from flowmorph_klein.trajectory import (
+        make_strong_trajectory_reference,
+        prepare_flux2_klein_img2img_inputs,
+    )
 
     BASE_DIRECTORY = RUN_DIRECTORY / "base_frames"
     REFERENCE_DIRECTORY = BASE_DIRECTORY / "trajectory_references"
@@ -361,8 +426,10 @@ notebook["cells"][14]["source"] = lines(
             "uid": f"base_{index:03d}",
             "science": stage["science"],
             "prompt": stage["prompt"],
+            "generation_prompt": trajectory_generation_prompt(stage["prompt"]),
             "trajectory_member": trajectory["member"],
             "trajectory_member_sha256": trajectory["member_sha256"],
+            "trajectory_denoise_strength": TRAJECTORY_DENOISE_STRENGTH,
         }
         for index, (stage, trajectory) in enumerate(
             zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)
@@ -380,8 +447,12 @@ notebook["cells"][14]["source"] = lines(
                 "uid": record["uid"],
                 "science": record["science"],
                 "prompt": record["prompt"],
+                "generation_prompt": record.get("generation_prompt"),
                 "trajectory_member": record["trajectory_member"],
                 "trajectory_member_sha256": record["trajectory_member_sha256"],
+                "trajectory_denoise_strength": record.get(
+                    "trajectory_denoise_strength"
+                ),
             }
             for record in BASE_RECORDS
         ]
@@ -412,14 +483,27 @@ notebook["cells"][14]["source"] = lines(
             reference_path = REFERENCE_DIRECTORY / f"reference_{index:03d}.png"
             if SAVE_TRAJECTORY_REFERENCES:
                 reference.save(reference_path, format="PNG", compress_level=4)
+            generator = torch.Generator(device="cuda").manual_seed(seed)
+            img2img = prepare_flux2_klein_img2img_inputs(
+                FLUX_PIPE,
+                reference,
+                width=IMAGE_WIDTH,
+                height=IMAGE_HEIGHT,
+                num_inference_steps=IMAGE_INFERENCE_STEPS,
+                strength=TRAJECTORY_DENOISE_STRENGTH,
+                generator=generator,
+            )
+            generation_prompt = trajectory_generation_prompt(stage["prompt"])
             result = FLUX_PIPE(
-                prompt=stage["prompt"],
+                prompt=generation_prompt,
                 image=reference,
                 height=IMAGE_HEIGHT,
                 width=IMAGE_WIDTH,
                 num_inference_steps=IMAGE_INFERENCE_STEPS,
+                sigmas=list(img2img.sigmas),
+                latents=img2img.latents,
                 guidance_scale=IMAGE_GUIDANCE_SCALE,
-                generator=torch.Generator(device="cuda").manual_seed(seed),
+                generator=generator,
                 output_type="pil",
             )
             if not result.images:
@@ -433,6 +517,7 @@ notebook["cells"][14]["source"] = lines(
                 "round": 0,
                 "science": stage["science"],
                 "prompt": stage["prompt"],
+                "generation_prompt": generation_prompt,
                 "seed": seed,
                 "path": str(output_path),
                 "trajectory_index": trajectory["trajectory_index"],
@@ -445,6 +530,9 @@ notebook["cells"][14]["source"] = lines(
                 "trajectory_init_detail_strength": TRAJECTORY_INIT_DETAIL_STRENGTH,
                 "trajectory_init_blur": TRAJECTORY_INIT_BLUR,
                 "trajectory_init_grain_strength": TRAJECTORY_INIT_GRAIN_STRENGTH,
+                "trajectory_denoise_strength": TRAJECTORY_DENOISE_STRENGTH,
+                "effective_start_sigma": img2img.effective_start_sigma,
+                "effective_denoising_steps": img2img.denoising_steps,
             }
             BASE_RECORDS.append(record)
             BASE_MANIFEST_PATH.write_text(json.dumps({
@@ -459,7 +547,7 @@ notebook["cells"][14]["source"] = lines(
             )
             reference.close()
             image.close()
-            del result
+            del result, img2img
 
     if len(BASE_RECORDS) != len(ACTIVE_BASE_STAGES):
         raise RuntimeError("The anchor manifest is incomplete; regenerate or resume the correct run.")

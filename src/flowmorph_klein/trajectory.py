@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
 import stat
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import numpy as np
+import torch
 from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
+
+from .flow_schedule import compute_empirical_mu, klein_custom_sigmas
 
 
 IMAGE_SUFFIXES = frozenset({".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"})
@@ -19,6 +24,17 @@ IMAGE_SUFFIXES = frozenset({".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".
 
 class TrajectoryArchiveError(RuntimeError):
     """Raised when a trajectory ZIP is unsafe, empty, or contains invalid images."""
+
+
+@dataclass(frozen=True)
+class Flux2KleinImg2ImgInputs:
+    """True img2img inputs for the pinned FLUX.2 Klein pipeline."""
+
+    latents: torch.Tensor
+    sigmas: tuple[float, ...]
+    requested_strength: float
+    effective_start_sigma: float
+    denoising_steps: int
 
 
 def natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
@@ -186,12 +202,97 @@ def make_strong_trajectory_reference(
     return Image.fromarray(np.clip(array + grain, 0.0, 255.0).astype(np.uint8), mode="RGB")
 
 
+def prepare_flux2_klein_img2img_inputs(
+    pipeline: Any,
+    image: Image.Image,
+    *,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    strength: float,
+    generator: torch.Generator,
+) -> Flux2KleinImg2ImgInputs:
+    """Encode an image into the output latents and start from a late sigma.
+
+    ``Flux2KleinPipeline(image=...)`` treats the image as reference context; it
+    does not initialize the output canvas from that image. This helper supplies
+    both the image latent and a truncated scheduler tail, giving conventional
+    img2img behavior. Lower strength preserves more of the source composition.
+    """
+
+    if width < 1 or height < 1:
+        raise ValueError("img2img output dimensions must be positive")
+    if num_inference_steps < 2:
+        raise ValueError("img2img num_inference_steps must be at least 2")
+    if not 0.0 < strength <= 1.0:
+        raise ValueError("img2img strength must lie in (0, 1]")
+    scheduler_config = getattr(getattr(pipeline, "scheduler", None), "config", {})
+    use_flow_sigmas = (
+        scheduler_config.get("use_flow_sigmas", False)
+        if isinstance(scheduler_config, dict)
+        else getattr(scheduler_config, "use_flow_sigmas", False)
+    )
+    if use_flow_sigmas:
+        raise ValueError(
+            "true trajectory img2img requires a scheduler that accepts custom sigmas"
+        )
+
+    device = pipeline._execution_device
+    multiple_of = int(pipeline.vae_scale_factor) * 2
+    normalized_width = max(multiple_of, (int(width) // multiple_of) * multiple_of)
+    normalized_height = max(multiple_of, (int(height) // multiple_of) * multiple_of)
+    processed = pipeline.image_processor.preprocess(
+        image.convert("RGB"),
+        height=normalized_height,
+        width=normalized_width,
+        resize_mode="crop",
+    ).to(device=device, dtype=pipeline.vae.dtype)
+    with torch.no_grad():
+        clean_latents = pipeline._encode_vae_image(
+            image=processed,
+            generator=generator,
+        )
+
+    denoising_steps = max(
+        2,
+        min(num_inference_steps, math.ceil(num_inference_steps * strength)),
+    )
+    sigmas = klein_custom_sigmas(num_inference_steps)[-denoising_steps:]
+    image_seq_len = int(clean_latents.shape[-2] * clean_latents.shape[-1])
+    mu = compute_empirical_mu(image_seq_len, num_inference_steps)
+    pipeline.scheduler.set_timesteps(
+        sigmas=list(sigmas),
+        device=device,
+        mu=mu,
+    )
+    effective_start_sigma = float(pipeline.scheduler.sigmas[0].item())
+    noise = torch.randn(
+        clean_latents.shape,
+        generator=generator,
+        device=clean_latents.device,
+        dtype=clean_latents.dtype,
+    )
+    latents = (
+        (1.0 - effective_start_sigma) * clean_latents
+        + effective_start_sigma * noise
+    )
+    return Flux2KleinImg2ImgInputs(
+        latents=latents,
+        sigmas=tuple(float(value) for value in sigmas),
+        requested_strength=float(strength),
+        effective_start_sigma=effective_start_sigma,
+        denoising_steps=denoising_steps,
+    )
+
+
 __all__ = [
+    "Flux2KleinImg2ImgInputs",
     "IMAGE_SUFFIXES",
     "TrajectoryArchiveError",
     "list_image_members",
     "make_strong_trajectory_reference",
     "natural_sort_key",
+    "prepare_flux2_klein_img2img_inputs",
     "regular_sample_indices",
     "stage_regular_keyframes",
 ]

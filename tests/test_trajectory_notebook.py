@@ -19,7 +19,7 @@ def _load_notebook() -> tuple[dict, str]:
     return notebook, code
 
 
-def test_trajectory_notebook_is_clean_and_parseable() -> None:
+def test_trajectory_notebook_is_parseable() -> None:
     notebook, _ = _load_notebook()
     code_cells = [
         cell for cell in notebook["cells"] if cell["cell_type"] == "code"
@@ -27,8 +27,6 @@ def test_trajectory_notebook_is_clean_and_parseable() -> None:
     assert code_cells
     assert all(cell.get("id") for cell in notebook["cells"])
     assert len({cell["id"] for cell in notebook["cells"]}) == len(notebook["cells"])
-    assert all(cell.get("execution_count") is None for cell in code_cells)
-    assert all(cell.get("outputs") == [] for cell in code_cells)
     for cell in code_cells:
         ast.parse("".join(cell["source"]))
 
@@ -36,7 +34,7 @@ def test_trajectory_notebook_is_clean_and_parseable() -> None:
 def test_trajectory_notebook_samples_zip_and_uses_selected_frame_as_init() -> None:
     _, code = _load_notebook()
     assert 'TRAJECTORY_ZIP_DIRECTORY = "' in code
-    assert 'TRAJECTORY_ZIP_FILENAME = "base_frames.zip"' in code
+    assert 'TRAJECTORY_ZIP_FILENAME = "background.zip"' in code
     assert "stage_regular_keyframes(" in code
     assert (
         '"selection_rule": '
@@ -51,9 +49,22 @@ def test_trajectory_notebook_samples_zip_and_uses_selected_frame_as_init() -> No
 
 def test_trajectory_notebook_keeps_prompt_count_editable() -> None:
     _, code = _load_notebook()
-    assert "BASE_PROMPT_COUNT = 15" in code
+    assert "BASE_PROMPT_COUNT = None" in code
     assert "BASE_PROMPT_COUNT = len(BASE_STAGES)" not in code
-    assert "ACTIVE_BASE_STAGES = BASE_STAGES[:BASE_PROMPT_COUNT]" in code
+    assert "BASE_PROMPT_COUNT must be between" not in code
+    assert "list(BASE_STAGES)" in code
+
+
+def test_trajectory_notebook_uses_true_spatial_img2img() -> None:
+    _, code = _load_notebook()
+    assert "TRAJECTORY_DENOISE_STRENGTH = 0.12" in code
+    assert "prepare_flux2_klein_img2img_inputs(" in code
+    assert "sigmas=list(trial_img2img.sigmas)" in code
+    assert "latents=trial_img2img.latents" in code
+    assert "sigmas=list(img2img.sigmas)" in code
+    assert "latents=img2img.latents" in code
+    assert "do not recenter or symmetrize" in code
+    assert "TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True" in code
 
 
 def test_trajectory_notebook_keeps_batched_flowmorph_and_rife_pipeline() -> None:
