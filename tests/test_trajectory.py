@@ -11,6 +11,7 @@ from PIL import Image
 
 from flowmorph_klein.trajectory import (
     TrajectoryArchiveError,
+    composite_generated_activity,
     list_image_members,
     make_strong_trajectory_reference,
     make_trajectory_activity_guide,
@@ -143,8 +144,8 @@ def test_activity_guide_discards_source_color_but_preserves_occupancy() -> None:
     assert result.estimated_background_rgb == (240, 235, 220)
     assert mask[20, 48] == 255
     assert mask[4, 4] == 0
-    assert np.array_equal(guide[4, 4], (240, 235, 220))
-    assert guide[20, 48, 0] < guide[4, 4, 0]
+    assert np.array_equal(guide[20, 48], (240, 235, 220))
+    assert guide[20, 48, 0] > guide[4, 4, 0]
     assert np.allclose(
         guide[20, 48] / guide[20, 48].sum(),
         guide[4, 4] / guide[4, 4].sum(),
@@ -153,7 +154,7 @@ def test_activity_guide_discards_source_color_but_preserves_occupancy() -> None:
     assert 0.09 < result.coverage_fraction < 0.12
 
 
-def test_activity_guide_uniform_frame_becomes_blank_background() -> None:
+def test_activity_guide_uniform_frame_becomes_inactive_shadow() -> None:
     result = make_trajectory_activity_guide(
         Image.new("RGB", (32, 32), (200, 210, 220)),
         blur_radius=3,
@@ -164,9 +165,28 @@ def test_activity_guide_uniform_frame_becomes_blank_background() -> None:
     assert np.asarray(result.mask).max() == 0
     assert np.array_equal(
         np.asarray(result.image),
-        np.full((32, 32, 3), (238, 233, 218), dtype=np.uint8),
+        np.full((32, 32, 3), (178, 175, 164), dtype=np.uint8),
     )
     assert result.coverage_fraction == 0.0
+
+
+def test_activity_composite_keeps_content_where_mask_is_white() -> None:
+    generated = Image.new("RGB", (8, 4), (200, 30, 20))
+    mask = Image.new("L", (8, 4), 0)
+    mask_array = np.asarray(mask).copy()
+    mask_array[:, 4:] = 255
+    mask = Image.fromarray(mask_array, mode="L")
+
+    result = composite_generated_activity(
+        generated,
+        mask,
+        background_rgb=(240, 235, 220),
+        outside_opacity=0.0,
+    )
+
+    array = np.asarray(result)
+    assert np.array_equal(array[:, :4], np.full((4, 4, 3), (240, 235, 220)))
+    assert np.array_equal(array[:, 4:], np.full((4, 4, 3), (200, 30, 20)))
 
 
 class _FakeImageProcessor:

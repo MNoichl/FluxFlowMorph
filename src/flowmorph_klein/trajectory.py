@@ -221,6 +221,7 @@ def make_trajectory_activity_guide(
     expansion_radius: int = 6,
     contrast: float = 0.25,
     background_rgb: tuple[int, int, int] = (238, 233, 218),
+    active_is_light: bool = True,
 ) -> TrajectoryActivityGuide:
     """Convert a trajectory frame into a color-free soft occupancy guide.
 
@@ -266,9 +267,13 @@ def make_trajectory_activity_guide(
 
     softened_mask = np.asarray(mask, dtype=np.float32) / 255.0
     background = np.asarray(background_rgb, dtype=np.float32)
-    active_tone = background * (1.0 - contrast)
+    shadow_tone = background * (1.0 - contrast)
+    if active_is_light:
+        inactive_tone, active_tone = shadow_tone, background
+    else:
+        inactive_tone, active_tone = background, shadow_tone
     guide_array = (
-        background[None, None, :] * (1.0 - softened_mask[:, :, None])
+        inactive_tone[None, None, :] * (1.0 - softened_mask[:, :, None])
         + active_tone[None, None, :] * softened_mask[:, :, None]
     )
     guide = Image.fromarray(np.round(guide_array).clip(0, 255).astype(np.uint8), mode="RGB")
@@ -280,6 +285,31 @@ def make_trajectory_activity_guide(
         ),
         coverage_fraction=float(np.mean(softened_mask >= 0.5)),
     )
+
+
+def composite_generated_activity(
+    generated: Image.Image,
+    mask: Image.Image,
+    *,
+    background_rgb: tuple[int, int, int] = (238, 233, 218),
+    outside_opacity: float = 0.0,
+) -> Image.Image:
+    """Keep generated content inside activity while neutralizing empty regions."""
+
+    if len(background_rgb) != 3 or any(not 0 <= channel <= 255 for channel in background_rgb):
+        raise ValueError("activity composite background_rgb must contain values in [0, 255]")
+    if not 0.0 <= outside_opacity <= 1.0:
+        raise ValueError("activity composite outside_opacity must lie in [0, 1]")
+    output = generated.convert("RGB")
+    resized_mask = mask.convert("L").resize(output.size, Image.Resampling.LANCZOS)
+    mask_array = np.asarray(resized_mask, dtype=np.float32) / 255.0
+    alpha = outside_opacity + (1.0 - outside_opacity) * mask_array
+    alpha_image = Image.fromarray(
+        np.round(alpha * 255.0).clip(0, 255).astype(np.uint8),
+        mode="L",
+    )
+    background = Image.new("RGB", output.size, background_rgb)
+    return Image.composite(output, background, alpha_image)
 
 
 def prepare_flux2_klein_img2img_inputs(
@@ -370,6 +400,7 @@ __all__ = [
     "IMAGE_SUFFIXES",
     "TrajectoryActivityGuide",
     "TrajectoryArchiveError",
+    "composite_generated_activity",
     "list_image_members",
     "make_strong_trajectory_reference",
     "make_trajectory_activity_guide",

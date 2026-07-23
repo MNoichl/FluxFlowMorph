@@ -129,9 +129,11 @@ settings = replace_once(
     'TRAJECTORY_MASK_EXPANSION = 4\n'
     'TRAJECTORY_GUIDE_CONTRAST = 0.32\n'
     'TRAJECTORY_GUIDE_BACKGROUND = (238, 233, 218)\n'
+    'TRAJECTORY_GUIDE_ACTIVE_IS_LIGHT = True\n'
+    'TRAJECTORY_OUTSIDE_CONTENT_OPACITY = 0.0  # 0 strictly clears non-activity regions.\n'
     'TRAJECTORY_DENOISE_STRENGTH = 0.45  # Higher repaints more; the guide carries layout only.\n'
     'TRAJECTORY_COMPOSITION_INSTRUCTION = (\n'
-    '    "Treat the darker regions of the neutral reference as an occupancy map: build "\n'
+    '    "Treat the lighter regions of the neutral reference as an occupancy map: build "\n'
     '    "the fresco ornament inside those regions, follow their placement and silhouette, "\n'
     '    "and leave pale regions mostly bare. Do not reproduce the guide as blobs or shading."\n'
     ')\n'
@@ -215,6 +217,8 @@ validation = replace_once(
     '    raise ValueError("Trajectory mask blur/expansion settings are invalid")\n'
     'if not 0 < TRAJECTORY_GUIDE_CONTRAST <= 1:\n'
     '    raise ValueError("TRAJECTORY_GUIDE_CONTRAST must lie in (0, 1]")\n'
+    'if not 0 <= TRAJECTORY_OUTSIDE_CONTENT_OPACITY <= 1:\n'
+    '    raise ValueError("TRAJECTORY_OUTSIDE_CONTENT_OPACITY must lie in [0, 1]")\n'
     '\n'
     'def trajectory_generation_prompt(prompt):\n'
     '    base = prompt\n'
@@ -339,6 +343,7 @@ model_cell = replace_once(
     "from flowmorph_klein.lora import load_flux2_lora\n",
     "from flowmorph_klein.lora import load_flux2_lora\n"
     "from flowmorph_klein.trajectory import (\n"
+    "    composite_generated_activity,\n"
     "    make_strong_trajectory_reference,\n"
     "    make_trajectory_activity_guide,\n"
     "    prepare_flux2_klein_img2img_inputs,\n"
@@ -360,6 +365,7 @@ model_cell = replace_once(
     "            expansion_radius=TRAJECTORY_MASK_EXPANSION,\n"
     "            contrast=TRAJECTORY_GUIDE_CONTRAST,\n"
     "            background_rgb=TRAJECTORY_GUIDE_BACKGROUND,\n"
+    "            active_is_light=TRAJECTORY_GUIDE_ACTIVE_IS_LIGHT,\n"
     "        )\n"
     "        guide_source = activity.image\n"
     "    else:\n"
@@ -418,15 +424,27 @@ model_cell = model_cell[:trial_start] + dedent(
             generator=trial_generator,
             output_type="pil",
         )
-        trial_image = trial_result.images[0].convert("RGB")
+        trial_raw_image = trial_result.images[0].convert("RGB")
+        trial_image = (
+            composite_generated_activity(
+                trial_raw_image,
+                trial_activity.mask,
+                background_rgb=TRAJECTORY_GUIDE_BACKGROUND,
+                outside_opacity=TRAJECTORY_OUTSIDE_CONTENT_OPACITY,
+            )
+            if trial_activity is not None
+            else trial_raw_image.copy()
+        )
         trial_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         trial_directory = RUN_DIRECTORY / "trials" / f"{trial_stamp}_{trial_stage['id']}_{trial_seed}"
         trial_directory.mkdir(parents=True, exist_ok=False)
         trial_path = trial_directory / "trial.png"
+        trial_raw_path = trial_directory / "trial_raw_before_activity_composite.png"
         trial_source_path = trial_directory / "trajectory_source.png"
         trial_reference_path = trial_directory / "trajectory_reference.png"
         trial_mask_path = trial_directory / "trajectory_activity_mask.png"
         trial_image.save(trial_path)
+        trial_raw_image.save(trial_raw_path)
         trial_source.save(trial_source_path)
         trial_reference.save(trial_reference_path)
         if trial_activity is not None:
@@ -449,6 +467,8 @@ model_cell = model_cell[:trial_start] + dedent(
             "trajectory_mask_blur": TRAJECTORY_MASK_BLUR,
             "trajectory_mask_expansion": TRAJECTORY_MASK_EXPANSION,
             "trajectory_guide_contrast": TRAJECTORY_GUIDE_CONTRAST,
+            "trajectory_guide_active_is_light": TRAJECTORY_GUIDE_ACTIVE_IS_LIGHT,
+            "outside_content_opacity": TRAJECTORY_OUTSIDE_CONTENT_OPACITY,
             "activity_coverage_fraction": (
                 trial_activity.coverage_fraction if trial_activity is not None else None
             ),
@@ -461,11 +481,13 @@ model_cell = model_cell[:trial_start] + dedent(
             trial_activity.mask.convert("RGB") if trial_activity is not None else None
         )
         input_preview = trial_reference.copy()
+        raw_preview = trial_raw_image.copy()
         output_preview = trial_image.copy()
         source_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
         if mask_preview is not None:
             mask_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
         input_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
+        raw_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
         output_preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
         display(Markdown(f"### Trial source: `{trial_trajectory['member']}`"))
         display(source_preview)
@@ -474,10 +496,13 @@ model_cell = model_cell[:trial_start] + dedent(
             display(mask_preview)
         display(Markdown("### Neutral activity-map guide used by FLUX"))
         display(input_preview)
-        display(Markdown(f"### Trial regenerated anchor: `{trial_stage['id']}`"))
+        display(Markdown("### Raw FLUX result before guaranteed mask composite"))
+        display(raw_preview)
+        display(Markdown(f"### Activity-constrained trial anchor: `{trial_stage['id']}`"))
         display(output_preview)
         print({
             "path": str(trial_path),
+            "raw_path": str(trial_raw_path),
             "trajectory_source": str(trial_source_path),
             "trajectory_reference": str(trial_reference_path),
             "trajectory_mask": (
@@ -486,8 +511,9 @@ model_cell = model_cell[:trial_start] + dedent(
             "seed": trial_seed,
             "prompt_index": trial_index,
         })
-        del trial_result, trial_img2img, trial_image, trial_source, trial_reference
-        del source_preview, mask_preview, input_preview, output_preview, trial_activity
+        del trial_result, trial_img2img, trial_raw_image, trial_image
+        del trial_source, trial_reference, source_preview, mask_preview
+        del input_preview, raw_preview, output_preview, trial_activity
     else:
         print("Trial skipped.")
     '''
@@ -513,6 +539,7 @@ notebook["cells"][14]["source"] = lines(
     BASE_DIRECTORY = RUN_DIRECTORY / "base_frames"
     REFERENCE_DIRECTORY = BASE_DIRECTORY / "trajectory_references"
     MASK_DIRECTORY = BASE_DIRECTORY / "trajectory_activity_masks"
+    RAW_DIRECTORY = BASE_DIRECTORY / "raw_activity_generations"
     BASE_MANIFEST_PATH = RUN_DIRECTORY / "metadata" / "base_manifest.json"
     BASE_RECORDS = []
     expected_anchor_contract = [
@@ -532,6 +559,8 @@ notebook["cells"][14]["source"] = lines(
                 "expansion": TRAJECTORY_MASK_EXPANSION,
                 "contrast": TRAJECTORY_GUIDE_CONTRAST,
                 "background": list(TRAJECTORY_GUIDE_BACKGROUND),
+                "active_is_light": TRAJECTORY_GUIDE_ACTIVE_IS_LIGHT,
+                "outside_content_opacity": TRAJECTORY_OUTSIDE_CONTENT_OPACITY,
             },
         }
         for index, (stage, trajectory) in enumerate(
@@ -575,6 +604,7 @@ notebook["cells"][14]["source"] = lines(
     else:
         REFERENCE_DIRECTORY.mkdir(parents=True, exist_ok=True)
         MASK_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        RAW_DIRECTORY.mkdir(parents=True, exist_ok=True)
         for index, (stage, trajectory) in enumerate(
             zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)
         ):
@@ -612,8 +642,20 @@ notebook["cells"][14]["source"] = lines(
             )
             if not result.images:
                 raise RuntimeError(f"FLUX returned no image for {stage['id']}")
-            image = result.images[0].convert("RGB")
+            raw_image = result.images[0].convert("RGB")
+            image = (
+                composite_generated_activity(
+                    raw_image,
+                    activity.mask,
+                    background_rgb=TRAJECTORY_GUIDE_BACKGROUND,
+                    outside_opacity=TRAJECTORY_OUTSIDE_CONTENT_OPACITY,
+                )
+                if activity is not None
+                else raw_image.copy()
+            )
+            raw_output_path = RAW_DIRECTORY / f"{index:03d}_{stage['id']}_raw.png"
             output_path = BASE_DIRECTORY / f"{index:03d}_{stage['id']}.png"
+            raw_image.save(raw_output_path, format="PNG", compress_level=4)
             image.save(output_path, format="PNG", compress_level=4)
             record = {
                 "uid": f"base_{index:03d}",
@@ -624,6 +666,7 @@ notebook["cells"][14]["source"] = lines(
                 "generation_prompt": generation_prompt,
                 "seed": seed,
                 "path": str(output_path),
+                "raw_generation_path": str(raw_output_path),
                 "trajectory_index": trajectory["trajectory_index"],
                 "trajectory_member": trajectory["member"],
                 "trajectory_member_sha256": trajectory["member_sha256"],
@@ -643,6 +686,8 @@ notebook["cells"][14]["source"] = lines(
                     "expansion": TRAJECTORY_MASK_EXPANSION,
                     "contrast": TRAJECTORY_GUIDE_CONTRAST,
                     "background": list(TRAJECTORY_GUIDE_BACKGROUND),
+                    "active_is_light": TRAJECTORY_GUIDE_ACTIVE_IS_LIGHT,
+                    "outside_content_opacity": TRAJECTORY_OUTSIDE_CONTENT_OPACITY,
                 },
                 "trajectory_activity_mask_path": (
                     str(mask_path) if activity is not None else None
@@ -671,6 +716,7 @@ notebook["cells"][14]["source"] = lines(
             )
             reference.close()
             source_image.close()
+            raw_image.close()
             image.close()
             del result, img2img, activity
 
