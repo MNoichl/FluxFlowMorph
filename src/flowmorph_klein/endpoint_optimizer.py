@@ -437,3 +437,228 @@ def optimize_endpoint(
         diagnostics=tuple(history),
         completed_steps=settings.optimization_steps,
     )
+
+
+def optimize_endpoint_batch(
+    targets: Sequence[Tensor],
+    *,
+    sigma_i: float | Tensor,
+    sigma_last: float | Tensor,
+    timestep_i: Any,
+    predictor: EndpointVelocityPredictor,
+    conditioning: Any,
+    config: EndpointOptimizerConfig | None = None,
+    initial_deltas: Sequence[Tensor | None] | None = None,
+    initial_us: Sequence[Tensor | None] | None = None,
+    optimizer_state_dicts: Sequence[Mapping[str, Any] | None] | None = None,
+    start_step: int = 0,
+    predictor_parameters: Iterable[nn.Parameter] | None = None,
+    checkpoint_callbacks: Sequence[EndpointCheckpointCallback | None] | None = None,
+    diagnostics_callbacks: Sequence[EndpointDiagnosticsCallback | None] | None = None,
+) -> tuple[EndpointOptimizationResult, ...]:
+    """Fit independent endpoints in one frozen-transformer batch.
+
+    Each endpoint retains separate float32 leaves, AdamW state, loss, diagnostics,
+    and checkpoint callback. Summing the per-endpoint objectives before backward
+    therefore produces the same uncoupled gradients as independent fits while
+    sharing the expensive transformer call.
+    """
+
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("endpoint optimization cannot run inside torch.inference_mode()")
+    if not targets:
+        raise ValueError("at least one endpoint target is required")
+    if any(target.shape[0] != 1 for target in targets):
+        raise ValueError("batched endpoint fitting expects one image per target tensor")
+    settings = config or EndpointOptimizerConfig()
+    if start_step < 0 or start_step >= settings.optimization_steps:
+        raise ValueError("start_step must be in [0, optimization_steps)")
+    batch_count = len(targets)
+
+    def normalize_optional(values: Sequence[Any] | None, name: str) -> list[Any]:
+        if values is None:
+            return [None] * batch_count
+        if len(values) != batch_count:
+            raise ValueError(f"{name} must contain one item per endpoint")
+        return list(values)
+
+    delta_values = normalize_optional(initial_deltas, "initial_deltas")
+    u_values = normalize_optional(initial_us, "initial_us")
+    optimizer_values = normalize_optional(optimizer_state_dicts, "optimizer_state_dicts")
+    checkpoint_values = normalize_optional(checkpoint_callbacks, "checkpoint_callbacks")
+    diagnostics_values = normalize_optional(diagnostics_callbacks, "diagnostics_callbacks")
+
+    masters: list[Tensor] = []
+    preds: list[nn.Parameter] = []
+    us: list[nn.Parameter] = []
+    optimizers: list[torch.optim.AdamW] = []
+    for target, initial_delta, initial_u, optimizer_state in zip(
+        targets,
+        delta_values,
+        u_values,
+        optimizer_values,
+        strict=True,
+    ):
+        master, pred, u = initialize_endpoint_parameters(
+            target,
+            initial_delta=initial_delta,
+            initial_u=initial_u,
+        )
+        optimizer = build_endpoint_optimizer(pred, u, settings)
+        if optimizer_state is not None:
+            optimizer.load_state_dict(dict(optimizer_state))
+        optimizer.zero_grad(set_to_none=True)
+        masters.append(master)
+        preds.append(pred)
+        us.append(u)
+        optimizers.append(optimizer)
+
+    model_parameters = _discover_predictor_parameters(predictor, predictor_parameters)
+    _assert_frozen_inputs(model_parameters, conditioning)
+    histories: list[list[OptimizationStepDiagnostics]] = [[] for _ in targets]
+    started = time.perf_counter()
+    device = masters[0].device
+    if any(master.device != device or master.shape != masters[0].shape for master in masters):
+        raise ValueError("batched endpoint targets must share device and shape")
+    loss_mode = LossMode(settings.loss_mode)
+
+    with torch.set_grad_enabled(True):
+        for step in range(start_step + 1, settings.optimization_steps + 1):
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            states = [
+                state_from_pred_and_u(pred, u, sigma_i, sigma_last)
+                for pred, u in zip(preds, us, strict=True)
+            ]
+            state_batch = torch.cat(states, dim=0)
+            velocity_batch = _predict_velocity(
+                predictor,
+                state_batch,
+                timestep_i,
+                conditioning,
+            )
+            velocity_parts = velocity_batch.split(1, dim=0)
+            totals: list[Tensor] = []
+            reconstructions: list[Tensor] = []
+            regularizations: list[Tensor] = []
+            for state, velocity, master, pred, u in zip(
+                states,
+                velocity_parts,
+                masters,
+                preds,
+                us,
+                strict=True,
+            ):
+                reconstructed = one_step_reconstruction(
+                    state,
+                    velocity,
+                    sigma_i,
+                    sigma_last,
+                )
+                reconstruction = reconstruction_loss(reconstructed, master, loss_mode)
+                delta = pred - master
+                regularization = (
+                    settings.lambda_delta * delta.float().square().sum()
+                    + settings.lambda_u * u.float().square().sum()
+                )
+                total = reconstruction + regularization
+                _finite_loss(total)
+                reconstructions.append(reconstruction)
+                regularizations.append(regularization)
+                totals.append(total)
+            torch.stack(totals).sum().backward()
+
+            pred_gradient_norms = [
+                _finite_gradient(pred, f"pred[{index}]")
+                for index, pred in enumerate(preds)
+            ]
+            u_gradient_norms = [
+                _finite_gradient(u, f"u[{index}]")
+                for index, u in enumerate(us)
+            ]
+            if any(parameter.grad is not None for parameter in model_parameters):
+                raise RuntimeError("a frozen predictor/model/LoRA parameter received a gradient")
+            for optimizer in optimizers:
+                optimizer.step()
+
+            peak_allocated, peak_reserved = _vram_peaks(device)
+            for index, (
+                master,
+                pred,
+                u,
+                optimizer,
+                reconstruction,
+                regularization,
+                total,
+            ) in enumerate(
+                zip(
+                    masters,
+                    preds,
+                    us,
+                    optimizers,
+                    reconstructions,
+                    regularizations,
+                    totals,
+                    strict=True,
+                )
+            ):
+                diagnostics = OptimizationStepDiagnostics(
+                    step=step,
+                    total_loss=float(total.detach().float().item()),
+                    reconstruction_loss=float(reconstruction.detach().float().item()),
+                    regularization_loss=float(regularization.detach().float().item()),
+                    pred_gradient_norm=pred_gradient_norms[index],
+                    u_gradient_norm=u_gradient_norms[index],
+                    pred_parameter_norm=float(torch.linalg.vector_norm(pred.detach().float()).item()),
+                    u_parameter_norm=float(torch.linalg.vector_norm(u.detach().float()).item()),
+                    delta_norm=float(torch.linalg.vector_norm((pred.detach() - master).float()).item()),
+                    peak_allocated_vram_bytes=peak_allocated,
+                    peak_reserved_vram_bytes=peak_reserved,
+                    elapsed_seconds=time.perf_counter() - started,
+                )
+                histories[index].append(diagnostics)
+                diagnostics_callback = diagnostics_values[index]
+                if diagnostics_callback is not None:
+                    diagnostics_callback(diagnostics)
+                checkpoint_callback = checkpoint_values[index]
+                if checkpoint_callback is not None and (
+                    step % settings.checkpoint_every == 0
+                    or step == settings.optimization_steps
+                ):
+                    checkpoint_callback(
+                        step,
+                        _endpoint_snapshot(
+                            master,
+                            pred,
+                            u,
+                            sigma_i,
+                            sigma_last,
+                            timestep_i,
+                        ),
+                        optimizer,
+                        diagnostics,
+                    )
+            for optimizer in optimizers:
+                optimizer.zero_grad(set_to_none=True)
+
+    return tuple(
+        EndpointOptimizationResult(
+            endpoint=_endpoint_snapshot(
+                master,
+                pred,
+                u,
+                sigma_i,
+                sigma_last,
+                timestep_i,
+            ),
+            diagnostics=tuple(history),
+            completed_steps=settings.optimization_steps,
+        )
+        for master, pred, u, history in zip(
+            masters,
+            preds,
+            us,
+            histories,
+            strict=True,
+        )
+    )

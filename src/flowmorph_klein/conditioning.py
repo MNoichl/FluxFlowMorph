@@ -98,6 +98,33 @@ class ConditioningPackage:
         }
 
 
+def stack_conditioning_packages(
+    packages: tuple[ConditioningPackage, ...] | list[ConditioningPackage],
+) -> ConditioningPackage:
+    """Stack independent prompt packages into one transformer batch."""
+
+    if not packages:
+        raise ValueError("at least one conditioning package is required")
+    first = packages[0]
+    expected_embed_shape = first.prompt_embeds.shape[1:]
+    expected_id_shape = first.text_ids.shape[1:]
+    if any(package.prompt_embeds.shape[1:] != expected_embed_shape for package in packages):
+        raise ValueError("conditioning embedding sequence/feature shapes must match")
+    if any(package.text_ids.shape[1:] != expected_id_shape for package in packages):
+        raise ValueError("conditioning text-ID sequence shapes must match")
+    prompts: list[str] = []
+    for package in packages:
+        if isinstance(package.prompt, tuple):
+            prompts.extend(package.prompt)
+        else:
+            prompts.append(package.prompt)
+    return ConditioningPackage(
+        prompt=tuple(prompts),
+        prompt_embeds=torch.cat([package.prompt_embeds for package in packages], dim=0).detach(),
+        text_ids=torch.cat([package.text_ids for package in packages], dim=0).detach(),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedPrompts:
     source: str

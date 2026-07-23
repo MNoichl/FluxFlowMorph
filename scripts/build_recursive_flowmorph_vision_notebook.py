@@ -178,6 +178,12 @@ settings = replace_once(
     "FLOWMORPH_RENDER_INDICES = [*range(35, 100, 5), 99]\n"
     "FLOWMORPH_CHECKPOINT_EVERY = 25\n"
     "FLOWMORPH_STREAM_PAIRS_PER_CHUNK = 3\n"
+    "FLOWMORPH_ENDPOINT_BATCH_SIZE = 2\n"
+    "FLOWMORPH_RENDER_BATCH_SIZE = 4\n"
+    "FLOWMORPH_DECODE_BATCH_SIZE = 8\n"
+    'FLOWMORPH_CFG_EXECUTION = "batched"\n'
+    "FLOWMORPH_BATCH_OOM_BACKOFF = True\n"
+    "OPENAI_CONCURRENCY = 6\n"
     "FLOWMORPH_STREAM_DISPLAY_PROGRESS = True\n",
 )
 settings = replace_once(settings, "RIFE_MULTIPLIER = 4\n", "RIFE_MULTIPLIER = 2\n")
@@ -247,8 +253,8 @@ notebook["cells"][10]["source"] = lines(
         raise ValueError("IMAGE_GUIDANCE_SCALE must be between 0 and 20")
     if not 0 < IMAGE_LORA_SCALE <= 4:
         raise ValueError("IMAGE_LORA_SCALE must lie in (0, 4]")
-    if not 0 < BASE_REFERENCE_STRENGTH <= 0.35:
-        raise ValueError("BASE_REFERENCE_STRENGTH must lie in (0, 0.35]")
+    if not 0 < BASE_REFERENCE_STRENGTH <= 1.0:
+        raise ValueError("BASE_REFERENCE_STRENGTH must lie in (0, 1]")
     if not 0 <= BASE_REFERENCE_GRAIN_STRENGTH <= 0.25:
         raise ValueError("BASE_REFERENCE_GRAIN_STRENGTH must lie in [0, 0.25]")
     if OPENAI_IMAGE_DETAIL not in {"low", "high", "original", "auto"}:
@@ -273,6 +279,16 @@ notebook["cells"][10]["source"] = lines(
         raise ValueError("FlowMorph guidance must match IMAGE_GUIDANCE_SCALE")
     if FLOWMORPH_STREAM_PAIRS_PER_CHUNK < 1:
         raise ValueError("FLOWMORPH_STREAM_PAIRS_PER_CHUNK must be positive")
+    for name, value in {
+        "FLOWMORPH_ENDPOINT_BATCH_SIZE": FLOWMORPH_ENDPOINT_BATCH_SIZE,
+        "FLOWMORPH_RENDER_BATCH_SIZE": FLOWMORPH_RENDER_BATCH_SIZE,
+        "FLOWMORPH_DECODE_BATCH_SIZE": FLOWMORPH_DECODE_BATCH_SIZE,
+        "OPENAI_CONCURRENCY": OPENAI_CONCURRENCY,
+    }.items():
+        if value < 1:
+            raise ValueError(f"{name} must be positive")
+    if FLOWMORPH_CFG_EXECUTION not in {"sequential", "batched"}:
+        raise ValueError("FLOWMORPH_CFG_EXECUTION must be sequential or batched")
     if not 0 <= FLOWMORPH_ONE_GAP_TEST_INDEX < BASE_PROMPT_COUNT:
         raise ValueError("FLOWMORPH_ONE_GAP_TEST_INDEX is outside the active anchor range")
     if (
@@ -335,6 +351,7 @@ notebook["cells"][18]["source"] = lines(
 notebook["cells"][19]["source"] = lines(
     r"""
     import gc
+    from concurrent.futures import ThreadPoolExecutor
     from flowmorph_klein.cli import select_hardware_profile
     from flowmorph_klein.config import ProjectTemplateConfig, load_config, resolve_config
     from flowmorph_klein.pipeline import FlowMorphRunner
@@ -677,10 +694,11 @@ notebook["cells"][18]["source"] = lines(
 notebook["cells"][19]["source"] = lines(
     r"""
     import gc
+    from concurrent.futures import ThreadPoolExecutor
     from flowmorph_klein.cli import select_hardware_profile
     from flowmorph_klein.config import ProjectTemplateConfig, load_config, resolve_config
     from flowmorph_klein.pipeline import FlowMorphRunner
-    from flowmorph_klein.sequence import FlowMorphSequenceSession
+    from flowmorph_klein.sequence import FlowMorphSequenceSession, SequenceEndpointRequest
 
     # Explicit art-mode contract: preserve the numerical and geometry safety
     # checks while allowing the sequence engine to render interior alphas only.
@@ -767,6 +785,11 @@ notebook["cells"][19]["source"] = lines(
         "width": IMAGE_WIDTH,
         "height": IMAGE_HEIGHT,
         "conditioning": "piecewise_source_midpoint_target_embeddings",
+        "endpoint_batch_size": FLOWMORPH_ENDPOINT_BATCH_SIZE,
+        "render_batch_size": FLOWMORPH_RENDER_BATCH_SIZE,
+        "decode_batch_size": FLOWMORPH_DECODE_BATCH_SIZE,
+        "cfg_execution": FLOWMORPH_CFG_EXECUTION,
+        "batch_oom_backoff": FLOWMORPH_BATCH_OOM_BACKOFF,
     }
     SEQUENCE_SESSION_FINGERPRINT = stable_fingerprint(SEQUENCE_SESSION_CONTRACT)
     SEQUENCE_SESSION_DIRECTORY = (
@@ -855,13 +878,23 @@ notebook["cells"][19]["source"] = lines(
         run_directory=SEQUENCE_SESSION_DIRECTORY,
     )
     SEQUENCE_RUNNER.prepare(resume=session_resume)
-    SEQUENCE_SESSION = FlowMorphSequenceSession(SEQUENCE_RUNNER)
+    SEQUENCE_SESSION = FlowMorphSequenceSession(
+        SEQUENCE_RUNNER,
+        render_batch_size=FLOWMORPH_RENDER_BATCH_SIZE,
+        decode_batch_size=FLOWMORPH_DECODE_BATCH_SIZE,
+        cfg_execution=FLOWMORPH_CFG_EXECUTION,
+        oom_backoff=FLOWMORPH_BATCH_OOM_BACKOFF,
+    )
     PROBE_REPORT = SEQUENCE_SESSION.run_backward_probe_once()
     print({
         "model_loads": 1,
         "backward_probes": 1,
         "fit_steps_per_unique_endpoint": FLOWMORPH_SOURCE_OPTIMIZATION_STEPS,
         "probe_peak_reserved_gib": round(PROBE_REPORT.peak_reserved_vram_bytes / (1024 ** 3), 3),
+        "endpoint_batch_size": FLOWMORPH_ENDPOINT_BATCH_SIZE,
+        "render_batch_size": FLOWMORPH_RENDER_BATCH_SIZE,
+        "decode_batch_size": FLOWMORPH_DECODE_BATCH_SIZE,
+        "cfg_execution": FLOWMORPH_CFG_EXECUTION,
     })
 
     IMAGE_ASSET_CACHE, PROMPT_CONDITIONING_CACHE = SEQUENCE_SESSION.seed_prepared_assets(
@@ -920,28 +953,44 @@ notebook["cells"][19]["source"] = lines(
             PROMPT_CONDITIONING_CACHE.update(new_prompts)
             IMAGE_ASSET_CACHE.update(new_images)
 
-    def fit_sequence_endpoint(record, progress_label):
+    def fit_sequence_endpoints(records, progress_label):
         global UNIQUE_ENDPOINT_FIT_COUNT
-        uid = record["uid"]
-        if uid in ENDPOINT_CACHE:
-            return ENDPOINT_CACHE[uid]
-        fingerprint = endpoint_fingerprint(record)
-        checkpoint_directory = SEQUENCE_ENDPOINT_ROOT / f"{uid}_{fingerprint[:12]}"
-        result = SEQUENCE_SESSION.fit_endpoint(
-            endpoint_key=uid,
-            asset=IMAGE_ASSET_CACHE[uid],
-            conditioning=PROMPT_CONDITIONING_CACHE[record["prompt"]],
-            checkpoint_directory=checkpoint_directory,
-            resume=RESUME_FLOWMORPH_SEQUENCE and checkpoint_directory.exists(),
+        unique_records = {
+            record["uid"]: record
+            for record in records
+            if record["uid"] not in ENDPOINT_CACHE
+        }
+        if not unique_records:
+            return
+        requests = []
+        fingerprints = {}
+        for uid, record in unique_records.items():
+            fingerprint = endpoint_fingerprint(record)
+            fingerprints[uid] = fingerprint
+            checkpoint_directory = SEQUENCE_ENDPOINT_ROOT / f"{uid}_{fingerprint[:12]}"
+            requests.append(SequenceEndpointRequest(
+                endpoint_key=uid,
+                asset=IMAGE_ASSET_CACHE[uid],
+                conditioning=PROMPT_CONDITIONING_CACHE[record["prompt"]],
+                checkpoint_directory=checkpoint_directory,
+                resume=RESUME_FLOWMORPH_SEQUENCE and checkpoint_directory.exists(),
+            ))
+        fitted = SEQUENCE_SESSION.fit_endpoints(
+            requests,
+            batch_size=FLOWMORPH_ENDPOINT_BATCH_SIZE,
         )
-        ENDPOINT_CACHE[uid] = result.endpoint
-        ENDPOINT_FINGERPRINTS[uid] = fingerprint
-        UNIQUE_ENDPOINT_FIT_COUNT += 1
-        print(
-            f"{progress_label}: {uid}; steps={result.completed_steps}; "
-            f"checkpoint_reused={result.resumed}"
-        )
-        return result.endpoint
+        for uid, result in fitted.items():
+            ENDPOINT_CACHE[uid] = result.endpoint
+            ENDPOINT_FINGERPRINTS[uid] = fingerprints[uid]
+            UNIQUE_ENDPOINT_FIT_COUNT += 1
+            print(
+                f"{progress_label}: {uid}; steps={result.completed_steps}; "
+                f"checkpoint_reused={result.resumed}"
+            )
+
+    def fit_sequence_endpoint(record, progress_label):
+        fit_sequence_endpoints([record], progress_label)
+        return ENDPOINT_CACHE[record["uid"]]
 
     if RUN_FLOWMORPH_ONE_GAP_TEST:
         import numpy as np
@@ -966,8 +1015,9 @@ notebook["cells"][19]["source"] = lines(
             [test_left, test_right],
             prompts=[test_proposal.prompt],
         )
-        test_source_endpoint = fit_sequence_endpoint(test_left, "One-gap source fit")
-        test_target_endpoint = fit_sequence_endpoint(test_right, "One-gap target fit")
+        fit_sequence_endpoints([test_left, test_right], "One-gap endpoint fit")
+        test_source_endpoint = ENDPOINT_CACHE[test_left["uid"]]
+        test_target_endpoint = ENDPOINT_CACHE[test_right["uid"]]
         test_frames = SEQUENCE_SESSION.render_midpoints(
             source=test_source_endpoint,
             target=test_target_endpoint,
@@ -1067,20 +1117,33 @@ notebook["cells"][19]["source"] = lines(
         gap_count = len(incoming)
         pair_jobs = []
 
-        # One image-aware LLM proposal per gap. In round 2 it is reused for all
-        # ten alpha positions instead of making ten calls or inventing ten prompts.
+        # One image-aware LLM proposal per gap. Independent API requests are
+        # bounded and concurrent; executor.map retains deterministic gap order.
+        prompt_jobs = []
         for gap_index, left in enumerate(incoming):
             right = incoming[(gap_index + 1) % gap_count]
             pair_uid = f"r{round_number:02d}_g{gap_index:04d}"
             proposal_path = proposal_directory / f"{pair_uid}_shared.json"
-            proposal, response_id, usage, proposal_fingerprint = load_or_create_shared_prompt(
+            prompt_jobs.append((
                 left,
                 right,
                 round_number,
                 gap_index,
                 prompt_mode,
                 proposal_path,
-            )
+                pair_uid,
+            ))
+        with ThreadPoolExecutor(
+            max_workers=min(OPENAI_CONCURRENCY, len(prompt_jobs))
+        ) as executor:
+            prompt_results = list(executor.map(
+                lambda job: load_or_create_shared_prompt(*job[:6]),
+                prompt_jobs,
+            ))
+
+        for prompt_job, prompt_result in zip(prompt_jobs, prompt_results, strict=True):
+            left, right, _, gap_index, _, proposal_path, pair_uid = prompt_job
+            proposal, response_id, usage, proposal_fingerprint = prompt_result
             OPENAI_SHARED_PROMPT_COUNT += 1
             frame_records = []
             for midpoint_index, fraction in enumerate(fractions, start=1):
@@ -1184,17 +1247,17 @@ notebook["cells"][19]["source"] = lines(
             ]
             chunk_frames = []
             chunk_paths = []
+            fit_sequence_endpoints(
+                [
+                    endpoint_record
+                    for job in chunk_jobs
+                    for endpoint_record in (job["left"], job["right"])
+                ],
+                f"Round {round_number} batched streaming fit",
+            )
             for job in chunk_jobs:
                 left = job["left"]
                 right = job["right"]
-                fit_sequence_endpoint(
-                    left,
-                    f"Round {round_number} streaming fit",
-                )
-                fit_sequence_endpoint(
-                    right,
-                    f"Round {round_number} streaming fit",
-                )
                 shared = PROMPT_CONDITIONING_CACHE[job["proposal"].prompt]
                 rendered = SEQUENCE_SESSION.render_midpoints(
                     source=ENDPOINT_CACHE[left["uid"]],
@@ -1208,10 +1271,12 @@ notebook["cells"][19]["source"] = lines(
                 chunk_paths.extend(item["output_path"] for item in job["frame_records"])
                 print(
                     f"Rendered {job['pair_uid']} ({midpoint_count} interior frame(s)); "
+                    f"render_batch={SEQUENCE_SESSION.last_render_batch_size}; "
                     "decoding with this chunk..."
                 )
 
             SEQUENCE_SESSION.decode_frames_to_paths(chunk_frames, chunk_paths)
+            print(f"Decoded with batch_size={SEQUENCE_SESSION.last_decode_batch_size}")
             for job in chunk_jobs:
                 inserted = [
                     {
@@ -1321,6 +1386,15 @@ notebook["cells"][19]["source"] = lines(
             "input_count": len(incoming),
             "midpoints_per_gap": midpoint_count,
             "alphas": fractions,
+            "execution_batching": {
+                "endpoint_batch_size": FLOWMORPH_ENDPOINT_BATCH_SIZE,
+                "render_batch_size": FLOWMORPH_RENDER_BATCH_SIZE,
+                "decode_batch_size": FLOWMORPH_DECODE_BATCH_SIZE,
+                "cfg_execution_requested": FLOWMORPH_CFG_EXECUTION,
+                "cfg_execution_active": SEQUENCE_SESSION.cfg_execution,
+                "openai_concurrency": OPENAI_CONCURRENCY,
+                "oom_backoff": FLOWMORPH_BATCH_OOM_BACKOFF,
+            },
             "output_count": len(outgoing),
             "records": outgoing,
         }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1361,6 +1435,15 @@ notebook["cells"][19]["source"] = lines(
         "pair_renders": FLOWMORPH_PAIR_RENDER_COUNT,
         "one_openai_prompt_per_gap": True,
         "openai_prompt_count": OPENAI_SHARED_PROMPT_COUNT,
+        "execution_batching": {
+            "endpoint_batch_size": FLOWMORPH_ENDPOINT_BATCH_SIZE,
+            "render_batch_size": FLOWMORPH_RENDER_BATCH_SIZE,
+            "decode_batch_size": FLOWMORPH_DECODE_BATCH_SIZE,
+            "cfg_execution_requested": FLOWMORPH_CFG_EXECUTION,
+            "cfg_execution_active": SEQUENCE_SESSION.cfg_execution,
+            "openai_concurrency": OPENAI_CONCURRENCY,
+            "oom_backoff": FLOWMORPH_BATCH_OOM_BACKOFF,
+        },
         "final_count": len(FINAL_RECORDS),
         "round_manifests": ROUND_MANIFESTS,
         "records": FINAL_RECORDS,

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 from flowmorph_klein.conditioning import ConditioningPackage
 from flowmorph_klein.flow_state import FlowMorphEndpoint
@@ -94,6 +95,46 @@ def test_render_midpoints_uses_piecewise_endpoint_midpoint_conditioning(monkeypa
     assert [float(item.prompt_embeds.mean()) for item in scheduled] == [1.0, 2.0, 1.5]
     assert all(isinstance(item.prompt, tuple) and item.prompt[0].startswith("interpolated:") for item in scheduled)
     assert [frame.alpha for frame in frames] == list(alphas)
+
+
+def test_decode_frames_to_paths_uses_configured_batches(monkeypatch, tmp_path):
+    runner = FakeRunner()
+    runner.pipeline = SimpleNamespace(
+        transformer=torch.nn.Linear(1, 1, bias=False),
+        vae=torch.nn.Linear(1, 1, bias=False),
+        image_processor=object(),
+    )
+    runner.image_ids = torch.zeros((1, 2, 4), dtype=torch.long)
+    observed_batch_sizes = []
+
+    def fake_decode(tokens, image_ids, vae, **kwargs):
+        del vae, kwargs
+        assert tokens.shape[0] == image_ids.shape[0]
+        observed_batch_sizes.append(tokens.shape[0])
+        return [Image.new("RGB", (4, 4), (index, 0, 0)) for index in range(tokens.shape[0])]
+
+    monkeypatch.setattr("flowmorph_klein.sequence.decode_packed_latent", fake_decode)
+    monkeypatch.setattr("flowmorph_klein.sequence._move_module", lambda *args: None)
+    monkeypatch.setattr("flowmorph_klein.sequence.release_cuda_memory", lambda: None)
+    session = FlowMorphSequenceSession(runner, decode_batch_size=2)
+    frames = tuple(
+        RenderedLatentFrame(
+            index=index,
+            alpha=index / 5,
+            start_state=torch.zeros((1, 2, 4)),
+            final_latent=torch.zeros((1, 2, 4)),
+            conditioning_mode="prompt_schedule",
+        )
+        for index in range(5)
+    )
+    destinations = [tmp_path / f"{index}.png" for index in range(5)]
+
+    result = session.decode_frames_to_paths(frames, destinations)
+
+    assert observed_batch_sizes == [2, 2, 1]
+    assert session.last_decode_batch_size == 2
+    assert result == tuple(destinations)
+    assert all(path.is_file() for path in destinations)
 
 
 @pytest.mark.parametrize("alphas", [(), (0.0,), (1.0,), (-0.1,), (1.1,)])

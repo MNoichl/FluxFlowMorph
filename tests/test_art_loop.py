@@ -43,6 +43,15 @@ def test_art_loop_rejects_wrong_bridge_prompt_count(tmp_path: Path) -> None:
         load_art_loop_spec(invalid)
 
 
+def test_art_loop_allows_full_reference_blend(tmp_path: Path) -> None:
+    payload = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    payload["generation"]["continuity"]["reference_blend"] = 1.0
+    valid = tmp_path / "full-reference.json"
+    valid.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert load_art_loop_spec(valid).generation.continuity.reference_blend == 1.0
+
+
 def test_soft_reference_is_faint_blurred_previous_image() -> None:
     previous = Image.new("RGB", (16, 16), (255, 0, 0))
     reference = make_soft_reference(
@@ -54,6 +63,27 @@ def test_soft_reference_is_faint_blurred_previous_image() -> None:
 
     assert reference.size == previous.size
     assert tuple(np.asarray(reference)[0, 0]) == (131, 80, 80)
+
+
+def test_soft_reference_allows_full_image_blend() -> None:
+    previous = Image.new("RGB", (16, 16), (255, 0, 0))
+    reference = make_soft_reference(
+        previous,
+        reference_blend=1.0,
+        blur_radius=0.0,
+        background_rgb=(100, 100, 100),
+    )
+
+    assert np.array_equal(np.asarray(reference), np.asarray(previous))
+
+
+@pytest.mark.parametrize("reference_blend", [0.0, 1.001])
+def test_soft_reference_rejects_invalid_blend(reference_blend: float) -> None:
+    with pytest.raises(ValueError, match=r"reference_blend must lie in \(0, 1\]"):
+        make_soft_reference(
+            Image.new("RGB", (8, 8), "gray"),
+            reference_blend=reference_blend,
+        )
 
 
 def test_soft_reference_grain_is_seeded_and_visible() -> None:

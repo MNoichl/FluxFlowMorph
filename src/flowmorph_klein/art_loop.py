@@ -41,7 +41,7 @@ class ArtProject(ArtLoopModel):
 
 class ContinuityConfig(ArtLoopModel):
     enabled: bool = True
-    reference_blend: float = Field(default=0.15, gt=0.0, le=0.35)
+    reference_blend: float = Field(default=0.15, gt=0.0, le=1.0)
     blur_radius: float = Field(default=12.0, ge=0.0, le=64.0)
     grain_strength: float = Field(default=0.0, ge=0.0, le=0.25)
     background_rgb: tuple[int, int, int] = (127, 127, 127)
@@ -210,8 +210,8 @@ def make_soft_reference(
     blend so its visible amplitude is not accidentally attenuated twice.
     """
 
-    if not 0.0 < reference_blend <= 0.35:
-        raise ValueError("reference_blend must lie in (0, 0.35]")
+    if not 0.0 < reference_blend <= 1.0:
+        raise ValueError("reference_blend must lie in (0, 1]")
     if blur_radius < 0.0:
         raise ValueError("blur_radius cannot be negative")
     if not 0.0 <= grain_strength <= 0.25:

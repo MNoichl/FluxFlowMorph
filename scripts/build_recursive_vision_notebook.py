@@ -159,6 +159,7 @@ cells = [
         RIFE_MODEL_FILENAME = "RIFE_v4.25.zip"
         RIFE_MULTIPLIER = 4
         RIFE_SCALE = 1.0
+        RIFE_BATCH_SIZE = 4
         RIFE_USE_FP16 = True
         RIFE_RETRY_WITH_FP32 = True  # Automatically retry once when the fp16 runner fails.
         RIFE_FINAL_FPS = 24.0
@@ -1349,6 +1350,8 @@ cells = [
                 raise RuntimeError("RIFE requires CUDA")
             if RIFE_MULTIPLIER < 2:
                 raise ValueError("RIFE_MULTIPLIER must be at least 2")
+            if RIFE_BATCH_SIZE < 1:
+                raise ValueError("RIFE_BATCH_SIZE must be positive")
             if RIFE_SCALE not in {0.25, 0.5, 1.0, 2.0, 4.0}:
                 raise ValueError("RIFE_SCALE must be 0.25, 0.5, 1.0, 2.0, or 4.0")
             if RIFE_FINAL_FPS <= 0 or SOURCE_SEQUENCE_FPS <= 0:
@@ -1418,11 +1421,14 @@ cells = [
         parser.add_argument("--output", required=True)
         parser.add_argument("--multi", type=int, required=True)
         parser.add_argument("--scale", type=float, required=True)
+        parser.add_argument("--batch-size", type=int, default=1)
         parser.add_argument("--fp16", action="store_true")
         args = parser.parse_args()
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for RIFE")
+        if args.batch_size < 1:
+            raise ValueError("--batch-size must be positive")
         torch.cuda.set_device(0)
         device = torch.device("cuda:0")
         sys.path.insert(0, str(Path(args.model).resolve().parent))
@@ -1530,28 +1536,71 @@ cells = [
             return F.pad(tensor, padding)
 
         def save_tensor(tensor, path):
+            if tensor.shape[0] != 1:
+                raise ValueError("save_tensor expects one image")
             array = (tensor[0, :, :height, :width].float().clamp(0, 1) * 255.0).round().byte()
             array = array.permute(1, 2, 0).cpu().numpy()
             Image.fromarray(array, mode="RGB").save(path, compress_level=4)
 
-        output_index = 0
-        shutil.copy2(input_paths[0], output / f"{output_index:07d}.png")
-        output_index += 1
-        report_every = max(1, (len(input_paths) - 1) // 20)
+        pair_count = len(input_paths) - 1
+        shutil.copy2(input_paths[0], output / "0000000.png")
+        report_every = max(1, pair_count // 20)
+        pair_start = 0
+        active_batch_size = min(args.batch_size, pair_count)
         with torch.inference_mode():
-            left = load_tensor(input_paths[0])
-            for pair_index, right_path in enumerate(input_paths[1:], start=1):
-                right = load_tensor(right_path)
-                for step in range(1, args.multi):
-                    middle = model.inference(left, right, timestep=step / args.multi, scale=args.scale)
-                    save_tensor(middle, output / f"{output_index:07d}.png")
-                    output_index += 1
-                shutil.copy2(right_path, output / f"{output_index:07d}.png")
-                output_index += 1
-                left = right
-                if pair_index % report_every == 0 or pair_index == len(input_paths) - 1:
-                    print(f"RIFE pairs: {pair_index}/{len(input_paths) - 1}; frames: {output_index}", flush=True)
-        print(f"RIFE complete: {output_index} PNG frames")
+            while pair_start < pair_count:
+                current_size = min(active_batch_size, pair_count - pair_start)
+                pair_indices = list(range(pair_start, pair_start + current_size))
+                left = None
+                right = None
+                try:
+                    left = torch.cat(
+                        [load_tensor(input_paths[index]) for index in pair_indices],
+                        dim=0,
+                    )
+                    right = torch.cat(
+                        [load_tensor(input_paths[index + 1]) for index in pair_indices],
+                        dim=0,
+                    )
+                    for step in range(1, args.multi):
+                        middle = model.inference(
+                            left,
+                            right,
+                            timestep=step / args.multi,
+                            scale=args.scale,
+                        )
+                        for offset, pair_index in enumerate(pair_indices):
+                            output_index = pair_index * args.multi + step
+                            save_tensor(
+                                middle[offset : offset + 1],
+                                output / f"{output_index:07d}.png",
+                            )
+                    for pair_index in pair_indices:
+                        output_index = (pair_index + 1) * args.multi
+                        shutil.copy2(
+                            input_paths[pair_index + 1],
+                            output / f"{output_index:07d}.png",
+                        )
+                except torch.cuda.OutOfMemoryError:
+                    if current_size == 1:
+                        raise
+                    active_batch_size = max(1, (current_size + 1) // 2)
+                    del left, right
+                    torch.cuda.empty_cache()
+                    print(
+                        f"RIFE OOM; retrying pair batch with batch_size={active_batch_size}",
+                        flush=True,
+                    )
+                    continue
+                pair_start += current_size
+                if pair_start % report_every == 0 or pair_start == pair_count:
+                    print(
+                        f"RIFE pairs: {pair_start}/{pair_count}; "
+                        f"active_batch_size={active_batch_size}",
+                        flush=True,
+                    )
+        output_count = pair_count * args.multi + 1
+        print(f"RIFE complete: {output_count} PNG frames")
         '''
             RIFE_RUNNER_PATH = Path(LOCAL_ASSET_ROOT) / PROJECT_NAME / "rife_pair_sequence_runner.py"
             RIFE_RUNNER_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1561,6 +1610,7 @@ cells = [
                 "model_directory": str(RIFE_MODEL_DIRECTORY),
                 "multiplier": RIFE_MULTIPLIER,
                 "scale": RIFE_SCALE,
+                "batch_size": RIFE_BATCH_SIZE,
                 "runner": str(RIFE_RUNNER_PATH),
             })
         """
@@ -1656,6 +1706,7 @@ cells = [
                 "--output", str(RIFE_DENSE_DIRECTORY),
                 "--multi", str(RIFE_MULTIPLIER),
                 "--scale", str(RIFE_SCALE),
+                "--batch-size", str(RIFE_BATCH_SIZE),
             ]
             if RIFE_USE_FP16:
                 command.append("--fp16")
@@ -1823,6 +1874,7 @@ cells = [
                 "rife_model_revision": RIFE_MODEL_REVISION,
                 "rife_model_filename": RIFE_MODEL_FILENAME,
                 "rife_multiplier": RIFE_MULTIPLIER,
+                "rife_batch_size": RIFE_BATCH_SIZE,
                 "rife_scale": RIFE_SCALE,
                 "rife_fp16": RIFE_USE_FP16,
                 "base_frames": len(EXPORT_FRAME_PATHS),

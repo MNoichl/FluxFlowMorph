@@ -31,6 +31,7 @@ class VelocityPredictor(Protocol):
 
 
 ConditioningInterpolator = Callable[[Any, Any, float], Any]
+ConditioningBatcher = Callable[[Sequence[Any]], Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +193,8 @@ def render_morph(
     bridge_conditioning: Any = None,
     frame_conditionings: Sequence[Any] | None = None,
     conditioning_interpolator: ConditioningInterpolator | None = None,
+    conditioning_batcher: ConditioningBatcher | None = None,
+    batch_size: int = 1,
     output_dtype: torch.dtype | None = None,
     use_inference_mode: bool = True,
 ) -> tuple[RenderedLatentFrame, ...]:
@@ -208,6 +211,10 @@ def render_morph(
     coefficients = linear_alphas(frame_count) if alphas is None else tuple(_alpha_value(alpha) for alpha in alphas)
     if not coefficients:
         raise ValueError("at least one alpha is required")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if batch_size > 1 and conditioning_batcher is None:
+        raise ValueError("batched rendering requires conditioning_batcher")
     if selected_mode is RenderConditioningMode.PROMPT_SCHEDULE:
         if frame_conditionings is None:
             raise ValueError("prompt_schedule rendering requires frame_conditionings")
@@ -219,40 +226,56 @@ def render_morph(
     context = torch.inference_mode() if use_inference_mode else nullcontext()
     frames: list[RenderedLatentFrame] = []
     with context:
-        for index, alpha in enumerate(coefficients):
-            endpoint = interpolate_endpoint(
-                source,
-                target,
-                alpha,
-                output_dtype=output_dtype,
-            )
+        for chunk_start in range(0, len(coefficients), batch_size):
+            chunk_alphas = coefficients[chunk_start : chunk_start + batch_size]
+            endpoints = [
+                interpolate_endpoint(
+                    source,
+                    target,
+                    alpha,
+                    output_dtype=output_dtype,
+                )
+                for alpha in chunk_alphas
+            ]
+            chunk_states = torch.cat([endpoint.state for endpoint in endpoints], dim=0)
             if selected_mode is RenderConditioningMode.PROMPT_SCHEDULE:
                 assert frame_conditionings is not None
-                conditioning = frame_conditionings[index]
-            else:
-                conditioning = select_render_conditioning(
-                    selected_mode,
-                    alpha,
-                    source_conditioning=source_conditioning,
-                    target_conditioning=target_conditioning,
-                    bridge_conditioning=bridge_conditioning,
-                    conditioning_interpolator=conditioning_interpolator,
+                chunk_conditionings = list(
+                    frame_conditionings[chunk_start : chunk_start + len(chunk_alphas)]
                 )
-            start_state = endpoint.state
-            final_latent = render_latent_trajectory(
-                start_state,
+            else:
+                chunk_conditionings = [
+                    select_render_conditioning(
+                        selected_mode,
+                        alpha,
+                        source_conditioning=source_conditioning,
+                        target_conditioning=target_conditioning,
+                        bridge_conditioning=bridge_conditioning,
+                        conditioning_interpolator=conditioning_interpolator,
+                    )
+                    for alpha in chunk_alphas
+                ]
+            conditioning = (
+                chunk_conditionings[0]
+                if len(chunk_conditionings) == 1
+                else conditioning_batcher(chunk_conditionings)  # type: ignore[misc]
+            )
+            final_latents = render_latent_trajectory(
+                chunk_states,
                 predictor=predictor,
                 conditioning=conditioning,
                 render_chain=chain,
-                frame_index=index,
+                frame_index=chunk_start,
             )
-            frames.append(
-                RenderedLatentFrame(
-                    index=index,
-                    alpha=alpha,
-                    start_state=start_state.detach().clone(),
-                    final_latent=final_latent.detach().clone(),
-                    conditioning_mode=selected_mode,
+            for offset, alpha in enumerate(chunk_alphas):
+                frame_slice = slice(offset, offset + 1)
+                frames.append(
+                    RenderedLatentFrame(
+                        index=chunk_start + offset,
+                        alpha=alpha,
+                        start_state=chunk_states[frame_slice].detach().clone(),
+                        final_latent=final_latents[frame_slice].detach().clone(),
+                        conditioning_mode=selected_mode,
+                    )
                 )
-            )
     return tuple(frames)

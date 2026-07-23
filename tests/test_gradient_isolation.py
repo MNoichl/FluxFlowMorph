@@ -7,6 +7,7 @@ from torch import nn
 from flowmorph_klein.endpoint_optimizer import (
     EndpointOptimizerConfig,
     optimize_endpoint,
+    optimize_endpoint_batch,
 )
 
 
@@ -121,4 +122,51 @@ def test_optimizer_rejects_grad_enabled_cached_conditioning() -> None:
             predictor=predictor,
             conditioning={"bias": torch.zeros(1, 2, requires_grad=True)},
             config=EndpointOptimizerConfig(optimization_steps=1),
+        )
+
+
+def test_batched_endpoint_optimizer_matches_independent_fits() -> None:
+    settings = EndpointOptimizerConfig(
+        optimization_steps=3,
+        checkpoint_every=3,
+    )
+    targets = [
+        torch.tensor([[1.0, -0.5, 0.25]], dtype=torch.float32),
+        torch.tensor([[-0.25, 0.75, 1.5]], dtype=torch.float32),
+    ]
+    biases = [
+        torch.full_like(targets[0], 0.1),
+        torch.full_like(targets[1], -0.2),
+    ]
+    independent = [
+        optimize_endpoint(
+            target,
+            sigma_i=0.8,
+            sigma_last=0.0,
+            timestep_i=torch.tensor([800.0]),
+            predictor=FrozenCastPredictor(),
+            conditioning={"bias": bias},
+            config=settings,
+        )
+        for target, bias in zip(targets, biases, strict=True)
+    ]
+    predictor = FrozenCastPredictor()
+    batched = optimize_endpoint_batch(
+        targets,
+        sigma_i=0.8,
+        sigma_last=0.0,
+        timestep_i=torch.tensor([800.0]),
+        predictor=predictor,
+        conditioning={"bias": torch.cat(biases, dim=0)},
+        config=settings,
+    )
+
+    assert predictor.saw_differentiable_input == [True, True, True]
+    for expected, actual in zip(independent, batched, strict=True):
+        assert torch.allclose(actual.endpoint.delta, expected.endpoint.delta)
+        assert torch.allclose(actual.endpoint.u, expected.endpoint.u)
+        assert [
+            diagnostics.total_loss for diagnostics in actual.diagnostics
+        ] == pytest.approx(
+            [diagnostics.total_loss for diagnostics in expected.diagnostics]
         )

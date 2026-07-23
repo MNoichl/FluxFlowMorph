@@ -184,3 +184,43 @@ def test_renderer_uses_one_scheduled_conditioning_per_frame() -> None:
             conditioning_mode="prompt_schedule",
             frame_conditionings=("only one",),
         )
+
+
+def test_renderer_batches_scheduled_frames_without_changing_order() -> None:
+    class RecordingPredictor(ConstantVelocityPredictor):
+        def __init__(self) -> None:
+            super().__init__(torch.zeros(1))
+            self.batch_sizes = []
+
+        def predict_velocity(self, state, timestep, conditioning):
+            self.batch_sizes.append(state.shape[0])
+            return torch.zeros_like(state)
+
+    endpoint = FlowMorphEndpoint(
+        z=torch.zeros((1, 1)),
+        delta=torch.zeros((1, 1)),
+        u=torch.zeros((1, 1)),
+        sigma_i=0.8,
+        sigma_last=0.0,
+    )
+    schedule = build_flowmorph_schedule(timesteps=[800.0], sigmas=[0.8, 0.0])
+    predictor = RecordingPredictor()
+
+    frames = render_morph(
+        endpoint,
+        endpoint,
+        schedule=schedule,
+        predictor=predictor,
+        source_conditioning=torch.zeros((1, 1)),
+        target_conditioning=torch.zeros((1, 1)),
+        alphas=(0.0, 0.25, 0.5, 0.75, 1.0),
+        render_indices=(0,),
+        conditioning_mode="prompt_schedule",
+        frame_conditionings=tuple(torch.zeros((1, 1)) for _ in range(5)),
+        conditioning_batcher=lambda items: torch.cat(items, dim=0),
+        batch_size=2,
+    )
+
+    assert predictor.batch_sizes == [2, 2, 1]
+    assert [frame.alpha for frame in frames] == [0.0, 0.25, 0.5, 0.75, 1.0]
+    assert all(frame.final_latent.shape[0] == 1 for frame in frames)
