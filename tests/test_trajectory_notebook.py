@@ -65,6 +65,8 @@ def test_trajectory_notebook_uses_true_spatial_img2img() -> None:
     assert "latents=img2img.latents" in code
     assert "do not recenter or symmetrize" in code
     assert "TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True" in code
+    assert 'sys.modules.get("flowmorph_klein.trajectory")' in code
+    assert "importlib.reload(trajectory_module)" in code
 
 
 def test_trajectory_notebook_keeps_batched_flowmorph_and_rife_pipeline() -> None:

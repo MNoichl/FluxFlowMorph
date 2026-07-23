@@ -140,6 +140,22 @@ prompts = replace_once(
 )
 notebook["cells"][4]["source"] = prompts.splitlines(keepends=True)
 
+repository_setup = source(notebook["cells"][6])
+repository_setup = replace_once(
+    repository_setup,
+    "importlib.invalidate_caches()\n"
+    "import flowmorph_klein\n"
+    "from diffusers import Flux2KleinPipeline\n",
+    "importlib.invalidate_caches()\n"
+    "import flowmorph_klein\n"
+    'trajectory_module = sys.modules.get("flowmorph_klein.trajectory")\n'
+    "if trajectory_module is not None:\n"
+    "    trajectory_module = importlib.reload(trajectory_module)\n"
+    "from flowmorph_klein.trajectory import prepare_flux2_klein_img2img_inputs\n"
+    "from diffusers import Flux2KleinPipeline\n",
+)
+notebook["cells"][6]["source"] = repository_setup.splitlines(keepends=True)
+
 notebook["cells"][9]["source"] = lines(
     """
     ## 5. Validate settings, stage the trajectory ZIP, and preview the recursive cost
