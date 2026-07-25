@@ -12,10 +12,13 @@ from PIL import Image
 from flowmorph_klein.trajectory import (
     TrajectoryArchiveError,
     composite_generated_activity,
+    composite_generated_on_background,
     list_image_members,
+    make_background_edit_mask,
     make_strong_trajectory_reference,
     make_trajectory_activity_guide,
     prepare_flux2_klein_img2img_inputs,
+    prepare_flux2_klein_masked_inpaint_inputs,
     regular_sample_indices,
     stage_regular_keyframes,
 )
@@ -189,6 +192,42 @@ def test_activity_composite_keeps_content_where_mask_is_white() -> None:
     assert np.array_equal(array[:, 4:], np.full((4, 4, 3), (200, 30, 20)))
 
 
+def test_explicit_background_mask_makes_only_non_background_editable() -> None:
+    source = np.full((32, 32, 3), (238, 233, 218), dtype=np.uint8)
+    source[8:24, 16:28] = (220, 30, 20)
+
+    result = make_background_edit_mask(
+        Image.fromarray(source, mode="RGB"),
+        background_rgb=(238, 233, 218),
+        tolerance=0.05,
+        softness=0.05,
+        expansion_radius=0,
+        feather_radius=0,
+    )
+
+    mask = np.asarray(result.mask)
+    assert mask[2, 2] == 0
+    assert mask[16, 20] == 255
+    assert result.background_rgb == (238, 233, 218)
+    assert result.editable_fraction == pytest.approx(0.1875)
+
+
+def test_background_composite_uses_white_mask_for_generated_content() -> None:
+    generated = Image.new("RGB", (8, 4), (200, 30, 20))
+    mask_array = np.zeros((4, 8), dtype=np.uint8)
+    mask_array[:, 4:] = 255
+
+    result = composite_generated_on_background(
+        generated,
+        Image.fromarray(mask_array, mode="L"),
+        background_rgb=(238, 233, 218),
+    )
+
+    array = np.asarray(result)
+    assert np.array_equal(array[:, :4], np.full((4, 4, 3), (238, 233, 218)))
+    assert np.array_equal(array[:, 4:], np.full((4, 4, 3), (200, 30, 20)))
+
+
 class _FakeImageProcessor:
     def preprocess(self, image, *, height, width, resize_mode):
         assert image.mode == "RGB"
@@ -223,6 +262,11 @@ class _FakePipeline:
         assert generator is not None
         return torch.ones((1, 4, 2, 3), dtype=torch.float32)
 
+    @staticmethod
+    def _pack_latents(latents):
+        batch_size, channels, height, width = latents.shape
+        return latents.reshape(batch_size, channels, height * width).permute(0, 2, 1)
+
 
 def test_true_img2img_inputs_use_encoded_image_and_truncated_sigmas() -> None:
     pipeline = _FakePipeline()
@@ -242,6 +286,34 @@ def test_true_img2img_inputs_use_encoded_image_and_truncated_sigmas() -> None:
     assert result.effective_start_sigma == pytest.approx(0.4)
     assert result.latents.shape == (1, 4, 2, 3)
     assert not torch.equal(result.latents, torch.ones_like(result.latents))
+
+
+def test_masked_inpaint_callback_locks_only_black_mask_regions() -> None:
+    pipeline = _FakePipeline()
+    mask_array = np.array([[0, 0, 255], [0, 0, 255]], dtype=np.uint8)
+    result = prepare_flux2_klein_masked_inpaint_inputs(
+        pipeline,
+        Image.fromarray(mask_array, mode="L"),
+        background_rgb=(238, 233, 218),
+        width=32,
+        height=32,
+        num_inference_steps=20,
+        strength=1.0,
+        generator=torch.Generator(device="cpu").manual_seed(123),
+    )
+
+    generated = torch.full((1, 6, 4), 9.0)
+    callback_result = result.callback_on_step_end(
+        pipeline,
+        len(pipeline.scheduler.sigmas) - 1,
+        torch.tensor(0.0),
+        {"latents": generated},
+    )["latents"]
+
+    assert torch.equal(callback_result[:, :2], torch.ones_like(callback_result[:, :2]))
+    assert torch.equal(callback_result[:, 2:3], torch.full_like(callback_result[:, 2:3], 9.0))
+    assert torch.equal(callback_result[:, 3:5], torch.ones_like(callback_result[:, 3:5]))
+    assert torch.equal(callback_result[:, 5:], torch.full_like(callback_result[:, 5:], 9.0))
 
 
 @pytest.mark.parametrize("strength", [0.0, 1.01])

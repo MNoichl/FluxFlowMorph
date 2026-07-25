@@ -10,7 +10,7 @@ import stat
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -45,6 +45,27 @@ class TrajectoryActivityGuide:
     mask: Image.Image
     estimated_background_rgb: tuple[int, int, int]
     coverage_fraction: float
+
+
+@dataclass(frozen=True)
+class BackgroundEditMask:
+    """A white-edit/black-protect mask derived from an explicit background color."""
+
+    mask: Image.Image
+    background_rgb: tuple[int, int, int]
+    editable_fraction: float
+
+
+@dataclass(frozen=True)
+class Flux2KleinMaskedInpaintInputs:
+    """Latents and callback for background-locked FLUX.2 Klein inpainting."""
+
+    latents: torch.Tensor
+    sigmas: tuple[float, ...]
+    callback_on_step_end: Callable[[Any, int, torch.Tensor, dict[str, torch.Tensor]], dict[str, torch.Tensor]]
+    requested_strength: float
+    effective_start_sigma: float
+    denoising_steps: int
 
 
 def natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
@@ -287,6 +308,51 @@ def make_trajectory_activity_guide(
     )
 
 
+def make_background_edit_mask(
+    image: Image.Image,
+    *,
+    background_rgb: tuple[int, int, int],
+    tolerance: float = 0.08,
+    softness: float = 0.05,
+    expansion_radius: int = 0,
+    feather_radius: float = 3.0,
+) -> BackgroundEditMask:
+    """Make a mask where non-background pixels are editable.
+
+    Pixels sufficiently close to ``background_rgb`` become black (protected);
+    everything else becomes white (editable). ``softness`` and
+    ``feather_radius`` create a gradual boundary without changing the polarity.
+    """
+
+    if len(background_rgb) != 3 or any(not 0 <= channel <= 255 for channel in background_rgb):
+        raise ValueError("background_rgb must contain three values in [0, 255]")
+    if not 0.0 <= tolerance < 1.0:
+        raise ValueError("background tolerance must lie in [0, 1)")
+    if not 0.0 < softness <= 1.0:
+        raise ValueError("background softness must lie in (0, 1]")
+    if not isinstance(expansion_radius, int) or not 0 <= expansion_radius <= 128:
+        raise ValueError("mask expansion_radius must be an integer in [0, 128]")
+    if feather_radius < 0.0:
+        raise ValueError("mask feather_radius cannot be negative")
+
+    source = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    background = np.asarray(background_rgb, dtype=np.float32) / 255.0
+    distance = np.sqrt(np.mean(np.square(source - background), axis=2))
+    editable = np.clip((distance - tolerance) / softness, 0.0, 1.0)
+    editable = editable * editable * (3.0 - 2.0 * editable)
+    mask = Image.fromarray(np.round(editable * 255.0).astype(np.uint8), mode="L")
+    if expansion_radius:
+        mask = mask.filter(ImageFilter.MaxFilter(2 * expansion_radius + 1))
+    if feather_radius:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_radius))
+    mask_array = np.asarray(mask, dtype=np.float32) / 255.0
+    return BackgroundEditMask(
+        mask=mask,
+        background_rgb=tuple(int(channel) for channel in background_rgb),
+        editable_fraction=float(np.mean(mask_array)),
+    )
+
+
 def composite_generated_activity(
     generated: Image.Image,
     mask: Image.Image,
@@ -310,6 +376,159 @@ def composite_generated_activity(
     )
     background = Image.new("RGB", output.size, background_rgb)
     return Image.composite(output, background, alpha_image)
+
+
+def composite_generated_on_background(
+    generated: Image.Image,
+    edit_mask: Image.Image,
+    *,
+    background_rgb: tuple[int, int, int],
+) -> Image.Image:
+    """Place generated pixels only in white/editable mask regions."""
+
+    if len(background_rgb) != 3 or any(not 0 <= channel <= 255 for channel in background_rgb):
+        raise ValueError("background_rgb must contain three values in [0, 255]")
+    output = generated.convert("RGB")
+    resized_mask = edit_mask.convert("L").resize(output.size, Image.Resampling.LANCZOS)
+    background = Image.new("RGB", output.size, background_rgb)
+    return Image.composite(output, background, resized_mask)
+
+
+def prepare_flux2_klein_masked_inpaint_inputs(
+    pipeline: Any,
+    edit_mask: Image.Image,
+    *,
+    background_rgb: tuple[int, int, int],
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    strength: float,
+    generator: torch.Generator,
+) -> Flux2KleinMaskedInpaintInputs:
+    """Prepare full repainting inside a mask while locking the background.
+
+    The source image is used only to derive ``edit_mask``. Generation starts
+    from noise over a flat background canvas. After every denoising step, black
+    mask regions are restored to the correctly noised flat-background latent;
+    white regions remain free for prompt-driven generation.
+    """
+
+    if len(background_rgb) != 3 or any(not 0 <= channel <= 255 for channel in background_rgb):
+        raise ValueError("background_rgb must contain three values in [0, 255]")
+    if width < 1 or height < 1:
+        raise ValueError("masked inpaint output dimensions must be positive")
+    if num_inference_steps < 2:
+        raise ValueError("masked inpaint num_inference_steps must be at least 2")
+    if not 0.0 < strength <= 1.0:
+        raise ValueError("masked inpaint strength must lie in (0, 1]")
+    scheduler_config = getattr(getattr(pipeline, "scheduler", None), "config", {})
+    use_flow_sigmas = (
+        scheduler_config.get("use_flow_sigmas", False)
+        if isinstance(scheduler_config, dict)
+        else getattr(scheduler_config, "use_flow_sigmas", False)
+    )
+    if use_flow_sigmas:
+        raise ValueError(
+            "masked trajectory generation requires a scheduler that accepts custom sigmas"
+        )
+
+    device = pipeline._execution_device
+    multiple_of = int(pipeline.vae_scale_factor) * 2
+    normalized_width = max(multiple_of, (int(width) // multiple_of) * multiple_of)
+    normalized_height = max(multiple_of, (int(height) // multiple_of) * multiple_of)
+    background_image = Image.new(
+        "RGB",
+        (normalized_width, normalized_height),
+        tuple(int(channel) for channel in background_rgb),
+    )
+    processed = pipeline.image_processor.preprocess(
+        background_image,
+        height=normalized_height,
+        width=normalized_width,
+        resize_mode="crop",
+    ).to(device=device, dtype=pipeline.vae.dtype)
+    with torch.no_grad():
+        background_latents = pipeline._encode_vae_image(
+            image=processed,
+            generator=generator,
+        )
+
+    denoising_steps = max(
+        2,
+        min(num_inference_steps, math.ceil(num_inference_steps * strength)),
+    )
+    sigmas = klein_custom_sigmas(num_inference_steps)[-denoising_steps:]
+    image_seq_len = int(background_latents.shape[-2] * background_latents.shape[-1])
+    mu = compute_empirical_mu(image_seq_len, num_inference_steps)
+    pipeline.scheduler.set_timesteps(
+        sigmas=list(sigmas),
+        device=device,
+        mu=mu,
+    )
+    effective_start_sigma = float(pipeline.scheduler.sigmas[0].item())
+    fixed_noise = torch.randn(
+        background_latents.shape,
+        generator=generator,
+        device=background_latents.device,
+        dtype=background_latents.dtype,
+    )
+    latents = (
+        (1.0 - effective_start_sigma) * background_latents
+        + effective_start_sigma * fixed_noise
+    )
+
+    latent_height, latent_width = background_latents.shape[-2:]
+    resized_mask = edit_mask.convert("L").resize(
+        (latent_width, latent_height),
+        Image.Resampling.LANCZOS,
+    )
+    mask_array = np.asarray(resized_mask, dtype=np.float32) / 255.0
+    edit_mask_latents = torch.from_numpy(mask_array).to(
+        device=background_latents.device,
+        dtype=background_latents.dtype,
+    )[None, None, :, :]
+    edit_mask_packed = edit_mask_latents.flatten(2).transpose(1, 2)
+
+    def lock_background_callback(
+        current_pipeline: Any,
+        step_index: int,
+        _timestep: torch.Tensor,
+        callback_kwargs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        current_latents = callback_kwargs["latents"]
+        scheduler_sigmas = current_pipeline.scheduler.sigmas
+        next_index = min(step_index + 1, len(scheduler_sigmas) - 1)
+        next_sigma = scheduler_sigmas[next_index].to(
+            device=background_latents.device,
+            dtype=background_latents.dtype,
+        )
+        protected_latents = (
+            (1.0 - next_sigma) * background_latents
+            + next_sigma * fixed_noise
+        )
+        packed_protected = current_pipeline._pack_latents(protected_latents).to(
+            device=current_latents.device,
+            dtype=current_latents.dtype,
+        )
+        packed_mask = edit_mask_packed.to(
+            device=current_latents.device,
+            dtype=current_latents.dtype,
+        )
+        return {
+            "latents": (
+                packed_mask * current_latents
+                + (1.0 - packed_mask) * packed_protected
+            )
+        }
+
+    return Flux2KleinMaskedInpaintInputs(
+        latents=latents,
+        sigmas=tuple(float(value) for value in sigmas),
+        callback_on_step_end=lock_background_callback,
+        requested_strength=float(strength),
+        effective_start_sigma=effective_start_sigma,
+        denoising_steps=denoising_steps,
+    )
 
 
 def prepare_flux2_klein_img2img_inputs(
@@ -396,16 +615,21 @@ def prepare_flux2_klein_img2img_inputs(
 
 
 __all__ = [
+    "BackgroundEditMask",
     "Flux2KleinImg2ImgInputs",
+    "Flux2KleinMaskedInpaintInputs",
     "IMAGE_SUFFIXES",
     "TrajectoryActivityGuide",
     "TrajectoryArchiveError",
     "composite_generated_activity",
+    "composite_generated_on_background",
     "list_image_members",
+    "make_background_edit_mask",
     "make_strong_trajectory_reference",
     "make_trajectory_activity_guide",
     "natural_sort_key",
     "prepare_flux2_klein_img2img_inputs",
+    "prepare_flux2_klein_masked_inpaint_inputs",
     "regular_sample_indices",
     "stage_regular_keyframes",
 ]
