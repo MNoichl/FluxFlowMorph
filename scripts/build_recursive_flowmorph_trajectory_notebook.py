@@ -59,6 +59,8 @@ notebook["cells"][0]["source"] = lines(
     """
     # Recursive science still-life loop — trajectory ZIP + true FlowMorph
 
+    [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MNoichl/FluxFlowMorph/blob/main/notebooks/StillLife_Recursive_FlowMorph_Trajectory_Init.ipynb)
+
     This notebook follows the same recursive, cyclic FlowMorph workflow as
     `StillLife_Recursive_FlowMorph_Vision`, but the anchor paintings follow an
     external image trajectory stored as a ZIP on Google Drive.

@@ -55,6 +55,8 @@ cells = [
         r"""
         # Recursive science still-life loop — image-aware prompt interpolation
 
+        [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MNoichl/FluxFlowMorph/blob/main/notebooks/StillLife_Recursive_Vision_Interpolation.ipynb)
+
         This local working notebook generates a closed sequence without an uploaded prompt JSON and without the old twenty-prompt FlowMorph schedules.
 
         1. Edit the anchor sciences and prompts directly in section 2.

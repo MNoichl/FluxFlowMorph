@@ -120,6 +120,8 @@ notebook["cells"][0]["source"] = lines(
     r"""
     # Recursive science still-life loop — vision prompts + true FlowMorph midpoints
 
+    [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MNoichl/FluxFlowMorph/blob/main/notebooks/StillLife_Recursive_FlowMorph_Vision.ipynb)
+
     This local working notebook keeps the useful structure of the recursive vision notebook while making FlowMorph the interpolation mechanism.
 
     1. Edit the anchor sciences and prompts directly in section 2.
