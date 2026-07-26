@@ -78,26 +78,26 @@ notebook["cells"][0]["source"] = lines(
 
     [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MNoichl/FluxFlowMorph/blob/main/notebooks/StillLife_Recursive_FlowMorph_Trajectory_Background_Mask.ipynb)
 
-    This is a separate masking experiment. It keeps the full recursive FlowMorph
-    and RIFE workflow, but the ZIP frames are used only to locate editable regions:
+    This separate experiment loads grayscale images from a ZIP as continuous masks:
 
-    - pixels close to `SOURCE_BACKGROUND_RGB` are black/protected in the mask;
-    - every other pixel is white/editable and regenerated from noise;
-    - the source image is never used as a latent init or FLUX image reference;
-    - the protected region is locked during denoising and composited to the exact
-      `OUTPUT_BACKGROUND_RGB` at the end.
+    - black is protected background;
+    - white is fully editable;
+    - every gray value retains proportional influence without binarization;
+    - anchor 1 begins independently;
+    - every later anchor uses a weak blurred, background-blended, grained version
+      of the previous generated anchor as latent initialization;
+    - protected regions remain locked and are composited to `OUTPUT_BACKGROUND_RGB`.
 
-    Run the trial first. Its mask preview makes polarity and tolerance errors visible
-    before any full anchor batch is generated.
+    Run the trial first to verify mask polarity and gradients before generating anchors.
     """
 )
 notebook["cells"][1]["source"] = lines(
     """
     ## 1. Editable run, background-mask, model, API, FlowMorph, image, and video settings
 
-    `SOURCE_BACKGROUND_RGB` is the color to recognize in the ZIP frames.
-    `OUTPUT_BACKGROUND_RGB` is the flat color written outside the editable mask.
-    White mask pixels are regenerated; black mask pixels are protected.
+    Point the mask ZIP settings at naturally ordered black/white or grayscale files.
+    Values are preserved by default. `OUTPUT_BACKGROUND_RGB` is the flat color written
+    outside the editable mask. Previous-anchor initialization affects only editable areas.
     """
 )
 
@@ -112,25 +112,30 @@ settings = source(settings_cell).replace(
 )
 mask_settings = dedent(
     """
-    # Background-mask trajectory experiment. The source supplies geometry only.
-    TRAJECTORY_ZIP_DIRECTORY = "/content/drive/MyDrive/FluxFlowMorphArt/trajectory_inputs"
-    TRAJECTORY_ZIP_FILENAME = "background.zip"
-    TRAJECTORY_MEMBER_PREFIX = ""  # Optional folder inside the ZIP, without leading slash.
-    TRAJECTORY_FRAME_OFFSET = 0
-    TRAJECTORY_REVERSE_ORDER = False
+    # Grayscale-mask ZIP. Files are regularly sampled to match the active prompts.
+    MASK_ZIP_DIRECTORY = "/content/drive/MyDrive/FluxFlowMorphArt/trajectory_inputs"
+    MASK_ZIP_FILENAME = "masks.zip"
+    MASK_MEMBER_PREFIX = ""  # Optional folder inside the ZIP, without leading slash.
+    MASK_FRAME_OFFSET = 0
+    MASK_REVERSE_ORDER = False
 
-    # Background detection: matching pixels are protected (black in the mask).
-    SOURCE_BACKGROUND_RGB = (238, 233, 218)
-    BACKGROUND_COLOR_TOLERANCE = 0.08  # Normalized RGB distance treated as background.
-    BACKGROUND_MASK_SOFTNESS = 0.05  # Transition width after the tolerance boundary.
-    BACKGROUND_MASK_EXPANSION = 2  # Grow white/editable regions by this many pixels.
-    BACKGROUND_MASK_FEATHER = 3.0
-    MASK_MIN_EDITABLE_FRACTION = 0.01
-    MASK_MAX_EDITABLE_FRACTION = 0.95
+    # Direct mask interpretation. Defaults preserve every input grayscale value.
+    MASK_INVERT = False
+    MASK_GAMMA = 1.0
+    MASK_EXPANSION = 0
+    MASK_FEATHER = 0.0
+    MASK_MIN_EDITABLE_FRACTION = 0.001
+    MASK_MAX_EDITABLE_FRACTION = 1.0
 
-    # Generation: source pixels never enter FLUX; editable regions begin from noise.
+    # Generation and weak sequential continuity.
     OUTPUT_BACKGROUND_RGB = (238, 233, 218)
-    MASK_DENOISE_STRENGTH = 1.0  # 1.0 gives editable regions maximum freedom.
+    MASK_DENOISE_STRENGTH = 0.72  # Higher repaints more; lower preserves more init.
+    PREVIOUS_INIT_ENABLED = True
+    PREVIOUS_INIT_BLEND = 0.12
+    PREVIOUS_INIT_BLUR = 16.0
+    PREVIOUS_INIT_GRAIN_STRENGTH = 0.035
+    PREVIOUS_INIT_BACKGROUND_RGB = OUTPUT_BACKGROUND_RGB
+    SAVE_PREVIOUS_INITS = True
     MASK_PROMPT_INSTRUCTION = (
         "Arrange the described painted forms densely within the available shaped field, "
         "with natural cropped edges and a calm unpainted surround."
@@ -151,26 +156,30 @@ validation_cell = find_cell(notebook, "def trajectory_generation_prompt")
 validation = source(validation_cell)
 mask_validation = dedent(
     """
-    if len(SOURCE_BACKGROUND_RGB) != 3 or any(
-        not 0 <= channel <= 255 for channel in SOURCE_BACKGROUND_RGB
-    ):
-        raise ValueError("SOURCE_BACKGROUND_RGB must contain three values in [0, 255]")
     if len(OUTPUT_BACKGROUND_RGB) != 3 or any(
         not 0 <= channel <= 255 for channel in OUTPUT_BACKGROUND_RGB
     ):
         raise ValueError("OUTPUT_BACKGROUND_RGB must contain three values in [0, 255]")
-    if not 0 <= BACKGROUND_COLOR_TOLERANCE < 1:
-        raise ValueError("BACKGROUND_COLOR_TOLERANCE must lie in [0, 1)")
-    if not 0 < BACKGROUND_MASK_SOFTNESS <= 1:
-        raise ValueError("BACKGROUND_MASK_SOFTNESS must lie in (0, 1]")
-    if not isinstance(BACKGROUND_MASK_EXPANSION, int) or not 0 <= BACKGROUND_MASK_EXPANSION <= 128:
-        raise ValueError("BACKGROUND_MASK_EXPANSION must be an integer in [0, 128]")
-    if BACKGROUND_MASK_FEATHER < 0:
-        raise ValueError("BACKGROUND_MASK_FEATHER cannot be negative")
+    if MASK_GAMMA <= 0:
+        raise ValueError("MASK_GAMMA must be positive")
+    if not isinstance(MASK_EXPANSION, int) or not 0 <= MASK_EXPANSION <= 128:
+        raise ValueError("MASK_EXPANSION must be an integer in [0, 128]")
+    if MASK_FEATHER < 0:
+        raise ValueError("MASK_FEATHER cannot be negative")
     if not 0 <= MASK_MIN_EDITABLE_FRACTION < MASK_MAX_EDITABLE_FRACTION <= 1:
         raise ValueError("Editable-fraction limits must satisfy 0 <= min < max <= 1")
     if not 0 < MASK_DENOISE_STRENGTH <= 1:
         raise ValueError("MASK_DENOISE_STRENGTH must lie in (0, 1]")
+    if not 0 < PREVIOUS_INIT_BLEND <= 1:
+        raise ValueError("PREVIOUS_INIT_BLEND must lie in (0, 1]")
+    if PREVIOUS_INIT_BLUR < 0:
+        raise ValueError("PREVIOUS_INIT_BLUR cannot be negative")
+    if not 0 <= PREVIOUS_INIT_GRAIN_STRENGTH <= 0.25:
+        raise ValueError("PREVIOUS_INIT_GRAIN_STRENGTH must lie in [0, 0.25]")
+    if len(PREVIOUS_INIT_BACKGROUND_RGB) != 3 or any(
+        not 0 <= channel <= 255 for channel in PREVIOUS_INIT_BACKGROUND_RGB
+    ):
+        raise ValueError("PREVIOUS_INIT_BACKGROUND_RGB must contain three values in [0, 255]")
 
     def trajectory_generation_prompt(prompt):
         base = prompt
@@ -185,7 +194,30 @@ validation = replace_between(
     "if OPENAI_IMAGE_DETAIL not in",
     mask_validation,
 )
+validation = validation.replace(
+    "TRAJECTORY_ZIP_FILENAME",
+    "MASK_ZIP_FILENAME",
+).replace(
+    "TRAJECTORY_FRAME_OFFSET",
+    "MASK_FRAME_OFFSET",
+)
 validation_cell["source"] = validation.splitlines(keepends=True)
+
+staging_cell = find_cell(notebook, "TRAJECTORY_DRIVE_ARCHIVE")
+staging = source(staging_cell)
+for old_name, new_name in {
+    "TRAJECTORY_ZIP_DIRECTORY": "MASK_ZIP_DIRECTORY",
+    "TRAJECTORY_ZIP_FILENAME": "MASK_ZIP_FILENAME",
+    "TRAJECTORY_MEMBER_PREFIX": "MASK_MEMBER_PREFIX",
+    "TRAJECTORY_FRAME_OFFSET": "MASK_FRAME_OFFSET",
+    "TRAJECTORY_REVERSE_ORDER": "MASK_REVERSE_ORDER",
+}.items():
+    staging = staging.replace(old_name, new_name)
+staging = staging.replace("trajectory ZIP", "grayscale-mask ZIP").replace(
+    "Trajectory ZIP",
+    "Grayscale-mask ZIP",
+)
+staging_cell["source"] = staging.splitlines(keepends=True)
 
 model_cell = find_cell(notebook, "if RUN_TRIAL_KEYFRAME:")
 model = source(model_cell)
@@ -202,21 +234,21 @@ model_cell["source"] = code_blocks(
     from huggingface_hub import hf_hub_download
     from IPython.display import Markdown, display
     from PIL import Image
+    from flowmorph_klein.art_loop import make_soft_reference
     from flowmorph_klein.lora import load_flux2_lora
     from flowmorph_klein.trajectory import (
         composite_generated_on_background,
-        make_background_edit_mask,
+        prepare_grayscale_edit_mask,
         prepare_flux2_klein_masked_inpaint_inputs,
     )
 
-    def build_background_mask(source):
-        result = make_background_edit_mask(
-            source,
-            background_rgb=SOURCE_BACKGROUND_RGB,
-            tolerance=BACKGROUND_COLOR_TOLERANCE,
-            softness=BACKGROUND_MASK_SOFTNESS,
-            expansion_radius=BACKGROUND_MASK_EXPANSION,
-            feather_radius=BACKGROUND_MASK_FEATHER,
+    def build_background_mask(mask_source):
+        result = prepare_grayscale_edit_mask(
+            mask_source,
+            invert=MASK_INVERT,
+            gamma=MASK_GAMMA,
+            expansion_radius=MASK_EXPANSION,
+            feather_radius=MASK_FEATHER,
         )
         if not (
             MASK_MIN_EDITABLE_FRACTION
@@ -226,18 +258,19 @@ model_cell["source"] = code_blocks(
             raise RuntimeError(
                 f"Editable mask coverage {result.editable_fraction:.1%} is outside "
                 f"{MASK_MIN_EDITABLE_FRACTION:.1%}–{MASK_MAX_EDITABLE_FRACTION:.1%}. "
-                "Adjust SOURCE_BACKGROUND_RGB or BACKGROUND_COLOR_TOLERANCE. "
-                "White must mark content; black must mark background."
+                "Adjust the mask file, MASK_INVERT, or the editable-fraction limits. "
+                "White is editable; black is protected."
             )
         return result
 
-    def generate_masked_anchor(source, prompt, seed):
-        mask_result = build_background_mask(source)
+    def generate_masked_anchor(mask_source, prompt, seed, init_image=None):
+        mask_result = build_background_mask(mask_source)
         generator = torch.Generator(device="cuda").manual_seed(seed)
         masked_inputs = prepare_flux2_klein_masked_inpaint_inputs(
             FLUX_PIPE,
             mask_result.mask,
             background_rgb=OUTPUT_BACKGROUND_RGB,
+            init_image=init_image,
             width=IMAGE_WIDTH,
             height=IMAGE_HEIGHT,
             num_inference_steps=IMAGE_INFERENCE_STEPS,
@@ -283,10 +316,10 @@ model_cell["source"] = code_blocks(
         trial_stage = ACTIVE_BASE_STAGES[trial_index]
         trial_trajectory = TRAJECTORY_RECORDS[trial_index]
         with Image.open(trial_trajectory["path"]) as opened:
-            trial_source = opened.convert("RGB")
+            trial_mask_source = opened.convert("L")
         trial_generation_prompt = trajectory_generation_prompt(trial_stage["prompt"])
         trial_image, trial_raw, trial_mask, trial_inputs = generate_masked_anchor(
-            trial_source,
+            trial_mask_source,
             trial_generation_prompt,
             trial_seed,
         )
@@ -297,25 +330,25 @@ model_cell["source"] = code_blocks(
         trial_directory.mkdir(parents=True, exist_ok=False)
         trial_path = trial_directory / "trial_background_locked.png"
         trial_raw_path = trial_directory / "trial_raw.png"
-        trial_source_path = trial_directory / "trajectory_source.png"
+        trial_source_path = trial_directory / "grayscale_mask_source.png"
         trial_mask_path = trial_directory / "edit_mask_white_is_editable.png"
         trial_image.save(trial_path)
         trial_raw.save(trial_raw_path)
-        trial_source.save(trial_source_path)
+        trial_mask_source.save(trial_source_path)
         trial_mask.mask.save(trial_mask_path)
         (trial_directory / "settings.json").write_text(json.dumps({
             "stage": trial_stage,
             "trajectory": trial_trajectory,
             "seed": trial_seed,
-            "source_background_rgb": list(SOURCE_BACKGROUND_RGB),
             "output_background_rgb": list(OUTPUT_BACKGROUND_RGB),
-            "background_color_tolerance": BACKGROUND_COLOR_TOLERANCE,
-            "background_mask_softness": BACKGROUND_MASK_SOFTNESS,
-            "background_mask_expansion": BACKGROUND_MASK_EXPANSION,
-            "background_mask_feather": BACKGROUND_MASK_FEATHER,
+            "mask_invert": MASK_INVERT,
+            "mask_gamma": MASK_GAMMA,
+            "mask_expansion": MASK_EXPANSION,
+            "mask_feather": MASK_FEATHER,
             "editable_fraction": trial_mask.editable_fraction,
             "mask_polarity": "white_editable_black_protected",
-            "source_used_only_to_derive_mask": True,
+            "mask_values_preserved_without_binarization": True,
+            "previous_init_used": False,
             "source_used_as_latent_init": False,
             "source_used_as_image_reference": False,
             "effective_start_sigma": trial_inputs.effective_start_sigma,
@@ -323,8 +356,8 @@ model_cell["source"] = code_blocks(
             "generation_prompt": trial_generation_prompt,
         }, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8")
         previews = [
-            ("Source used only for mask geometry", trial_source.copy()),
-            ("Edit mask — WHITE changes, BLACK stays background", trial_mask.mask.convert("RGB")),
+            ("Loaded grayscale mask source", trial_mask_source.convert("RGB")),
+            ("Effective mask — WHITE edits, BLACK protects, GRAY is partial", trial_mask.mask.convert("RGB")),
             ("Raw masked-denoising result", trial_raw.copy()),
             ("Final exact-background result", trial_image.copy()),
         ]
@@ -342,7 +375,7 @@ model_cell["source"] = code_blocks(
             "seed": trial_seed,
             "prompt_index": trial_index,
         })
-        del trial_image, trial_raw, trial_source, trial_mask, trial_inputs
+        del trial_image, trial_raw, trial_mask_source, trial_mask, trial_inputs
     else:
         print("Trial skipped.")
     """
@@ -353,9 +386,10 @@ anchor_markdown["source"] = lines(
     """
     ## 7. Generate background-masked cyclic anchor paintings
 
-    Each selected ZIP frame supplies only a white-edit/black-protect mask. Editable
-    regions start from noise and receive the science prompt. Background regions are
-    restored after every denoising step and written in the exact selected color.
+    Each selected ZIP frame is loaded directly as a continuous grayscale mask. Anchor 1
+    starts independently. Every later anchor uses a weak blurred, background-blended,
+    grained version of the preceding generated anchor as latent initialization inside
+    editable regions. Protected regions remain the exact selected background color.
     """
 )
 
@@ -364,20 +398,26 @@ anchor_cell["source"] = lines(
     """
     BASE_DIRECTORY = RUN_DIRECTORY / "base_frames"
     MASK_DIRECTORY = BASE_DIRECTORY / "background_edit_masks"
+    INIT_DIRECTORY = BASE_DIRECTORY / "previous_anchor_inits"
     RAW_DIRECTORY = BASE_DIRECTORY / "raw_masked_generations"
     BASE_MANIFEST_PATH = RUN_DIRECTORY / "metadata" / "base_manifest.json"
     BASE_RECORDS = []
     MASK_CONTRACT = {
-        "source_background_rgb": list(SOURCE_BACKGROUND_RGB),
+        "source": "direct_grayscale_mask",
         "output_background_rgb": list(OUTPUT_BACKGROUND_RGB),
-        "tolerance": BACKGROUND_COLOR_TOLERANCE,
-        "softness": BACKGROUND_MASK_SOFTNESS,
-        "expansion": BACKGROUND_MASK_EXPANSION,
-        "feather": BACKGROUND_MASK_FEATHER,
+        "invert": MASK_INVERT,
+        "gamma": MASK_GAMMA,
+        "expansion": MASK_EXPANSION,
+        "feather": MASK_FEATHER,
         "denoise_strength": MASK_DENOISE_STRENGTH,
         "polarity": "white_editable_black_protected",
-        "source_used_only_to_derive_mask": True,
-        "source_used_as_latent_init": False,
+        "continuous_values_preserved": True,
+        "previous_init_enabled": PREVIOUS_INIT_ENABLED,
+        "previous_init_blend": PREVIOUS_INIT_BLEND,
+        "previous_init_blur": PREVIOUS_INIT_BLUR,
+        "previous_init_grain_strength": PREVIOUS_INIT_GRAIN_STRENGTH,
+        "previous_init_background_rgb": list(PREVIOUS_INIT_BACKGROUND_RGB),
+        "source_mask_used_as_latent_init": False,
         "source_used_as_image_reference": False,
     }
     expected_anchor_contract = [
@@ -426,17 +466,39 @@ anchor_cell["source"] = lines(
     else:
         MASK_DIRECTORY.mkdir(parents=True, exist_ok=True)
         RAW_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        if SAVE_PREVIOUS_INITS:
+            INIT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        previous = None
         for index, (stage, trajectory) in enumerate(
             zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)
         ):
             seed = BASE_SEED + index
             with Image.open(trajectory["path"]) as opened:
-                source_image = opened.convert("RGB")
+                mask_source = opened.convert("L")
+            previous_init = None
+            previous_init_path = None
+            if previous is not None and PREVIOUS_INIT_ENABLED:
+                previous_init = make_soft_reference(
+                    previous,
+                    reference_blend=PREVIOUS_INIT_BLEND,
+                    blur_radius=PREVIOUS_INIT_BLUR,
+                    grain_strength=PREVIOUS_INIT_GRAIN_STRENGTH,
+                    grain_seed=seed,
+                    background_rgb=PREVIOUS_INIT_BACKGROUND_RGB,
+                )
+                if SAVE_PREVIOUS_INITS:
+                    previous_init_path = INIT_DIRECTORY / f"init_{index:03d}.png"
+                    previous_init.save(
+                        previous_init_path,
+                        format="PNG",
+                        compress_level=4,
+                    )
             generation_prompt = trajectory_generation_prompt(stage["prompt"])
             image, raw_image, mask_result, masked_inputs = generate_masked_anchor(
-                source_image,
+                mask_source,
                 generation_prompt,
                 seed,
+                init_image=previous_init,
             )
             mask_path = MASK_DIRECTORY / f"mask_{index:03d}.png"
             raw_path = RAW_DIRECTORY / f"{index:03d}_{stage['id']}_raw.png"
@@ -459,6 +521,10 @@ anchor_cell["source"] = lines(
                 "trajectory_member_sha256": trajectory["member_sha256"],
                 "trajectory_source_path": trajectory["path"],
                 "trajectory_edit_mask_path": str(mask_path),
+                "previous_init_path": (
+                    str(previous_init_path) if previous_init_path else None
+                ),
+                "previous_init_used": previous_init is not None,
                 "editable_fraction": mask_result.editable_fraction,
                 "mask_contract": MASK_CONTRACT,
                 "effective_start_sigma": masked_inputs.effective_start_sigma,
@@ -474,13 +540,22 @@ anchor_cell["source"] = lines(
             print(
                 f"Anchor {index + 1}/{len(ACTIVE_BASE_STAGES)} saved: "
                 f"{output_path.name} ← {trajectory['member']} "
-                f"({mask_result.editable_fraction:.1%} editable)"
+                f"({mask_result.editable_fraction:.1%} editable, "
+                f"previous init={'yes' if previous_init is not None else 'no'})"
             )
-            source_image.close()
+            if previous is not None:
+                previous.close()
+            previous = image.copy()
+            mask_source.close()
+            if previous_init is not None:
+                previous_init.close()
             raw_image.close()
             image.close()
             mask_result.mask.close()
             del masked_inputs
+        if previous is not None:
+            previous.close()
+            del previous
 
     if len(BASE_RECORDS) != len(ACTIVE_BASE_STAGES):
         raise RuntimeError("The anchor manifest is incomplete; regenerate or resume the correct run.")
@@ -503,25 +578,33 @@ contact_cell["source"] = lines(
         return images
 
     paired_contact_sheet_path = (
-        RUN_DIRECTORY / "previews" / "trajectory_source_mask_anchor_triplets.png"
+        RUN_DIRECTORY / "previews" / "mask_init_anchor_audit.png"
     )
     paired_images = []
     paired_labels = []
     for index, record in enumerate(BASE_RECORDS):
-        paired_images.extend(load_contact_thumbnails([
+        row_images = load_contact_thumbnails([
             Path(record["trajectory_source_path"]),
             Path(record["trajectory_edit_mask_path"]),
-            Path(record["path"]),
-        ]))
+        ])
+        if record.get("previous_init_path"):
+            row_images.extend(
+                load_contact_thumbnails([Path(record["previous_init_path"])])
+            )
+        else:
+            row_images.append(Image.new("RGB", (192, 192), OUTPUT_BACKGROUND_RGB))
+        row_images.extend(load_contact_thumbnails([Path(record["path"])]))
+        paired_images.extend(row_images)
         paired_labels.extend([
-            f"{index:02d} source",
-            f"{index:02d} WHITE=edit",
+            f"{index:02d} grayscale source",
+            f"{index:02d} effective mask",
+            f"{index:02d} previous init",
             f"{index:02d} generated",
         ])
     make_contact_sheet(
         paired_images,
         paired_contact_sheet_path,
-        columns=3,
+        columns=4,
         labels=paired_labels,
     )
     for image in paired_images:
@@ -529,7 +612,9 @@ contact_cell["source"] = lines(
 
     preview = Image.open(paired_contact_sheet_path).convert("RGB")
     preview.thumbnail((CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000))
-    display(Markdown("### Source → white-edit mask → generated anchor"))
+    display(Markdown(
+        "### Grayscale source → effective mask → weak previous init → generated anchor"
+    ))
     display(preview)
     preview.close()
     print({
@@ -538,6 +623,9 @@ contact_cell["source"] = lines(
         ),
         "full_resolution_masks": str(
             Path(BASE_RECORDS[0]["trajectory_edit_mask_path"]).parent
+        ),
+        "full_resolution_previous_inits": (
+            str(INIT_DIRECTORY) if SAVE_PREVIOUS_INITS else None
         ),
         "full_resolution_anchors": str(BASE_DIRECTORY),
         "paired_audit": str(paired_contact_sheet_path),

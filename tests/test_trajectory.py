@@ -19,6 +19,7 @@ from flowmorph_klein.trajectory import (
     make_trajectory_activity_guide,
     prepare_flux2_klein_img2img_inputs,
     prepare_flux2_klein_masked_inpaint_inputs,
+    prepare_grayscale_edit_mask,
     regular_sample_indices,
     stage_regular_keyframes,
 )
@@ -212,6 +213,22 @@ def test_explicit_background_mask_makes_only_non_background_editable() -> None:
     assert result.editable_fraction == pytest.approx(0.1875)
 
 
+def test_grayscale_edit_mask_preserves_continuous_values() -> None:
+    values = np.array([[0, 64, 128, 255]], dtype=np.uint8)
+
+    result = prepare_grayscale_edit_mask(
+        Image.fromarray(values, mode="L"),
+        invert=False,
+        gamma=1.0,
+        expansion_radius=0,
+        feather_radius=0,
+    )
+
+    assert np.array_equal(np.asarray(result.mask), values)
+    assert result.background_rgb is None
+    assert result.editable_fraction == pytest.approx(float(values.mean() / 255.0))
+
+
 def test_background_composite_uses_white_mask_for_generated_content() -> None:
     generated = Image.new("RGB", (8, 4), (200, 30, 20))
     mask_array = np.zeros((4, 8), dtype=np.uint8)
@@ -314,6 +331,58 @@ def test_masked_inpaint_callback_locks_only_black_mask_regions() -> None:
     assert torch.equal(callback_result[:, 2:3], torch.full_like(callback_result[:, 2:3], 9.0))
     assert torch.equal(callback_result[:, 3:5], torch.ones_like(callback_result[:, 3:5]))
     assert torch.equal(callback_result[:, 5:], torch.full_like(callback_result[:, 5:], 9.0))
+
+
+def test_masked_inpaint_uses_init_only_inside_editable_region() -> None:
+    class _InitPipeline(_FakePipeline):
+        def __init__(self) -> None:
+            self.encode_count = 0
+            self.scheduler = _FakeScheduler()
+
+        def _encode_vae_image(self, *, image, generator):
+            assert image.shape == (1, 3, 32, 32)
+            assert generator is not None
+            self.encode_count += 1
+            value = 1.0 if self.encode_count == 1 else 3.0
+            return torch.full((1, 4, 2, 3), value, dtype=torch.float32)
+
+    mask_array = np.array([[0, 0, 255], [0, 0, 255]], dtype=np.uint8)
+    baseline_pipeline = _InitPipeline()
+    baseline = prepare_flux2_klein_masked_inpaint_inputs(
+        baseline_pipeline,
+        Image.fromarray(mask_array, mode="L"),
+        background_rgb=(238, 233, 218),
+        width=32,
+        height=32,
+        num_inference_steps=20,
+        strength=0.5,
+        generator=torch.Generator(device="cpu").manual_seed(123),
+    )
+    pipeline = _InitPipeline()
+    result = prepare_flux2_klein_masked_inpaint_inputs(
+        pipeline,
+        Image.fromarray(mask_array, mode="L"),
+        background_rgb=(238, 233, 218),
+        init_image=Image.new("RGB", (32, 32), (20, 40, 80)),
+        width=32,
+        height=32,
+        num_inference_steps=20,
+        strength=0.5,
+        generator=torch.Generator(device="cpu").manual_seed(123),
+    )
+
+    assert result.used_init_image is True
+    assert pipeline.encode_count == 2
+    assert baseline.used_init_image is False
+    delta = result.latents - baseline.latents
+    assert torch.equal(delta[:, :, :, :2], torch.zeros_like(delta[:, :, :, :2]))
+    assert torch.allclose(
+        delta[:, :, :, 2:],
+        torch.full_like(
+            delta[:, :, :, 2:],
+            (1.0 - result.effective_start_sigma) * 2.0,
+        ),
+    )
 
 
 @pytest.mark.parametrize("strength", [0.0, 1.01])

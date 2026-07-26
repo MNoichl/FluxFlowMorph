@@ -49,10 +49,10 @@ class TrajectoryActivityGuide:
 
 @dataclass(frozen=True)
 class BackgroundEditMask:
-    """A white-edit/black-protect mask derived from an explicit background color."""
+    """A continuous white-edit/black-protect mask."""
 
     mask: Image.Image
-    background_rgb: tuple[int, int, int]
+    background_rgb: tuple[int, int, int] | None
     editable_fraction: float
 
 
@@ -66,6 +66,7 @@ class Flux2KleinMaskedInpaintInputs:
     requested_strength: float
     effective_start_sigma: float
     denoising_steps: int
+    used_init_image: bool
 
 
 def natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
@@ -353,6 +354,49 @@ def make_background_edit_mask(
     )
 
 
+def prepare_grayscale_edit_mask(
+    image: Image.Image,
+    *,
+    invert: bool = False,
+    gamma: float = 1.0,
+    expansion_radius: int = 0,
+    feather_radius: float = 0.0,
+) -> BackgroundEditMask:
+    """Load a continuous grayscale mask without binarizing it.
+
+    Black pixels remain protected, white pixels remain editable, and intermediate
+    values retain proportional influence. ``gamma`` is optional tone shaping:
+    values above one reduce mid-gray editability and values below one increase it.
+    """
+
+    if gamma <= 0.0:
+        raise ValueError("mask gamma must be positive")
+    if not isinstance(expansion_radius, int) or not 0 <= expansion_radius <= 128:
+        raise ValueError("mask expansion_radius must be an integer in [0, 128]")
+    if feather_radius < 0.0:
+        raise ValueError("mask feather_radius cannot be negative")
+
+    mask_array = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+    if invert:
+        mask_array = 1.0 - mask_array
+    if gamma != 1.0:
+        mask_array = np.power(mask_array, gamma)
+    mask = Image.fromarray(
+        np.clip(np.round(mask_array * 255.0), 0.0, 255.0).astype(np.uint8),
+        mode="L",
+    )
+    if expansion_radius:
+        mask = mask.filter(ImageFilter.MaxFilter(2 * expansion_radius + 1))
+    if feather_radius:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_radius))
+    final_array = np.asarray(mask, dtype=np.float32) / 255.0
+    return BackgroundEditMask(
+        mask=mask,
+        background_rgb=None,
+        editable_fraction=float(np.mean(final_array)),
+    )
+
+
 def composite_generated_activity(
     generated: Image.Image,
     mask: Image.Image,
@@ -399,6 +443,7 @@ def prepare_flux2_klein_masked_inpaint_inputs(
     edit_mask: Image.Image,
     *,
     background_rgb: tuple[int, int, int],
+    init_image: Image.Image | None = None,
     width: int,
     height: int,
     num_inference_steps: int,
@@ -407,10 +452,10 @@ def prepare_flux2_klein_masked_inpaint_inputs(
 ) -> Flux2KleinMaskedInpaintInputs:
     """Prepare full repainting inside a mask while locking the background.
 
-    The source image is used only to derive ``edit_mask``. Generation starts
-    from noise over a flat background canvas. After every denoising step, black
-    mask regions are restored to the correctly noised flat-background latent;
-    white regions remain free for prompt-driven generation.
+    Generation starts from either noise over a flat canvas or a noised init image
+    inside editable regions. After every denoising step, black mask regions are
+    restored to the correctly noised flat-background latent; white regions remain
+    free for prompt-driven generation. Gray values blend those behaviors.
     """
 
     if len(background_rgb) != 3 or any(not 0 <= channel <= 255 for channel in background_rgb):
@@ -453,6 +498,40 @@ def prepare_flux2_klein_masked_inpaint_inputs(
             generator=generator,
         )
 
+    latent_height, latent_width = background_latents.shape[-2:]
+    resized_mask = edit_mask.convert("L").resize(
+        (latent_width, latent_height),
+        Image.Resampling.LANCZOS,
+    )
+    mask_array = np.asarray(resized_mask, dtype=np.float32) / 255.0
+    edit_mask_latents = torch.from_numpy(mask_array).to(
+        device=background_latents.device,
+        dtype=background_latents.dtype,
+    )[None, None, :, :]
+    edit_mask_packed = edit_mask_latents.flatten(2).transpose(1, 2)
+
+    clean_latents = background_latents
+    if init_image is not None:
+        processed_init = pipeline.image_processor.preprocess(
+            init_image.convert("RGB"),
+            height=normalized_height,
+            width=normalized_width,
+            resize_mode="crop",
+        ).to(device=device, dtype=pipeline.vae.dtype)
+        with torch.no_grad():
+            init_latents = pipeline._encode_vae_image(
+                image=processed_init,
+                generator=generator,
+            )
+        if init_latents.shape != background_latents.shape:
+            raise ValueError(
+                "encoded init image and background latent shapes do not match"
+            )
+        clean_latents = (
+            edit_mask_latents * init_latents
+            + (1.0 - edit_mask_latents) * background_latents
+        )
+
     denoising_steps = max(
         2,
         min(num_inference_steps, math.ceil(num_inference_steps * strength)),
@@ -473,21 +552,9 @@ def prepare_flux2_klein_masked_inpaint_inputs(
         dtype=background_latents.dtype,
     )
     latents = (
-        (1.0 - effective_start_sigma) * background_latents
+        (1.0 - effective_start_sigma) * clean_latents
         + effective_start_sigma * fixed_noise
     )
-
-    latent_height, latent_width = background_latents.shape[-2:]
-    resized_mask = edit_mask.convert("L").resize(
-        (latent_width, latent_height),
-        Image.Resampling.LANCZOS,
-    )
-    mask_array = np.asarray(resized_mask, dtype=np.float32) / 255.0
-    edit_mask_latents = torch.from_numpy(mask_array).to(
-        device=background_latents.device,
-        dtype=background_latents.dtype,
-    )[None, None, :, :]
-    edit_mask_packed = edit_mask_latents.flatten(2).transpose(1, 2)
 
     def lock_background_callback(
         current_pipeline: Any,
@@ -528,6 +595,7 @@ def prepare_flux2_klein_masked_inpaint_inputs(
         requested_strength=float(strength),
         effective_start_sigma=effective_start_sigma,
         denoising_steps=denoising_steps,
+        used_init_image=init_image is not None,
     )
 
 
@@ -630,6 +698,7 @@ __all__ = [
     "natural_sort_key",
     "prepare_flux2_klein_img2img_inputs",
     "prepare_flux2_klein_masked_inpaint_inputs",
+    "prepare_grayscale_edit_mask",
     "regular_sample_indices",
     "stage_regular_keyframes",
 ]
