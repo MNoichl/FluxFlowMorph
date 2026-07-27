@@ -142,8 +142,8 @@ notebook["cells"][0]["source"] = lines(
 
     This experiment loads grayscale images from a ZIP as soft spatial initializers:
 
-    - dark mask values become a settable beige background;
-    - bright values become deterministic random RGB noise;
+    - dark mask values become a settable beige field with faint residual noise;
+    - bright values become deterministic RGB noise softly tinted toward beige;
     - a Gaussian-smoothed copy of the grayscale mask blends those two fields;
     - every anchor uses the resulting image through conventional latent img2img;
     - later anchors also mix in a weak blurred and grained previous image;
@@ -160,8 +160,9 @@ notebook["cells"][1]["source"] = lines(
     ## 1. Editable run, background-mask, model, API, FlowMorph, image, and video settings
 
     Point the mask ZIP settings at naturally ordered black/white or grayscale files.
-    `MASK_INIT_BACKGROUND_RGB` controls the quiet field, while the bright field is
-    seeded with deterministic RGB noise and softened by `MASK_INIT_GAUSSIAN_BLUR`.
+    `MASK_INIT_BACKGROUND_RGB` controls the quiet field. Two endpoint-mix controls
+    tint the active noise toward beige and retain faint noise in the quiet field;
+    `MASK_INIT_GAUSSIAN_BLUR` softens the spatial transition between them.
     This is only an img2img initialization: FLUX may repaint and cross its boundaries.
     """
 )
@@ -224,6 +225,10 @@ mask_settings = dedent(
     MASK_INIT_GAUSSIAN_BLUR = 32.0
     MASK_INIT_NOISE_LOW = 0
     MASK_INIT_NOISE_HIGH = 255
+    # 0 = pure RGB noise; 1 = completely beige at the bright endpoint.
+    MASK_INIT_NOISE_BEIGE_MIX = 0.18
+    # 0 = flat beige; larger values retain more noise at the dark endpoint.
+    MASK_INIT_BACKGROUND_NOISE_MIX = 0.04
     MASK_INIT_DENOISE_STRENGTH = 0.75
     MASK_INIT_PREVIOUS_MIX = 0.18
     SAVE_MASK_INITS = True
@@ -284,6 +289,15 @@ mask_validation = dedent(
     ):
         raise ValueError(
             "MASK_INIT_NOISE_LOW/HIGH must be integers satisfying 0 <= low < high <= 255"
+        )
+    if not 0 <= MASK_INIT_NOISE_BEIGE_MIX <= 1:
+        raise ValueError("MASK_INIT_NOISE_BEIGE_MIX must lie in [0, 1]")
+    if not 0 <= MASK_INIT_BACKGROUND_NOISE_MIX <= 1:
+        raise ValueError("MASK_INIT_BACKGROUND_NOISE_MIX must lie in [0, 1]")
+    if MASK_INIT_NOISE_BEIGE_MIX + MASK_INIT_BACKGROUND_NOISE_MIX >= 1:
+        raise ValueError(
+            "MASK_INIT_NOISE_BEIGE_MIX + MASK_INIT_BACKGROUND_NOISE_MIX "
+            "must be less than 1 so bright areas remain noisier than dark areas"
         )
     if not 0 < MASK_INIT_DENOISE_STRENGTH <= 1:
         raise ValueError("MASK_INIT_DENOISE_STRENGTH must lie in (0, 1]")
@@ -461,9 +475,19 @@ model_cell["source"] = code_blocks(
             (width, height),
             tuple(MASK_INIT_BACKGROUND_RGB),
         )
-        mask_noise_init = Image.composite(
+        beige_tinted_noise = Image.blend(
             noise_image,
             background,
+            MASK_INIT_NOISE_BEIGE_MIX,
+        )
+        faintly_noisy_background = Image.blend(
+            background,
+            noise_image,
+            MASK_INIT_BACKGROUND_NOISE_MIX,
+        )
+        mask_noise_init = Image.composite(
+            beige_tinted_noise,
+            faintly_noisy_background,
             soft_mask,
         )
         previous_reference = None
@@ -485,6 +509,8 @@ model_cell["source"] = code_blocks(
             generation_init = mask_noise_init.copy()
         noise_image.close()
         background.close()
+        beige_tinted_noise.close()
+        faintly_noisy_background.close()
         mask_noise_init.close()
         return generation_init, soft_mask, previous_reference
 
@@ -499,9 +525,10 @@ model_cell["source"] = code_blocks(
 
     Input: You receive (1) a science/theme, (2) the complete original art prompt,
     and (3) the Gaussian-smoothed activity geometry used to initialize FLUX. Bright
-    regions receive random RGB texture, dark regions receive a quiet beige field,
-    and gray regions softly mix the two. This is a compositional tendency, not a
-    hard stencil: FLUX is free to repaint and cross every boundary.
+    regions receive beige-tinted RGB texture, dark regions receive a quiet beige
+    field with faint residual texture, and gray regions softly mix the two. This
+    is a compositional tendency, not a hard stencil: FLUX is free to repaint and
+    cross every boundary.
 
     Task: Adapt the complete art prompt in rich visual detail so FLUX composes
     the subject organically around the active geometry. Inspect the geometry itself.
@@ -1055,13 +1082,18 @@ model_cell["source"] = code_blocks(
             "mask_init_gaussian_blur": MASK_INIT_GAUSSIAN_BLUR,
             "mask_init_noise_low": MASK_INIT_NOISE_LOW,
             "mask_init_noise_high": MASK_INIT_NOISE_HIGH,
+            "mask_init_noise_beige_mix": MASK_INIT_NOISE_BEIGE_MIX,
+            "mask_init_background_noise_mix": MASK_INIT_BACKGROUND_NOISE_MIX,
             "mask_init_denoise_strength": MASK_INIT_DENOISE_STRENGTH,
             "mask_invert": MASK_INVERT,
             "mask_gamma": MASK_GAMMA,
             "mask_expansion": MASK_EXPANSION,
             "mask_feather": MASK_FEATHER,
             "editable_fraction": trial_mask.editable_fraction,
-            "mask_polarity": "bright_noise_activity_dark_beige_quiet",
+            "mask_polarity": (
+                "bright_beige_tinted_noise_activity_"
+                "dark_faintly_noisy_beige_quiet"
+            ),
             "mask_values_preserved_without_binarization": True,
             "generation_backend": trial_generation_report["backend"],
             "generation_mode": trial_generation_report["mode"],
@@ -1084,7 +1116,10 @@ model_cell["source"] = code_blocks(
             ("Loaded grayscale mask source", trial_mask_source.convert("RGB")),
             ("Effective activity mask before Gaussian smoothing", trial_mask.mask.convert("RGB")),
             ("Gaussian-smoothed activity mask", trial_soft_mask.convert("RGB")),
-            ("Actual beige + RGB-noise img2img initialization", trial_init.copy()),
+            (
+                "Actual blended beige + tinted-noise img2img initialization",
+                trial_init.copy(),
+            ),
             ("Direct FLUX result — no post-generation mask", trial_image.copy()),
         ]
         for heading, preview in previews:
@@ -1122,9 +1157,10 @@ anchor_markdown["source"] = lines(
     """
     ## 7. Generate soft-mask-initialized cyclic anchor paintings
 
-    Each selected grayscale frame is Gaussian-smoothed and used to blend a quiet beige
-    field with deterministic random RGB noise. The remote vision model adapts the prompt
-    around the same soft activity geometry while retaining the LoRA trigger exactly once.
+    Each selected grayscale frame is Gaussian-smoothed and used to blend a faintly noisy
+    beige field with deterministic RGB noise tinted toward the same beige. The remote
+    vision model adapts the prompt around the same soft activity geometry while retaining
+    the LoRA trigger exactly once.
     Every anchor is generated by img2img from that initialization; anchors 2+ also mix
     in the weak blurred/grained previous image. The decoded result is saved directly:
     there is no exact output mask, alpha composite, or post-generation clipping.
@@ -1147,6 +1183,8 @@ anchor_cell["source"] = lines(
         "mask_init_gaussian_blur": MASK_INIT_GAUSSIAN_BLUR,
         "mask_init_noise_low": MASK_INIT_NOISE_LOW,
         "mask_init_noise_high": MASK_INIT_NOISE_HIGH,
+        "mask_init_noise_beige_mix": MASK_INIT_NOISE_BEIGE_MIX,
+        "mask_init_background_noise_mix": MASK_INIT_BACKGROUND_NOISE_MIX,
         "mask_init_denoise_strength": MASK_INIT_DENOISE_STRENGTH,
         "mask_init_previous_mix": MASK_INIT_PREVIOUS_MIX,
         "invert": MASK_INVERT,
@@ -1163,7 +1201,10 @@ anchor_cell["source"] = lines(
             OPENAI_MODEL if MASK_PROMPT_REWRITE_ENABLED else None
         ),
         "mask_prompt_rewrite_image_detail": MASK_PROMPT_REWRITE_IMAGE_DETAIL,
-        "polarity": "bright_noise_activity_dark_beige_quiet",
+        "polarity": (
+            "bright_beige_tinted_noise_activity_"
+            "dark_faintly_noisy_beige_quiet"
+        ),
         "continuous_values_preserved": True,
         "previous_init_enabled": PREVIOUS_INIT_ENABLED,
         "previous_init_blend": PREVIOUS_INIT_BLEND,

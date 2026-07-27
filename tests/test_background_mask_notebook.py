@@ -61,7 +61,8 @@ def test_background_mask_notebook_loads_continuous_masks() -> None:
     assert "prepare_grayscale_edit_mask(" in code
     assert "make_background_edit_mask(" not in code
     assert '"continuous_values_preserved": True' in code
-    assert '"mask_polarity": "bright_noise_activity_dark_beige_quiet"' in code
+    assert '"bright_beige_tinted_noise_activity_"' in code
+    assert '"dark_faintly_noisy_beige_quiet"' in code
 
 
 def test_background_mask_notebook_uses_soft_mask_noise_img2img_without_postmask() -> None:
@@ -77,13 +78,19 @@ def test_background_mask_notebook_uses_soft_mask_noise_img2img_without_postmask(
     assert "MASK_INIT_GAUSSIAN_BLUR = 32.0" in code
     assert "MASK_INIT_NOISE_LOW = 0" in code
     assert "MASK_INIT_NOISE_HIGH = 255" in code
+    assert "MASK_INIT_NOISE_BEIGE_MIX = 0.18" in code
+    assert "MASK_INIT_BACKGROUND_NOISE_MIX = 0.04" in code
     assert "MASK_INIT_DENOISE_STRENGTH = 0.75" in code
     assert "smooth_mask_for_initialization(" in code
     assert "ImageFilter.GaussianBlur(radius=MASK_INIT_GAUSSIAN_BLUR)" in code
     assert "np.random.default_rng(seed)" in code
+    assert "beige_tinted_noise = Image.blend(" in code
+    assert "MASK_INIT_NOISE_BEIGE_MIX," in code
+    assert "faintly_noisy_background = Image.blend(" in code
+    assert "MASK_INIT_BACKGROUND_NOISE_MIX," in code
     assert "Image.composite(" in code
-    assert "noise_image," in code
-    assert "background," in code
+    assert "beige_tinted_noise," in code
+    assert "faintly_noisy_background," in code
     assert "soft_mask," in code
     assert "prepare_flux2_klein_img2img_inputs(" in code
     assert "strength=MASK_INIT_DENOISE_STRENGTH" in code
