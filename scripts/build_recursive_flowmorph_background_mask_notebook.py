@@ -140,21 +140,19 @@ notebook["cells"][0]["source"] = lines(
 
     [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MNoichl/FluxFlowMorph/blob/main/notebooks/StillLife_Recursive_FlowMorph_Trajectory_Background_Mask.ipynb)
 
-    This separate experiment loads grayscale images from a ZIP as continuous masks:
+    This experiment loads grayscale images from a ZIP as soft spatial initializers:
 
-    - black is protected background;
-    - white is fully editable;
-    - every gray value retains proportional influence without binarization;
-    - anchor 1 is generated normally with the high-quality `Flux2KleinPipeline`;
-    - every later anchor uses a weak blurred, background-blended, grained version
-      of the previous generated anchor through conventional latent img2img;
+    - dark mask values become a settable beige background;
+    - bright values become deterministic random RGB noise;
+    - a Gaussian-smoothed copy of the grayscale mask blends those two fields;
+    - every anchor uses the resulting image through conventional latent img2img;
+    - later anchors also mix in a weak blurred and grained previous image;
     - the effective mask and unchanged original prompt are sent to the OpenAI
       vision model so it can write a detailed prompt around the actual geometry;
-    - the mask never enters FLUX as an image or latent conditioning signal;
-    - after decoding, the continuous mask reveals the generated painting over
-      `OUTPUT_BACKGROUND_RGB`.
+    - the remotely adapted prompt must begin with the LoRA trigger exactly once;
+    - there is no post-generation mask or exact compositing step.
 
-    Run the trial first to verify mask polarity and gradients before generating anchors.
+    Run the trial first to inspect the smoothed activity mask and actual img2img init.
     """
 )
 notebook["cells"][1]["source"] = lines(
@@ -162,10 +160,9 @@ notebook["cells"][1]["source"] = lines(
     ## 1. Editable run, background-mask, model, API, FlowMorph, image, and video settings
 
     Point the mask ZIP settings at naturally ordered black/white or grayscale files.
-    Values are preserved by default. `OUTPUT_BACKGROUND_RGB` is the flat color written
-    outside the editable mask. Before FLUX generation, the remote vision model receives
-    the unchanged original prompt and effective mask, then writes a detailed descriptive
-    prompt for that geometry. Masking remains a separate post-generation operation.
+    `MASK_INIT_BACKGROUND_RGB` controls the quiet field, while the bright field is
+    seeded with deterministic RGB noise and softened by `MASK_INIT_GAUSSIAN_BLUR`.
+    This is only an img2img initialization: FLUX may repaint and cross its boundaries.
     """
 )
 
@@ -222,14 +219,21 @@ mask_settings = dedent(
     MASK_PROMPT_MIN_COMPONENT_FRACTION = 0.0005
     MASK_PROMPT_MAX_COMPONENTS = 12
 
-    # Full-frame generation, post-generation masking, and weak sequential continuity.
-    OUTPUT_BACKGROUND_RGB = (238, 233, 218)
-    MASK_PREVIOUS_INIT_DENOISE_STRENGTH = 0.85
+    # Soft noisy mask initialization. No mask is applied after FLUX decoding.
+    MASK_INIT_BACKGROUND_RGB = (238, 233, 218)
+    MASK_INIT_GAUSSIAN_BLUR = 32.0
+    MASK_INIT_NOISE_LOW = 0
+    MASK_INIT_NOISE_HIGH = 255
+    MASK_INIT_DENOISE_STRENGTH = 0.75
+    MASK_INIT_PREVIOUS_MIX = 0.18
+    SAVE_MASK_INITS = True
+
+    # Weak sequential continuity mixed into the noisy mask init for anchors 2+.
     PREVIOUS_INIT_ENABLED = True
     PREVIOUS_INIT_BLEND = 0.12
     PREVIOUS_INIT_BLUR = 16.0
     PREVIOUS_INIT_GRAIN_STRENGTH = 0.035
-    PREVIOUS_INIT_BACKGROUND_RGB = OUTPUT_BACKGROUND_RGB
+    PREVIOUS_INIT_BACKGROUND_RGB = MASK_INIT_BACKGROUND_RGB
     SAVE_PREVIOUS_INITS = True
 
     TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True
@@ -259,10 +263,10 @@ validation_cell = find_cell(notebook, "def trajectory_generation_prompt")
 validation = source(validation_cell)
 mask_validation = dedent(
     """
-    if len(OUTPUT_BACKGROUND_RGB) != 3 or any(
-        not 0 <= channel <= 255 for channel in OUTPUT_BACKGROUND_RGB
+    if len(MASK_INIT_BACKGROUND_RGB) != 3 or any(
+        not 0 <= channel <= 255 for channel in MASK_INIT_BACKGROUND_RGB
     ):
-        raise ValueError("OUTPUT_BACKGROUND_RGB must contain three values in [0, 255]")
+        raise ValueError("MASK_INIT_BACKGROUND_RGB must contain three values in [0, 255]")
     if MASK_GAMMA <= 0:
         raise ValueError("MASK_GAMMA must be positive")
     if not isinstance(MASK_EXPANSION, int) or not 0 <= MASK_EXPANSION <= 128:
@@ -271,10 +275,20 @@ mask_validation = dedent(
         raise ValueError("MASK_FEATHER cannot be negative")
     if not 0 <= MASK_MIN_EDITABLE_FRACTION < MASK_MAX_EDITABLE_FRACTION <= 1:
         raise ValueError("Editable-fraction limits must satisfy 0 <= min < max <= 1")
-    if not 0 < MASK_PREVIOUS_INIT_DENOISE_STRENGTH <= 1:
+    if MASK_INIT_GAUSSIAN_BLUR < 0:
+        raise ValueError("MASK_INIT_GAUSSIAN_BLUR cannot be negative")
+    if not (
+        isinstance(MASK_INIT_NOISE_LOW, int)
+        and isinstance(MASK_INIT_NOISE_HIGH, int)
+        and 0 <= MASK_INIT_NOISE_LOW < MASK_INIT_NOISE_HIGH <= 255
+    ):
         raise ValueError(
-            "MASK_PREVIOUS_INIT_DENOISE_STRENGTH must lie in (0, 1]"
+            "MASK_INIT_NOISE_LOW/HIGH must be integers satisfying 0 <= low < high <= 255"
         )
+    if not 0 < MASK_INIT_DENOISE_STRENGTH <= 1:
+        raise ValueError("MASK_INIT_DENOISE_STRENGTH must lie in (0, 1]")
+    if not 0 <= MASK_INIT_PREVIOUS_MIX <= 1:
+        raise ValueError("MASK_INIT_PREVIOUS_MIX must lie in [0, 1]")
     if not 0 < PREVIOUS_INIT_BLEND <= 1:
         raise ValueError("PREVIOUS_INIT_BLEND must lie in (0, 1]")
     if PREVIOUS_INIT_BLUR < 0:
@@ -396,12 +410,11 @@ model_cell["source"] = code_blocks(
     from scipy import ndimage
     from huggingface_hub import hf_hub_download
     from IPython.display import Markdown, display
-    from PIL import Image
+    from PIL import Image, ImageFilter
     from pydantic import BaseModel, Field, ValidationError
     from flowmorph_klein.art_loop import make_soft_reference
     from flowmorph_klein.lora import load_flux2_lora
     from flowmorph_klein.trajectory import (
-        composite_generated_on_background,
         prepare_flux2_klein_img2img_inputs,
         prepare_grayscale_edit_mask,
     )
@@ -427,6 +440,54 @@ model_cell["source"] = code_blocks(
             )
         return result
 
+    def smooth_mask_for_initialization(effective_mask):
+        return effective_mask.convert("L").filter(
+            ImageFilter.GaussianBlur(radius=MASK_INIT_GAUSSIAN_BLUR)
+        )
+
+    def build_mask_noise_initialization(mask_result, seed, previous=None):
+        soft_mask = smooth_mask_for_initialization(mask_result.mask)
+        width, height = soft_mask.size
+        random_generator = np.random.default_rng(seed)
+        noise_values = random_generator.integers(
+            MASK_INIT_NOISE_LOW,
+            MASK_INIT_NOISE_HIGH + 1,
+            size=(height, width, 3),
+            dtype=np.uint8,
+        )
+        noise_image = Image.fromarray(noise_values, mode="RGB")
+        background = Image.new(
+            "RGB",
+            (width, height),
+            tuple(MASK_INIT_BACKGROUND_RGB),
+        )
+        mask_noise_init = Image.composite(
+            noise_image,
+            background,
+            soft_mask,
+        )
+        previous_reference = None
+        if previous is not None and PREVIOUS_INIT_ENABLED:
+            previous_reference = make_soft_reference(
+                previous,
+                reference_blend=PREVIOUS_INIT_BLEND,
+                blur_radius=PREVIOUS_INIT_BLUR,
+                grain_strength=PREVIOUS_INIT_GRAIN_STRENGTH,
+                grain_seed=seed,
+                background_rgb=PREVIOUS_INIT_BACKGROUND_RGB,
+            )
+            generation_init = Image.blend(
+                mask_noise_init,
+                previous_reference,
+                MASK_INIT_PREVIOUS_MIX,
+            )
+        else:
+            generation_init = mask_noise_init.copy()
+        noise_image.close()
+        background.close()
+        mask_noise_init.close()
+        return generation_init, soft_mask, previous_reference
+
     class MaskPromptPlan(BaseModel):
         spatial_analysis: str = Field(min_length=80, max_length=1800)
         object_layout: str = Field(min_length=120, max_length=2200)
@@ -437,13 +498,14 @@ model_cell["source"] = code_blocks(
     the {LORA_TRIGGER} oil-painting LoRA.
 
     Input: You receive (1) a science/theme, (2) the complete original art prompt,
-    and (3) the exact grayscale reveal geometry for the final painting. In that
-    geometry, bright pixels are where painted content will remain visible, dark
-    pixels are absent background, and gray pixels are soft edge transitions.
+    and (3) the Gaussian-smoothed activity geometry used to initialize FLUX. Bright
+    regions receive random RGB texture, dark regions receive a quiet beige field,
+    and gray regions softly mix the two. This is a compositional tendency, not a
+    hard stencil: FLUX is free to repaint and cross every boundary.
 
-    Task: Rewrite the complete art prompt in rich visual detail so FLUX composes
-    the subject organically inside the bright geometry before the exact reveal is
-    applied. Inspect the geometry itself. Translate its actual lobes, islands,
+    Task: Adapt the complete art prompt in rich visual detail so FLUX composes
+    the subject organically around the active geometry. Inspect the geometry itself.
+    Translate its actual lobes, islands,
     corridors, bends, diagonals, voids, edge contacts, relative areas, and visual
     center of gravity into a concrete composition.
 
@@ -451,16 +513,14 @@ model_cell["source"] = code_blocks(
     - Assign every important object from the original prompt to a plausible broad
       lobe or island, using explicit canvas locations, relative sizes, orientation,
       overlap, and visual hierarchy.
-    - Put complete recognizable objects well inside broad spaces. Do not position
-      faces, globes, clocks, vessels, brains, books, or other focal objects where a
-      contour would slice through them.
+    - Put recognizable focal objects in broad active spaces, but describe soft
+      overlap and natural spill across boundaries rather than hard clipped edges.
     - Use flexible matter—vines, acanthus, stems, ribbons, smoke, clouds, roots,
       cloth, tendrils, chains, wave motifs, and shadows—to travel through narrow
       corridors, join neighboring masses, curl around internal voids, and taper
       naturally before boundaries.
-    - Treat isolated bright islands as deliberate satellite ornaments related to
-      the main subject. Respect dark gaps by separating objects rather than placing
-      one large object across them.
+    - Treat isolated active islands as deliberate satellite ornaments related to
+      the main subject. Let quiet gaps remain calmer without making them blank.
     - Where the bright geometry meets a canvas edge, describe a natural entrance
       or exit such as a cropped garland, branch, drapery fold, or shadow—not a
       severed focal object.
@@ -472,7 +532,7 @@ model_cell["source"] = code_blocks(
       coherent masses and material texture rather than tiny scattered icons.
 
     Rewritten-prompt contract:
-    - It begins exactly with "{LORA_TRIGGER}," and contains that trigger once.
+    - It begins exactly with "{LORA_TRIGGER}," and contains that trigger exactly once.
     - It is a self-contained literal description of the final artwork, normally
       300–550 words. Repeat all desired content and style; do not refer back to
       the input.
@@ -700,12 +760,13 @@ model_cell["source"] = code_blocks(
         Complete original prompt:
         {base_prompt}
 
-        Deterministic measurements of the effective reveal geometry:
+        Deterministic measurements of the smoothed initialization activity:
         {json.dumps(geometry, indent=2, ensure_ascii=False)}
 
-        Inspect the attached effective grayscale reveal geometry. Write a detailed
-        spatial analysis, map the original objects into the actual bright shapes,
-        then return a complete self-contained rewritten generation prompt.
+        Inspect the attached smoothed grayscale activity map. Write a detailed
+        spatial analysis, map the original objects around its active shapes and
+        quiet intervals without hard clipping, then return a complete
+        self-contained adapted generation prompt.
         '''.strip()
         correction = ""
         last_error = None
@@ -893,81 +954,42 @@ model_cell["source"] = code_blocks(
             ))
         return result
 
-    def generate_masked_anchor(
-        mask_source,
-        prompt,
-        seed,
-        init_image=None,
-        mask_result=None,
-    ):
-        if mask_result is None:
-            mask_result = build_background_mask(mask_source)
+    def generate_mask_initialized_anchor(prompt, seed, init_image):
         generator = torch.Generator(device="cuda").manual_seed(seed)
-        if init_image is None:
-            generation_mode = "text_to_image"
-            generation_inputs = None
-            result = FLUX_PIPE(
-                prompt=prompt,
-                width=IMAGE_WIDTH,
-                height=IMAGE_HEIGHT,
-                num_inference_steps=IMAGE_INFERENCE_STEPS,
-                guidance_scale=IMAGE_GUIDANCE_SCALE,
-                generator=generator,
-                output_type="pil",
-            )
-        else:
-            generation_mode = "latent_img2img_from_weak_previous_anchor"
-            generation_inputs = prepare_flux2_klein_img2img_inputs(
-                FLUX_PIPE,
-                init_image,
-                width=IMAGE_WIDTH,
-                height=IMAGE_HEIGHT,
-                num_inference_steps=IMAGE_INFERENCE_STEPS,
-                strength=MASK_PREVIOUS_INIT_DENOISE_STRENGTH,
-                generator=generator,
-            )
-            result = FLUX_PIPE(
-                prompt=prompt,
-                width=IMAGE_WIDTH,
-                height=IMAGE_HEIGHT,
-                num_inference_steps=IMAGE_INFERENCE_STEPS,
-                sigmas=list(generation_inputs.sigmas),
-                latents=generation_inputs.latents,
-                guidance_scale=IMAGE_GUIDANCE_SCALE,
-                generator=generator,
-                output_type="pil",
-            )
+        generation_inputs = prepare_flux2_klein_img2img_inputs(
+            FLUX_PIPE,
+            init_image,
+            width=IMAGE_WIDTH,
+            height=IMAGE_HEIGHT,
+            num_inference_steps=IMAGE_INFERENCE_STEPS,
+            strength=MASK_INIT_DENOISE_STRENGTH,
+            generator=generator,
+        )
+        result = FLUX_PIPE(
+            prompt=prompt,
+            width=IMAGE_WIDTH,
+            height=IMAGE_HEIGHT,
+            num_inference_steps=IMAGE_INFERENCE_STEPS,
+            sigmas=list(generation_inputs.sigmas),
+            latents=generation_inputs.latents,
+            guidance_scale=IMAGE_GUIDANCE_SCALE,
+            generator=generator,
+            output_type="pil",
+        )
         if not result.images:
             raise RuntimeError("FLUX returned no anchor image")
-        raw_image = result.images[0].convert("RGB")
-        final_image = composite_generated_on_background(
-            raw_image,
-            mask_result.mask,
-            background_rgb=OUTPUT_BACKGROUND_RGB,
-        )
+        image = result.images[0].convert("RGB")
         generation_report = {
             "backend": type(FLUX_PIPE).__name__,
-            "mode": generation_mode,
-            "mask_used_by_model": False,
-            "mask_application": "post_decode_continuous_alpha_composite",
-            "requested_img2img_strength": (
-                generation_inputs.requested_strength
-                if generation_inputs is not None
-                else None
-            ),
-            "effective_start_sigma": (
-                generation_inputs.effective_start_sigma
-                if generation_inputs is not None
-                else None
-            ),
-            "effective_denoising_steps": (
-                generation_inputs.denoising_steps
-                if generation_inputs is not None
-                else IMAGE_INFERENCE_STEPS
-            ),
-            "used_previous_init": init_image is not None,
+            "mode": "latent_img2img_from_soft_mask_noise_init",
+            "mask_used_as_direct_pipeline_argument": False,
+            "mask_derived_init_used_by_model": True,
+            "post_decode_mask_application": "none",
+            "requested_img2img_strength": generation_inputs.requested_strength,
+            "effective_start_sigma": generation_inputs.effective_start_sigma,
+            "effective_denoising_steps": generation_inputs.denoising_steps,
         }
-        return final_image, raw_image, mask_result, generation_report
+        return image, generation_report
 
     """,
     pipeline_setup,
@@ -988,58 +1010,70 @@ model_cell["source"] = code_blocks(
             trial_mask_source = opened.convert("L")
         trial_mask = build_background_mask(trial_mask_source)
         (
+            trial_init,
+            trial_soft_mask,
+            trial_previous_reference,
+        ) = build_mask_noise_initialization(
+            trial_mask,
+            trial_seed,
+        )
+        if trial_previous_reference is not None:
+            raise RuntimeError("A standalone trial must not use a previous reference")
+        (
             trial_generation_prompt,
             trial_prompt_plan_report,
         ) = resolve_mask_aware_prompt(
             trial_stage,
-            trial_mask.mask,
+            trial_soft_mask,
             trial_index,
         )
-        (
-            trial_image,
-            trial_raw,
-            returned_trial_mask,
-            trial_generation_report,
-        ) = generate_masked_anchor(
-            trial_mask_source,
+        trial_image, trial_generation_report = generate_mask_initialized_anchor(
             trial_generation_prompt,
             trial_seed,
-            mask_result=trial_mask,
+            trial_init,
         )
-        if returned_trial_mask is not trial_mask:
-            raise RuntimeError("Trial mask object unexpectedly changed")
         trial_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         trial_directory = (
             RUN_DIRECTORY / "trials" / f"{trial_stamp}_{trial_stage['id']}_{trial_seed}"
         )
         trial_directory.mkdir(parents=True, exist_ok=False)
-        trial_path = trial_directory / "trial_background_locked.png"
-        trial_raw_path = trial_directory / "trial_raw.png"
+        trial_path = trial_directory / "trial_soft_mask_initialized.png"
+        trial_init_path = trial_directory / "mask_noise_init.png"
         trial_source_path = trial_directory / "grayscale_mask_source.png"
-        trial_mask_path = trial_directory / "edit_mask_white_is_editable.png"
+        trial_mask_path = trial_directory / "effective_activity_mask.png"
+        trial_soft_mask_path = trial_directory / "gaussian_smoothed_activity_mask.png"
         trial_image.save(trial_path)
-        trial_raw.save(trial_raw_path)
+        trial_init.save(trial_init_path)
         trial_mask_source.save(trial_source_path)
         trial_mask.mask.save(trial_mask_path)
+        trial_soft_mask.save(trial_soft_mask_path)
         (trial_directory / "settings.json").write_text(json.dumps({
             "stage": trial_stage,
             "trajectory": trial_trajectory,
             "seed": trial_seed,
-            "output_background_rgb": list(OUTPUT_BACKGROUND_RGB),
+            "mask_init_background_rgb": list(MASK_INIT_BACKGROUND_RGB),
+            "mask_init_gaussian_blur": MASK_INIT_GAUSSIAN_BLUR,
+            "mask_init_noise_low": MASK_INIT_NOISE_LOW,
+            "mask_init_noise_high": MASK_INIT_NOISE_HIGH,
+            "mask_init_denoise_strength": MASK_INIT_DENOISE_STRENGTH,
             "mask_invert": MASK_INVERT,
             "mask_gamma": MASK_GAMMA,
             "mask_expansion": MASK_EXPANSION,
             "mask_feather": MASK_FEATHER,
             "editable_fraction": trial_mask.editable_fraction,
-            "mask_polarity": "white_editable_black_protected",
+            "mask_polarity": "bright_noise_activity_dark_beige_quiet",
             "mask_values_preserved_without_binarization": True,
             "generation_backend": trial_generation_report["backend"],
             "generation_mode": trial_generation_report["mode"],
-            "mask_used_by_model": trial_generation_report["mask_used_by_model"],
-            "mask_application": trial_generation_report["mask_application"],
+            "mask_derived_init_used_by_model": (
+                trial_generation_report["mask_derived_init_used_by_model"]
+            ),
+            "post_decode_mask_application": (
+                trial_generation_report["post_decode_mask_application"]
+            ),
             "previous_init_used": False,
-            "source_used_as_latent_init": False,
-            "source_used_as_image_reference": False,
+            "source_used_as_direct_latent_init": False,
+            "mask_noise_image_used_as_img2img_init": True,
             "effective_denoising_steps": (
                 trial_generation_report["effective_denoising_steps"]
             ),
@@ -1048,9 +1082,10 @@ model_cell["source"] = code_blocks(
         }, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8")
         previews = [
             ("Loaded grayscale mask source", trial_mask_source.convert("RGB")),
-            ("Effective mask — WHITE edits, BLACK protects, GRAY is partial", trial_mask.mask.convert("RGB")),
-            ("Raw full-frame FLUX.2 Klein generation before masking", trial_raw.copy()),
-            ("Final exact-background masked result", trial_image.copy()),
+            ("Effective activity mask before Gaussian smoothing", trial_mask.mask.convert("RGB")),
+            ("Gaussian-smoothed activity mask", trial_soft_mask.convert("RGB")),
+            ("Actual beige + RGB-noise img2img initialization", trial_init.copy()),
+            ("Direct FLUX result — no post-generation mask", trial_image.copy()),
         ]
         for heading, preview in previews:
             preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
@@ -1059,19 +1094,21 @@ model_cell["source"] = code_blocks(
             preview.close()
         print({
             "path": str(trial_path),
-            "raw_path": str(trial_raw_path),
+            "init_path": str(trial_init_path),
             "source_path": str(trial_source_path),
             "mask_path": str(trial_mask_path),
+            "soft_mask_path": str(trial_soft_mask_path),
             "editable_fraction": trial_mask.editable_fraction,
             "seed": trial_seed,
             "prompt_index": trial_index,
         })
         del (
             trial_image,
-            trial_raw,
+            trial_init,
             trial_mask_source,
             trial_mask,
-            returned_trial_mask,
+            trial_soft_mask,
+            trial_previous_reference,
             trial_prompt_plan_report,
             trial_generation_report,
         )
@@ -1083,15 +1120,14 @@ model_cell["source"] = code_blocks(
 anchor_markdown = find_cell(notebook, "## 7. Generate trajectory-conditioned")
 anchor_markdown["source"] = lines(
     """
-    ## 7. Generate background-masked cyclic anchor paintings
+    ## 7. Generate soft-mask-initialized cyclic anchor paintings
 
-    Each selected ZIP frame is loaded directly as a continuous grayscale reveal mask.
-    The remote vision model first rewrites each complete prompt in detail around the
-    effective white geometry, assigning focal objects to broad lobes and flexible
-    ornament to corridors and edges. Anchor 1 is then normal text-to-image generation.
-    Every later anchor uses conventional latent img2img from a weak blurred,
-    background-blended, grained version of the preceding masked anchor. Only after
-    decoding is the grayscale mask composited over the exact selected background color.
+    Each selected grayscale frame is Gaussian-smoothed and used to blend a quiet beige
+    field with deterministic random RGB noise. The remote vision model adapts the prompt
+    around the same soft activity geometry while retaining the LoRA trigger exactly once.
+    Every anchor is generated by img2img from that initialization; anchors 2+ also mix
+    in the weak blurred/grained previous image. The decoded result is saved directly:
+    there is no exact output mask, alpha composite, or post-generation clipping.
     """
 )
 
@@ -1099,39 +1135,44 @@ anchor_cell = find_cell(notebook, "BASE_MANIFEST_PATH")
 anchor_cell["source"] = lines(
     """
     BASE_DIRECTORY = RUN_DIRECTORY / "base_frames"
-    MASK_DIRECTORY = BASE_DIRECTORY / "background_edit_masks"
-    INIT_DIRECTORY = BASE_DIRECTORY / "previous_anchor_inits"
-    RAW_DIRECTORY = BASE_DIRECTORY / "raw_masked_generations"
+    MASK_DIRECTORY = BASE_DIRECTORY / "effective_activity_masks"
+    SOFT_MASK_DIRECTORY = BASE_DIRECTORY / "gaussian_smoothed_activity_masks"
+    INIT_DIRECTORY = BASE_DIRECTORY / "mask_noise_inits"
+    PREVIOUS_INIT_DIRECTORY = BASE_DIRECTORY / "previous_anchor_references"
     BASE_MANIFEST_PATH = RUN_DIRECTORY / "metadata" / "base_manifest.json"
     BASE_RECORDS = []
     MASK_CONTRACT = {
-        "source": "direct_grayscale_mask",
-        "output_background_rgb": list(OUTPUT_BACKGROUND_RGB),
+        "source": "gaussian_smoothed_grayscale_mask_noise_initialization",
+        "mask_init_background_rgb": list(MASK_INIT_BACKGROUND_RGB),
+        "mask_init_gaussian_blur": MASK_INIT_GAUSSIAN_BLUR,
+        "mask_init_noise_low": MASK_INIT_NOISE_LOW,
+        "mask_init_noise_high": MASK_INIT_NOISE_HIGH,
+        "mask_init_denoise_strength": MASK_INIT_DENOISE_STRENGTH,
+        "mask_init_previous_mix": MASK_INIT_PREVIOUS_MIX,
         "invert": MASK_INVERT,
         "gamma": MASK_GAMMA,
         "expansion": MASK_EXPANSION,
         "feather": MASK_FEATHER,
-        "previous_init_denoise_strength": MASK_PREVIOUS_INIT_DENOISE_STRENGTH,
         "generation_backend": "Flux2KleinPipeline",
-        "first_anchor_mode": "text_to_image",
-        "later_anchor_mode": "latent_img2img_from_weak_previous_anchor",
-        "mask_application": "post_decode_continuous_alpha_composite",
-        "mask_used_by_model": False,
+        "all_anchor_mode": "latent_img2img_from_soft_mask_noise_init",
+        "post_decode_mask_application": "none",
+        "mask_used_as_direct_pipeline_argument": False,
+        "mask_derived_init_used_by_model": True,
         "mask_used_by_prompt_planner": MASK_PROMPT_REWRITE_ENABLED,
         "mask_prompt_planner_model": (
             OPENAI_MODEL if MASK_PROMPT_REWRITE_ENABLED else None
         ),
         "mask_prompt_rewrite_image_detail": MASK_PROMPT_REWRITE_IMAGE_DETAIL,
-        "polarity": "white_editable_black_protected",
+        "polarity": "bright_noise_activity_dark_beige_quiet",
         "continuous_values_preserved": True,
         "previous_init_enabled": PREVIOUS_INIT_ENABLED,
         "previous_init_blend": PREVIOUS_INIT_BLEND,
         "previous_init_blur": PREVIOUS_INIT_BLUR,
         "previous_init_grain_strength": PREVIOUS_INIT_GRAIN_STRENGTH,
         "previous_init_background_rgb": list(PREVIOUS_INIT_BACKGROUND_RGB),
-        "source_mask_used_as_latent_init": False,
-        "source_used_as_image_reference": False,
-        "previous_init_used_as_latent_img2img_source": True,
+        "source_mask_used_as_direct_latent_init": False,
+        "mask_noise_image_used_as_img2img_init": True,
+        "previous_reference_mixed_into_mask_init": True,
     }
 
     MASK_PROMPT_RECORDS = []
@@ -1141,9 +1182,12 @@ anchor_cell["source"] = lines(
         with Image.open(trajectory["path"]) as opened:
             planning_mask_source = opened.convert("L")
         planning_mask_result = build_background_mask(planning_mask_source)
+        planning_soft_mask = smooth_mask_for_initialization(
+            planning_mask_result.mask
+        )
         generation_prompt, prompt_plan_report = resolve_mask_aware_prompt(
             stage,
-            planning_mask_result.mask,
+            planning_soft_mask,
             index,
         )
         MASK_PROMPT_RECORDS.append({
@@ -1159,6 +1203,7 @@ anchor_cell["source"] = lines(
         })
         planning_mask_source.close()
         planning_mask_result.mask.close()
+        planning_soft_mask.close()
 
     expected_anchor_contract = [
         {
@@ -1211,12 +1256,14 @@ anchor_cell["source"] = lines(
                 "Prompts, mask settings, or archive differ from the saved anchors. "
                 "Set REGENERATE_BASE_FRAMES=True or resume the matching run."
             )
-        print(f"Loaded {len(BASE_RECORDS)} existing background-masked anchors.")
+        print(f"Loaded {len(BASE_RECORDS)} existing soft-mask-initialized anchors.")
     else:
         MASK_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        RAW_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        if SAVE_PREVIOUS_INITS:
+        SOFT_MASK_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        if SAVE_MASK_INITS:
             INIT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        if SAVE_PREVIOUS_INITS:
+            PREVIOUS_INIT_DIRECTORY.mkdir(parents=True, exist_ok=True)
         previous = None
         for index, (stage, trajectory, prompt_record) in enumerate(
             zip(
@@ -1229,45 +1276,53 @@ anchor_cell["source"] = lines(
             seed = BASE_SEED + index
             with Image.open(trajectory["path"]) as opened:
                 mask_source = opened.convert("L")
-            previous_init = None
-            previous_init_path = None
-            if previous is not None and PREVIOUS_INIT_ENABLED:
-                previous_init = make_soft_reference(
-                    previous,
-                    reference_blend=PREVIOUS_INIT_BLEND,
-                    blur_radius=PREVIOUS_INIT_BLUR,
-                    grain_strength=PREVIOUS_INIT_GRAIN_STRENGTH,
-                    grain_seed=seed,
-                    background_rgb=PREVIOUS_INIT_BACKGROUND_RGB,
-                )
-                if SAVE_PREVIOUS_INITS:
-                    previous_init_path = INIT_DIRECTORY / f"init_{index:03d}.png"
-                    previous_init.save(
-                        previous_init_path,
-                        format="PNG",
-                        compress_level=4,
-                    )
             generation_prompt = prompt_record["generation_prompt"]
             prepared_mask_result = build_background_mask(mask_source)
-            (
-                image,
-                raw_image,
-                mask_result,
-                generation_report,
-            ) = generate_masked_anchor(
-                mask_source,
+            generation_init, soft_mask, previous_reference = (
+                build_mask_noise_initialization(
+                    prepared_mask_result,
+                    seed,
+                    previous=previous,
+                )
+            )
+            image, generation_report = generate_mask_initialized_anchor(
                 generation_prompt,
                 seed,
-                init_image=previous_init,
-                mask_result=prepared_mask_result,
+                generation_init,
             )
-            if mask_result is not prepared_mask_result:
-                raise RuntimeError("Anchor mask object unexpectedly changed")
             mask_path = MASK_DIRECTORY / f"mask_{index:03d}.png"
-            raw_path = RAW_DIRECTORY / f"{index:03d}_{stage['id']}_raw.png"
+            soft_mask_path = (
+                SOFT_MASK_DIRECTORY / f"soft_mask_{index:03d}.png"
+            )
+            init_path = INIT_DIRECTORY / f"init_{index:03d}.png"
+            previous_reference_path = (
+                PREVIOUS_INIT_DIRECTORY / f"previous_{index:03d}.png"
+                if previous_reference is not None
+                else None
+            )
             output_path = BASE_DIRECTORY / f"{index:03d}_{stage['id']}.png"
-            mask_result.mask.save(mask_path, format="PNG", compress_level=4)
-            raw_image.save(raw_path, format="PNG", compress_level=4)
+            prepared_mask_result.mask.save(
+                mask_path,
+                format="PNG",
+                compress_level=4,
+            )
+            soft_mask.save(
+                soft_mask_path,
+                format="PNG",
+                compress_level=4,
+            )
+            if SAVE_MASK_INITS:
+                generation_init.save(
+                    init_path,
+                    format="PNG",
+                    compress_level=4,
+                )
+            if previous_reference_path is not None and SAVE_PREVIOUS_INITS:
+                previous_reference.save(
+                    previous_reference_path,
+                    format="PNG",
+                    compress_level=4,
+                )
             image.save(output_path, format="PNG", compress_level=4)
             record = {
                 "uid": f"base_{index:03d}",
@@ -1281,22 +1336,35 @@ anchor_cell["source"] = lines(
                 "mask_prompt_plan_path": prompt_record["plan_path"],
                 "seed": seed,
                 "path": str(output_path),
-                "raw_generation_path": str(raw_path),
                 "trajectory_index": trajectory["trajectory_index"],
                 "trajectory_member": trajectory["member"],
                 "trajectory_member_sha256": trajectory["member_sha256"],
                 "trajectory_source_path": trajectory["path"],
                 "trajectory_edit_mask_path": str(mask_path),
-                "previous_init_path": (
-                    str(previous_init_path) if previous_init_path else None
+                "trajectory_soft_activity_mask_path": str(soft_mask_path),
+                "mask_noise_init_path": (
+                    str(init_path) if SAVE_MASK_INITS else None
                 ),
-                "previous_init_used": previous_init is not None,
-                "editable_fraction": mask_result.editable_fraction,
+                "previous_reference_path": (
+                    str(previous_reference_path)
+                    if previous_reference_path is not None
+                    and SAVE_PREVIOUS_INITS
+                    else None
+                ),
+                "previous_init_used": previous_reference is not None,
+                "editable_fraction": prepared_mask_result.editable_fraction,
                 "mask_contract": MASK_CONTRACT,
                 "generation_backend": generation_report["backend"],
                 "generation_mode": generation_report["mode"],
-                "mask_used_by_model": generation_report["mask_used_by_model"],
-                "mask_application": generation_report["mask_application"],
+                "mask_used_as_direct_pipeline_argument": generation_report[
+                    "mask_used_as_direct_pipeline_argument"
+                ],
+                "mask_derived_init_used_by_model": generation_report[
+                    "mask_derived_init_used_by_model"
+                ],
+                "post_decode_mask_application": generation_report[
+                    "post_decode_mask_application"
+                ],
                 "img2img_strength": generation_report["requested_img2img_strength"],
                 "effective_start_sigma": generation_report["effective_start_sigma"],
                 "effective_denoising_steps": (
@@ -1313,18 +1381,19 @@ anchor_cell["source"] = lines(
             print(
                 f"Anchor {index + 1}/{len(ACTIVE_BASE_STAGES)} saved: "
                 f"{output_path.name} ← {trajectory['member']} "
-                f"({mask_result.editable_fraction:.1%} editable, "
-                f"previous init={'yes' if previous_init is not None else 'no'})"
+                f"({prepared_mask_result.editable_fraction:.1%} activity, "
+                f"previous reference={'yes' if previous_reference is not None else 'no'})"
             )
             if previous is not None:
                 previous.close()
             previous = image.copy()
             mask_source.close()
-            if previous_init is not None:
-                previous_init.close()
-            raw_image.close()
+            if previous_reference is not None:
+                previous_reference.close()
+            generation_init.close()
+            soft_mask.close()
             image.close()
-            mask_result.mask.close()
+            prepared_mask_result.mask.close()
             del prepared_mask_result
             del generation_report
         if previous is not None:
@@ -1333,7 +1402,7 @@ anchor_cell["source"] = lines(
 
     if len(BASE_RECORDS) != len(ACTIVE_BASE_STAGES):
         raise RuntimeError("The anchor manifest is incomplete; regenerate or resume the correct run.")
-    print(f"Prepared {len(BASE_RECORDS)} background-masked anchors in {BASE_DIRECTORY}")
+    print(f"Prepared {len(BASE_RECORDS)} soft-mask-initialized anchors in {BASE_DIRECTORY}")
     """
 )
 
@@ -1359,26 +1428,37 @@ contact_cell["source"] = lines(
     for index, record in enumerate(BASE_RECORDS):
         row_images = load_contact_thumbnails([
             Path(record["trajectory_source_path"]),
-            Path(record["trajectory_edit_mask_path"]),
+            Path(record["trajectory_soft_activity_mask_path"]),
         ])
-        if record.get("previous_init_path"):
+        if record.get("mask_noise_init_path"):
             row_images.extend(
-                load_contact_thumbnails([Path(record["previous_init_path"])])
+                load_contact_thumbnails([Path(record["mask_noise_init_path"])])
             )
         else:
-            row_images.append(Image.new("RGB", (192, 192), OUTPUT_BACKGROUND_RGB))
+            row_images.append(
+                Image.new("RGB", (192, 192), MASK_INIT_BACKGROUND_RGB)
+            )
+        if record.get("previous_reference_path"):
+            row_images.extend(
+                load_contact_thumbnails([Path(record["previous_reference_path"])])
+            )
+        else:
+            row_images.append(
+                Image.new("RGB", (192, 192), MASK_INIT_BACKGROUND_RGB)
+            )
         row_images.extend(load_contact_thumbnails([Path(record["path"])]))
         paired_images.extend(row_images)
         paired_labels.extend([
             f"{index:02d} grayscale source",
-            f"{index:02d} effective mask",
-            f"{index:02d} previous init",
+            f"{index:02d} smoothed activity",
+            f"{index:02d} mask-noise init",
+            f"{index:02d} previous reference",
             f"{index:02d} generated",
         ])
     make_contact_sheet(
         paired_images,
         paired_contact_sheet_path,
-        columns=4,
+        columns=5,
         labels=paired_labels,
     )
     for image in paired_images:
@@ -1387,7 +1467,7 @@ contact_cell["source"] = lines(
     preview = Image.open(paired_contact_sheet_path).convert("RGB")
     preview.thumbnail((CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000))
     display(Markdown(
-        "### Grayscale source → effective mask → weak previous init → generated anchor"
+        "### Source → smoothed activity → actual init → previous reference → direct result"
     ))
     display(preview)
     preview.close()
@@ -1395,11 +1475,14 @@ contact_cell["source"] = lines(
         "full_resolution_sources": str(
             Path(BASE_RECORDS[0]["trajectory_source_path"]).parent
         ),
-        "full_resolution_masks": str(
-            Path(BASE_RECORDS[0]["trajectory_edit_mask_path"]).parent
+        "full_resolution_soft_activity_masks": str(
+            Path(BASE_RECORDS[0]["trajectory_soft_activity_mask_path"]).parent
         ),
-        "full_resolution_previous_inits": (
-            str(INIT_DIRECTORY) if SAVE_PREVIOUS_INITS else None
+        "full_resolution_mask_noise_inits": (
+            str(INIT_DIRECTORY) if SAVE_MASK_INITS else None
+        ),
+        "full_resolution_previous_references": (
+            str(PREVIOUS_INIT_DIRECTORY) if SAVE_PREVIOUS_INITS else None
         ),
         "full_resolution_anchors": str(BASE_DIRECTORY),
         "paired_audit": str(paired_contact_sheet_path),
@@ -1410,9 +1493,11 @@ contact_cell["source"] = lines(
 assembly_markdown = find_cell(notebook, "## 10. Assemble, preview")
 assembly_markdown["source"] = lines(
     """
-    ## 10. Assemble, preview, and audit the generated cyclic masked sequence
+    ## 10. Assemble, preview, and audit the generated cyclic sequence
 
-    The background-masked anchors now enter the unchanged recursive FlowMorph pipeline.
+    The directly decoded, soft-mask-initialized anchors now enter the unchanged recursive
+    FlowMorph pipeline. FlowMorph receives ordinary completed anchor paintings; no masks
+    are reapplied to its fitted endpoints or interpolated frames.
     Round 1 contributes one explicit midpoint, Round 2 contributes ten shared-prompt
     renders, and the final-to-first gap closes the loop before RIFE finishing.
     """

@@ -61,10 +61,10 @@ def test_background_mask_notebook_loads_continuous_masks() -> None:
     assert "prepare_grayscale_edit_mask(" in code
     assert "make_background_edit_mask(" not in code
     assert '"continuous_values_preserved": True' in code
-    assert '"mask_polarity": "white_editable_black_protected"' in code
+    assert '"mask_polarity": "bright_noise_activity_dark_beige_quiet"' in code
 
 
-def test_background_mask_notebook_generates_before_masking() -> None:
+def test_background_mask_notebook_uses_soft_mask_noise_img2img_without_postmask() -> None:
     _, code = _load_notebook()
     assert "Flux2KleinPipeline.from_pretrained(" in code
     assert "Flux2KleinInpaintPipeline" not in code
@@ -73,34 +73,46 @@ def test_background_mask_notebook_generates_before_masking() -> None:
     assert "prepare_flux2_klein_masked_inpaint_inputs(" not in code
     assert "callback_on_step_end=masked_inputs.callback_on_step_end" not in code
     assert "IMAGE_INFERENCE_STEPS = 50" in code
-    assert "MASK_PREVIOUS_INIT_DENOISE_STRENGTH = 0.85" in code
-    assert '"mask_used_by_model": False' in code
-    assert (
-        '"mask_application": "post_decode_continuous_alpha_composite"'
-        in code
-    )
-    assert code.index("raw_image = result.images[0].convert") < code.index(
-        "final_image = composite_generated_on_background("
-    )
+    assert "MASK_INIT_BACKGROUND_RGB = (238, 233, 218)" in code
+    assert "MASK_INIT_GAUSSIAN_BLUR = 32.0" in code
+    assert "MASK_INIT_NOISE_LOW = 0" in code
+    assert "MASK_INIT_NOISE_HIGH = 255" in code
+    assert "MASK_INIT_DENOISE_STRENGTH = 0.75" in code
+    assert "smooth_mask_for_initialization(" in code
+    assert "ImageFilter.GaussianBlur(radius=MASK_INIT_GAUSSIAN_BLUR)" in code
+    assert "np.random.default_rng(seed)" in code
+    assert "Image.composite(" in code
+    assert "noise_image," in code
+    assert "background," in code
+    assert "soft_mask," in code
+    assert "prepare_flux2_klein_img2img_inputs(" in code
+    assert "strength=MASK_INIT_DENOISE_STRENGTH" in code
+    assert '"mask_derived_init_used_by_model": True' in code
+    assert '"post_decode_mask_application": "none"' in code
+    assert "composite_generated_on_background(" not in code
+    assert "raw_generation_path" not in code
 
 
-def test_background_mask_notebook_uses_weak_previous_latent_img2img() -> None:
+def test_background_mask_notebook_mixes_weak_previous_reference_into_init() -> None:
     _, code = _load_notebook()
     assert "PREVIOUS_INIT_ENABLED = True" in code
     assert "PREVIOUS_INIT_BLEND = 0.12" in code
     assert "PREVIOUS_INIT_BLUR = 16.0" in code
     assert "PREVIOUS_INIT_GRAIN_STRENGTH = 0.035" in code
+    assert "MASK_INIT_PREVIOUS_MIX = 0.18" in code
     assert "make_soft_reference(" in code
-    assert "composite_generated_on_background(" in code
-    assert "if init_image is None:" in code
+    assert "build_mask_noise_initialization(" in code
+    assert "Image.blend(" in code
+    assert "mask_noise_init," in code
+    assert "previous_reference," in code
+    assert "MASK_INIT_PREVIOUS_MIX," in code
     assert "prepare_flux2_klein_img2img_inputs(" in code
-    assert "strength=MASK_PREVIOUS_INIT_DENOISE_STRENGTH" in code
     assert "sigmas=list(generation_inputs.sigmas)" in code
     assert "latents=generation_inputs.latents" in code
     assert "previous = image.copy()" in code
-    assert '"previous_init_used": previous_init is not None' in code
-    assert '"source_mask_used_as_latent_init": False' in code
-    assert '"source_used_as_image_reference": False' in code
+    assert '"previous_init_used": previous_reference is not None' in code
+    assert '"source_mask_used_as_direct_latent_init": False' in code
+    assert '"mask_noise_image_used_as_img2img_init": True' in code
     assert "image=mask_source" not in code
 
 
@@ -141,10 +153,10 @@ def test_background_mask_notebook_rewrites_each_prompt_from_mask_geometry() -> N
     assert "MASK_PROMPT_SYSTEM_PROMPT" in code
     assert "lobes, islands," in code
     assert "Use flexible matter" in code
-    assert "Respect dark gaps" in code
+    assert "Let quiet gaps remain calmer without making them blank" in code
     assert "measure_effective_mask_geometry(" in code
     assert "components_largest_first" in code
-    assert "Deterministic measurements of the effective reveal geometry" in code
+    assert "Deterministic measurements of the smoothed initialization activity" in code
     assert "MASK_PROMPT_GEOMETRY_THRESHOLD = 0.35" in code
     assert "MASK_PROMPT_MIN_COMPONENT_FRACTION = 0.0005" in code
     assert "MASK_PROMPT_MAX_COMPONENTS = 12" in code
@@ -158,6 +170,13 @@ def test_background_mask_notebook_rewrites_each_prompt_from_mask_geometry() -> N
     assert '"detail": MASK_PROMPT_REWRITE_IMAGE_DETAIL' in code
     assert "text_format=MaskPromptPlan" in code
     assert "validate_mask_rewritten_prompt(" in code
+    assert 'clean.startswith(f"{LORA_TRIGGER},")' in code
+    assert "clean.casefold().count(LORA_TRIGGER.casefold()) != 1" in code
+    assert "Rewritten prompt must contain the LoRA trigger once" in code
+    assert (
+        'It begins exactly with "{LORA_TRIGGER}," and contains that trigger exactly once.'
+        in code
+    )
     assert "resolve_mask_aware_prompt(" in code
     assert 'MASK_PROMPT_CACHE_SUBDIRECTORY = "_mask_prompt_cache"' in code
     assert 'RUN_DIRECTORY / "metadata" / "mask_prompt_plans"' in code
@@ -167,6 +186,7 @@ def test_background_mask_notebook_rewrites_each_prompt_from_mask_geometry() -> N
     assert "**Remote spatial analysis**" in code
     assert "**Remote object layout**" in code
     assert "**Adapted FLUX prompt**" in code
+    assert "generation_prompt," in code
 
 
 def test_background_mask_notebook_does_not_reapply_masks_in_flowmorph() -> None:
