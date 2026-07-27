@@ -229,6 +229,22 @@ def test_grayscale_edit_mask_preserves_continuous_values() -> None:
     assert result.editable_fraction == pytest.approx(float(values.mean() / 255.0))
 
 
+def test_grayscale_edit_mask_expands_with_a_circular_footprint() -> None:
+    values = np.zeros((9, 9), dtype=np.uint8)
+    values[4, 4] = 255
+
+    result = prepare_grayscale_edit_mask(
+        Image.fromarray(values, mode="L"),
+        expansion_radius=2,
+    )
+    expanded = np.asarray(result.mask)
+
+    assert expanded[4, 2] == 255
+    assert expanded[2, 4] == 255
+    assert expanded[2, 2] == 0
+    assert expanded[6, 6] == 0
+
+
 def test_background_composite_uses_white_mask_for_generated_content() -> None:
     generated = Image.new("RGB", (8, 4), (200, 30, 20))
     mask_array = np.zeros((4, 8), dtype=np.uint8)

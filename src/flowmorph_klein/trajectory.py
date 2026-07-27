@@ -15,6 +15,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
+from scipy.ndimage import maximum_filter
 
 from .flow_schedule import compute_empirical_mu, klein_custom_sigmas
 
@@ -386,7 +387,19 @@ def prepare_grayscale_edit_mask(
         mode="L",
     )
     if expansion_radius:
-        mask = mask.filter(ImageFilter.MaxFilter(2 * expansion_radius + 1))
+        yy, xx = np.ogrid[
+            -expansion_radius : expansion_radius + 1,
+            -expansion_radius : expansion_radius + 1,
+        ]
+        circular_footprint = (xx * xx + yy * yy) <= expansion_radius * expansion_radius
+        expanded = maximum_filter(
+            np.asarray(mask, dtype=np.uint8),
+            footprint=circular_footprint,
+            mode="nearest",
+        )
+        if expanded.shape != (mask.height, mask.width):
+            raise RuntimeError("circular mask expansion produced an invalid image")
+        mask = Image.fromarray(expanded, mode="L")
     if feather_radius:
         mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_radius))
     final_array = np.asarray(mask, dtype=np.float32) / 255.0

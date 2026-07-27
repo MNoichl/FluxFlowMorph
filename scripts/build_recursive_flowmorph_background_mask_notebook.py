@@ -67,10 +67,15 @@ for index, cell in enumerate(notebook["cells"]):
     if cell.get("cell_type") == "code":
         cell["execution_count"] = None
         cell["outputs"] = []
-        cell["source"] = source(cell).replace(
-            '"repository_commit": project_com mit,',
-            '"repository_commit": project_commit,',
-        ).splitlines(keepends=True)
+        cell["source"] = (
+            source(cell)
+            .replace(
+                '"repository_commit": project_com mit,',
+                '"repository_commit": project_commit,',
+            )
+            .replace("Flux2KleinPipeline", "Flux2KleinInpaintPipeline")
+            .splitlines(keepends=True)
+        )
 
 notebook["cells"][0]["source"] = lines(
     """
@@ -84,9 +89,11 @@ notebook["cells"][0]["source"] = lines(
     - white is fully editable;
     - every gray value retains proportional influence without binarization;
     - anchor 1 begins independently;
+    - the pinned official `Flux2KleinInpaintPipeline` performs mask-aware generation;
     - every later anchor uses a weak blurred, background-blended, grained version
-      of the previous generated anchor as latent initialization;
-    - protected regions remain locked and are composited to `OUTPUT_BACKGROUND_RGB`.
+      of the previous generated anchor as the inpainting source image;
+    - protected regions remain locked and are composited to `OUTPUT_BACKGROUND_RGB`;
+    - the pipeline's default mask binarization is explicitly disabled so gradients survive.
 
     Run the trial first to verify mask polarity and gradients before generating anchors.
     """
@@ -114,13 +121,13 @@ mask_settings = dedent(
     """
     # Grayscale-mask ZIP. Files are regularly sampled to match the active prompts.
     MASK_ZIP_DIRECTORY = "/content/drive/MyDrive/FluxFlowMorphArt/trajectory_inputs"
-    MASK_ZIP_FILENAME = "masks.zip"
+    MASK_ZIP_FILENAME = "mask_2.zip"
     MASK_MEMBER_PREFIX = ""  # Optional folder inside the ZIP, without leading slash.
     MASK_FRAME_OFFSET = 0
     MASK_REVERSE_ORDER = False
 
     # Direct mask interpretation. Defaults preserve every input grayscale value.
-    MASK_INVERT = False
+    MASK_INVERT = True
     MASK_GAMMA = 1.0
     MASK_EXPANSION = 0
     MASK_FEATHER = 0.0
@@ -129,7 +136,8 @@ mask_settings = dedent(
 
     # Generation and weak sequential continuity.
     OUTPUT_BACKGROUND_RGB = (238, 233, 218)
-    MASK_DENOISE_STRENGTH = 0.72  # Higher repaints more; lower preserves more init.
+    MASK_DENOISE_STRENGTH = 1.0  # First anchor/trial: full repaint from the mask.
+    MASK_PREVIOUS_INIT_DENOISE_STRENGTH = 0.85
     PREVIOUS_INIT_ENABLED = True
     PREVIOUS_INIT_BLEND = 0.12
     PREVIOUS_INIT_BLUR = 16.0
@@ -170,6 +178,10 @@ mask_validation = dedent(
         raise ValueError("Editable-fraction limits must satisfy 0 <= min < max <= 1")
     if not 0 < MASK_DENOISE_STRENGTH <= 1:
         raise ValueError("MASK_DENOISE_STRENGTH must lie in (0, 1]")
+    if not 0 < MASK_PREVIOUS_INIT_DENOISE_STRENGTH <= 1:
+        raise ValueError(
+            "MASK_PREVIOUS_INIT_DENOISE_STRENGTH must lie in (0, 1]"
+        )
     if not 0 < PREVIOUS_INIT_BLEND <= 1:
         raise ValueError("PREVIOUS_INIT_BLEND must lie in (0, 1]")
     if PREVIOUS_INIT_BLUR < 0:
@@ -225,9 +237,49 @@ pipeline_setup = model[
     model.index("try:\n    import peft.tuners.lora.torchao")
     : model.index("if RUN_TRIAL_KEYFRAME:")
 ]
+pipeline_setup = pipeline_setup.replace(
+    "Flux2KleinPipeline",
+    "Flux2KleinInpaintPipeline",
+)
+pipeline_setup = pipeline_setup.replace(
+    "    pipeline.vae.enable_tiling()\n    return pipeline, report\n",
+    """    pipeline.vae.enable_tiling()
+    pipeline.mask_processor = type(pipeline.mask_processor)(
+        vae_scale_factor=pipeline.vae_scale_factor * 2,
+        vae_latent_channels=pipeline.latent_channels,
+        do_normalize=False,
+        do_binarize=False,
+        do_convert_rgb=False,
+        do_convert_grayscale=True,
+    )
+    if pipeline.mask_processor.config.do_binarize:
+        raise RuntimeError("Continuous inpaint masks require do_binarize=False")
+    return pipeline, report
+""",
+)
+pipeline_setup = pipeline_setup.replace(
+    'if "FLUX_PIPE" in globals() and globals().get("FLUX_PIPE_LORA_SCALE") != float(IMAGE_LORA_SCALE):\n',
+    """if (
+    "FLUX_PIPE" in globals()
+    and type(globals()["FLUX_PIPE"]).__name__ != "Flux2KleinInpaintPipeline"
+):
+    print("Mask backend changed to the official inpaint pipeline; rebuilding.")
+    release_flux_pipeline()
+if "FLUX_PIPE" in globals() and globals().get("FLUX_PIPE_LORA_SCALE") != float(IMAGE_LORA_SCALE):
+""",
+)
+pipeline_setup = pipeline_setup.replace(
+    'else:\n    print("Reusing the fused pipeline at the current LoRA scale.")\n',
+    """else:
+    print("Reusing the fused official inpaint pipeline at the current LoRA scale.")
+if FLUX_PIPE.mask_processor.config.do_binarize:
+    raise RuntimeError("The active inpaint pipeline unexpectedly binarizes masks")
+""",
+)
 model_cell["source"] = code_blocks(
     """
     import gc
+    import math
     import os
     import random
     import shutil
@@ -239,7 +291,6 @@ model_cell["source"] = code_blocks(
     from flowmorph_klein.trajectory import (
         composite_generated_on_background,
         prepare_grayscale_edit_mask,
-        prepare_flux2_klein_masked_inpaint_inputs,
     )
 
     def build_background_mask(mask_source):
@@ -266,39 +317,57 @@ model_cell["source"] = code_blocks(
     def generate_masked_anchor(mask_source, prompt, seed, init_image=None):
         mask_result = build_background_mask(mask_source)
         generator = torch.Generator(device="cuda").manual_seed(seed)
-        masked_inputs = prepare_flux2_klein_masked_inpaint_inputs(
-            FLUX_PIPE,
-            mask_result.mask,
-            background_rgb=OUTPUT_BACKGROUND_RGB,
-            init_image=init_image,
-            width=IMAGE_WIDTH,
-            height=IMAGE_HEIGHT,
-            num_inference_steps=IMAGE_INFERENCE_STEPS,
-            strength=MASK_DENOISE_STRENGTH,
-            generator=generator,
+        background = Image.new(
+            "RGB",
+            (IMAGE_WIDTH, IMAGE_HEIGHT),
+            OUTPUT_BACKGROUND_RGB,
+        )
+        if init_image is None:
+            inpaint_source = background
+        else:
+            inpaint_source = composite_generated_on_background(
+                init_image,
+                mask_result.mask,
+                background_rgb=OUTPUT_BACKGROUND_RGB,
+            )
+            background.close()
+        denoise_strength = (
+            MASK_DENOISE_STRENGTH
+            if init_image is None
+            else MASK_PREVIOUS_INIT_DENOISE_STRENGTH
         )
         result = FLUX_PIPE(
             prompt=prompt,
-            height=IMAGE_HEIGHT,
+            image=inpaint_source,
+            mask_image=mask_result.mask,
             width=IMAGE_WIDTH,
+            height=IMAGE_HEIGHT,
             num_inference_steps=IMAGE_INFERENCE_STEPS,
-            sigmas=list(masked_inputs.sigmas),
-            latents=masked_inputs.latents,
+            strength=denoise_strength,
             guidance_scale=IMAGE_GUIDANCE_SCALE,
             generator=generator,
             output_type="pil",
-            callback_on_step_end=masked_inputs.callback_on_step_end,
-            callback_on_step_end_tensor_inputs=["latents"],
         )
         if not result.images:
-            raise RuntimeError("FLUX returned no masked image")
+            inpaint_source.close()
+            raise RuntimeError("FLUX inpaint returned no image")
         raw_image = result.images[0].convert("RGB")
         final_image = composite_generated_on_background(
             raw_image,
             mask_result.mask,
             background_rgb=OUTPUT_BACKGROUND_RGB,
         )
-        return final_image, raw_image, mask_result, masked_inputs
+        inpaint_report = {
+            "backend": type(FLUX_PIPE).__name__,
+            "continuous_mask": not FLUX_PIPE.mask_processor.config.do_binarize,
+            "strength": float(denoise_strength),
+            "effective_denoising_steps": min(
+                IMAGE_INFERENCE_STEPS,
+                max(1, math.ceil(IMAGE_INFERENCE_STEPS * denoise_strength)),
+            ),
+            "used_previous_init": init_image is not None,
+        }
+        return final_image, raw_image, mask_result, inpaint_report, inpaint_source
 
     """,
     pipeline_setup,
@@ -318,7 +387,13 @@ model_cell["source"] = code_blocks(
         with Image.open(trial_trajectory["path"]) as opened:
             trial_mask_source = opened.convert("L")
         trial_generation_prompt = trajectory_generation_prompt(trial_stage["prompt"])
-        trial_image, trial_raw, trial_mask, trial_inputs = generate_masked_anchor(
+        (
+            trial_image,
+            trial_raw,
+            trial_mask,
+            trial_inpaint_report,
+            trial_inpaint_source,
+        ) = generate_masked_anchor(
             trial_mask_source,
             trial_generation_prompt,
             trial_seed,
@@ -330,10 +405,12 @@ model_cell["source"] = code_blocks(
         trial_directory.mkdir(parents=True, exist_ok=False)
         trial_path = trial_directory / "trial_background_locked.png"
         trial_raw_path = trial_directory / "trial_raw.png"
+        trial_inpaint_source_path = trial_directory / "trial_inpaint_source.png"
         trial_source_path = trial_directory / "grayscale_mask_source.png"
         trial_mask_path = trial_directory / "edit_mask_white_is_editable.png"
         trial_image.save(trial_path)
         trial_raw.save(trial_raw_path)
+        trial_inpaint_source.save(trial_inpaint_source_path)
         trial_mask_source.save(trial_source_path)
         trial_mask.mask.save(trial_mask_path)
         (trial_directory / "settings.json").write_text(json.dumps({
@@ -348,17 +425,22 @@ model_cell["source"] = code_blocks(
             "editable_fraction": trial_mask.editable_fraction,
             "mask_polarity": "white_editable_black_protected",
             "mask_values_preserved_without_binarization": True,
+            "inpaint_backend": trial_inpaint_report["backend"],
+            "inpaint_source_path": str(trial_inpaint_source_path),
             "previous_init_used": False,
             "source_used_as_latent_init": False,
             "source_used_as_image_reference": False,
-            "effective_start_sigma": trial_inputs.effective_start_sigma,
-            "effective_denoising_steps": trial_inputs.denoising_steps,
+            "denoise_strength": trial_inpaint_report["strength"],
+            "effective_denoising_steps": (
+                trial_inpaint_report["effective_denoising_steps"]
+            ),
             "generation_prompt": trial_generation_prompt,
         }, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8")
         previews = [
             ("Loaded grayscale mask source", trial_mask_source.convert("RGB")),
             ("Effective mask — WHITE edits, BLACK protects, GRAY is partial", trial_mask.mask.convert("RGB")),
-            ("Raw masked-denoising result", trial_raw.copy()),
+            ("Official inpaint source canvas", trial_inpaint_source.copy()),
+            ("Raw official FLUX.2 Klein inpaint result", trial_raw.copy()),
             ("Final exact-background result", trial_image.copy()),
         ]
         for heading, preview in previews:
@@ -369,13 +451,22 @@ model_cell["source"] = code_blocks(
         print({
             "path": str(trial_path),
             "raw_path": str(trial_raw_path),
+            "inpaint_source_path": str(trial_inpaint_source_path),
             "source_path": str(trial_source_path),
             "mask_path": str(trial_mask_path),
             "editable_fraction": trial_mask.editable_fraction,
             "seed": trial_seed,
             "prompt_index": trial_index,
         })
-        del trial_image, trial_raw, trial_mask_source, trial_mask, trial_inputs
+        trial_inpaint_source.close()
+        del (
+            trial_image,
+            trial_raw,
+            trial_mask_source,
+            trial_mask,
+            trial_inpaint_report,
+            trial_inpaint_source,
+        )
     else:
         print("Trial skipped.")
     """
@@ -388,8 +479,8 @@ anchor_markdown["source"] = lines(
 
     Each selected ZIP frame is loaded directly as a continuous grayscale mask. Anchor 1
     starts independently. Every later anchor uses a weak blurred, background-blended,
-    grained version of the preceding generated anchor as latent initialization inside
-    editable regions. Protected regions remain the exact selected background color.
+    grained version of the preceding generated anchor as the official inpainting source
+    inside editable regions. Protected regions remain the exact selected background color.
     """
 )
 
@@ -409,7 +500,10 @@ anchor_cell["source"] = lines(
         "gamma": MASK_GAMMA,
         "expansion": MASK_EXPANSION,
         "feather": MASK_FEATHER,
-        "denoise_strength": MASK_DENOISE_STRENGTH,
+        "first_denoise_strength": MASK_DENOISE_STRENGTH,
+        "previous_init_denoise_strength": MASK_PREVIOUS_INIT_DENOISE_STRENGTH,
+        "inpaint_backend": "Flux2KleinInpaintPipeline",
+        "pipeline_mask_binarization": False,
         "polarity": "white_editable_black_protected",
         "continuous_values_preserved": True,
         "previous_init_enabled": PREVIOUS_INIT_ENABLED,
@@ -419,6 +513,7 @@ anchor_cell["source"] = lines(
         "previous_init_background_rgb": list(PREVIOUS_INIT_BACKGROUND_RGB),
         "source_mask_used_as_latent_init": False,
         "source_used_as_image_reference": False,
+        "previous_init_used_as_inpaint_source": True,
     }
     expected_anchor_contract = [
         {
@@ -494,7 +589,13 @@ anchor_cell["source"] = lines(
                         compress_level=4,
                     )
             generation_prompt = trajectory_generation_prompt(stage["prompt"])
-            image, raw_image, mask_result, masked_inputs = generate_masked_anchor(
+            (
+                image,
+                raw_image,
+                mask_result,
+                inpaint_report,
+                inpaint_source,
+            ) = generate_masked_anchor(
                 mask_source,
                 generation_prompt,
                 seed,
@@ -527,8 +628,11 @@ anchor_cell["source"] = lines(
                 "previous_init_used": previous_init is not None,
                 "editable_fraction": mask_result.editable_fraction,
                 "mask_contract": MASK_CONTRACT,
-                "effective_start_sigma": masked_inputs.effective_start_sigma,
-                "effective_denoising_steps": masked_inputs.denoising_steps,
+                "inpaint_backend": inpaint_report["backend"],
+                "inpaint_denoise_strength": inpaint_report["strength"],
+                "effective_denoising_steps": (
+                    inpaint_report["effective_denoising_steps"]
+                ),
             }
             BASE_RECORDS.append(record)
             BASE_MANIFEST_PATH.write_text(json.dumps({
@@ -549,10 +653,11 @@ anchor_cell["source"] = lines(
             mask_source.close()
             if previous_init is not None:
                 previous_init.close()
+            inpaint_source.close()
             raw_image.close()
             image.close()
             mask_result.mask.close()
-            del masked_inputs
+            del inpaint_report, inpaint_source
         if previous is not None:
             previous.close()
             del previous
