@@ -56,6 +56,12 @@ def replace_between(text: str, start: str, end: str, replacement: str) -> str:
     return text[:start_index] + replacement + text[end_index:]
 
 
+def replace_once(text: str, old: str, new: str) -> str:
+    if text.count(old) != 1:
+        raise RuntimeError(f"Expected exactly one occurrence of {old!r}")
+    return text.replace(old, new, 1)
+
+
 notebook = json.loads(TEMPLATE.read_text(encoding="utf-8"))
 notebook["cells"] = [
     cell
@@ -144,6 +150,7 @@ mask_settings = dedent(
     PREVIOUS_INIT_GRAIN_STRENGTH = 0.035
     PREVIOUS_INIT_BACKGROUND_RGB = OUTPUT_BACKGROUND_RGB
     SAVE_PREVIOUS_INITS = True
+    FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES = True
     MASK_PROMPT_INSTRUCTION = (
         "Arrange the described painted forms densely within the available shaped field, "
         "with natural cropped edges and a calm unpainted surround."
@@ -192,6 +199,8 @@ mask_validation = dedent(
         not 0 <= channel <= 255 for channel in PREVIOUS_INIT_BACKGROUND_RGB
     ):
         raise ValueError("PREVIOUS_INIT_BACKGROUND_RGB must contain three values in [0, 255]")
+    if not isinstance(FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES, bool):
+        raise ValueError("FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES must be boolean")
 
     def trajectory_generation_prompt(prompt):
         base = prompt
@@ -290,6 +299,7 @@ model_cell["source"] = code_blocks(
     from flowmorph_klein.lora import load_flux2_lora
     from flowmorph_klein.trajectory import (
         composite_generated_on_background,
+        interpolate_grayscale_edit_masks,
         prepare_grayscale_edit_mask,
     )
 
@@ -616,6 +626,8 @@ anchor_cell["source"] = lines(
                 "generation_prompt": generation_prompt,
                 "seed": seed,
                 "path": str(output_path),
+                "flowmorph_endpoint_path": str(output_path),
+                "flowmorph_endpoint_role": "final_background_composited_anchor",
                 "raw_generation_path": str(raw_path),
                 "trajectory_index": trajectory["trajectory_index"],
                 "trajectory_member": trajectory["member"],
@@ -737,6 +749,444 @@ contact_cell["source"] = lines(
     })
     """
 )
+
+flowmorph_cell = find_cell(
+    notebook,
+    "from flowmorph_klein.sequence import FlowMorphSequenceSession",
+)
+flowmorph = source(flowmorph_cell)
+flowmorph = replace_once(
+    flowmorph,
+    """release_flux_pipeline()
+
+def usage_payload(response):
+""",
+    """release_flux_pipeline()
+if "FLUX_PIPE" in globals():
+    raise RuntimeError("The standalone inpaint pipeline was not fully released")
+
+def flowmorph_endpoint_path(record):
+    declared = record.get("flowmorph_endpoint_path", record.get("path"))
+    if not declared:
+        raise RuntimeError(f"{record.get('uid', '<unknown>')} has no endpoint image")
+    endpoint_path = Path(declared)
+    if not endpoint_path.is_file():
+        raise FileNotFoundError(f"Missing FlowMorph endpoint: {endpoint_path}")
+    if record.get("kind") == "base":
+        final_path = record.get("path")
+        if (
+            not final_path
+            or endpoint_path.resolve() != Path(final_path).resolve()
+        ):
+            raise RuntimeError(
+                f"{record['uid']} must fit the final composited anchor, not another artifact"
+            )
+        for artifact_key in (
+            "raw_generation_path",
+            "trajectory_source_path",
+            "trajectory_edit_mask_path",
+            "previous_init_path",
+        ):
+            artifact = record.get(artifact_key)
+            if (
+                artifact
+                and endpoint_path.resolve() == Path(artifact).resolve()
+            ):
+                raise RuntimeError(
+                    f"{record['uid']} endpoint incorrectly points at {artifact_key}"
+                )
+        if record.get("inpaint_backend") != "Flux2KleinInpaintPipeline":
+            raise RuntimeError(
+                f"{record['uid']} was not made by the corrected official inpaint backend; "
+                "regenerate the anchors before FlowMorph fitting"
+            )
+        if (
+            record.get("mask_contract", {}).get("continuous_values_preserved")
+            is not True
+        ):
+            raise RuntimeError(
+                f"{record['uid']} does not carry the continuous-mask contract"
+            )
+    with Image.open(endpoint_path) as opened:
+        if opened.size != (IMAGE_WIDTH, IMAGE_HEIGHT):
+            raise RuntimeError(
+                f"{record['uid']} endpoint is {opened.size}, expected "
+                f"{(IMAGE_WIDTH, IMAGE_HEIGHT)}"
+            )
+    return str(endpoint_path)
+
+def flowmorph_edit_mask_path(record):
+    declared = (
+        record.get("flowmorph_edit_mask_path")
+        or record.get("trajectory_edit_mask_path")
+    )
+    if not declared:
+        raise RuntimeError(
+            f"{record.get('uid', '<unknown>')} has no continuous edit mask"
+        )
+    mask_path = Path(declared)
+    if not mask_path.is_file():
+        raise FileNotFoundError(f"Missing FlowMorph edit mask: {mask_path}")
+    return mask_path
+
+def write_interpolated_flowmorph_mask(left, right, alpha, output_path):
+    with Image.open(flowmorph_edit_mask_path(left)) as opened:
+        source_mask = opened.convert("L")
+    with Image.open(flowmorph_edit_mask_path(right)) as opened:
+        target_mask = opened.convert("L")
+    interpolated = interpolate_grayscale_edit_masks(
+        source_mask,
+        target_mask,
+        alpha,
+    )
+    if interpolated.size != (IMAGE_WIDTH, IMAGE_HEIGHT):
+        interpolated = interpolated.resize(
+            (IMAGE_WIDTH, IMAGE_HEIGHT),
+            Image.Resampling.LANCZOS,
+        )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    interpolated.save(output_path, format="PNG", compress_level=4)
+    source_mask.close()
+    target_mask.close()
+    interpolated.close()
+    return output_path
+
+def composite_flowmorph_decoded_frame(raw_path, output_path, mask_path):
+    with Image.open(raw_path) as opened:
+        raw_image = opened.convert("RGB")
+    with Image.open(mask_path) as opened:
+        edit_mask = opened.convert("L")
+    final_image = composite_generated_on_background(
+        raw_image,
+        edit_mask,
+        background_rgb=OUTPUT_BACKGROUND_RGB,
+    )
+    output_path = Path(output_path)
+    final_image.save(output_path, format="PNG", compress_level=4)
+    raw_image.close()
+    edit_mask.close()
+    final_image.close()
+    return output_path
+
+for base_record in BASE_RECORDS:
+    flowmorph_endpoint_path(base_record)
+    flowmorph_edit_mask_path(base_record)
+print(
+    "FlowMorph handoff verified: final background-composited anchors are the "
+    "only endpoint images, and every endpoint has a continuous edit mask."
+)
+
+def usage_payload(response):
+""",
+)
+flowmorph = replace_once(
+    flowmorph,
+    '    "conditioning": "piecewise_source_midpoint_target_embeddings",\n',
+    """    "conditioning": "piecewise_source_midpoint_target_embeddings",
+    "base_endpoint_role": "final_background_composited_anchor",
+    "anchor_backend": "Flux2KleinInpaintPipeline",
+    "flowmorph_backend": "Flux2KleinPipeline",
+    "interior_masking": "interpolated_continuous_masks_exact_background",
+    "save_raw_unmasked_frames": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
+""",
+)
+flowmorph = replace_once(
+    flowmorph,
+    '    "input.source_image": str(bootstrap_left["path"]),\n'
+    '    "input.target_image": str(bootstrap_right["path"]),\n',
+    '    "input.source_image": flowmorph_endpoint_path(bootstrap_left),\n'
+    '    "input.target_image": flowmorph_endpoint_path(bootstrap_right),\n',
+)
+flowmorph = replace_once(
+    flowmorph,
+    """SEQUENCE_RUNNER.prepare(resume=session_resume)
+SEQUENCE_SESSION = FlowMorphSequenceSession(
+""",
+    """SEQUENCE_RUNNER.prepare(resume=session_resume)
+if type(SEQUENCE_RUNNER.pipeline).__name__ != "Flux2KleinPipeline":
+    raise RuntimeError(
+        "FlowMorph must use the ordinary differentiable Flux2KleinPipeline; "
+        f"found {type(SEQUENCE_RUNNER.pipeline).__name__}"
+    )
+SEQUENCE_SESSION = FlowMorphSequenceSession(
+""",
+)
+flowmorph = replace_once(
+    flowmorph,
+    '        "image_sha256": file_sha256(record["path"]),\n',
+    '        "image_sha256": file_sha256(flowmorph_endpoint_path(record)),\n',
+)
+flowmorph = replace_once(
+    flowmorph,
+    """        record["uid"]: (
+            record["path"],
+            SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
+        )
+""",
+    """        record["uid"]: (
+            flowmorph_endpoint_path(record),
+            SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
+        )
+""",
+)
+flowmorph = replace_once(
+    flowmorph,
+    """    test_output_paths = [
+        test_directory / f"alpha_{alpha:.4f}.png"
+        for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS
+    ]
+    SEQUENCE_SESSION.decode_frames_to_paths(test_frames, test_output_paths)
+""",
+    """    test_output_paths = [
+        test_directory / f"alpha_{alpha:.4f}.png"
+        for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS
+    ]
+    test_mask_directory = test_directory / "interpolated_masks"
+    test_raw_directory = test_directory / "raw_unmasked"
+    test_mask_paths = [
+        write_interpolated_flowmorph_mask(
+            test_left,
+            test_right,
+            alpha,
+            test_mask_directory / f"alpha_{alpha:.4f}.png",
+        )
+        for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS
+    ]
+    test_decode_paths = test_output_paths
+    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES:
+        test_raw_directory.mkdir(parents=True, exist_ok=True)
+        test_decode_paths = [
+            test_raw_directory / path.name
+            for path in test_output_paths
+        ]
+    SEQUENCE_SESSION.decode_frames_to_paths(test_frames, test_decode_paths)
+    for raw_path, output_path, mask_path in zip(
+        test_decode_paths,
+        test_output_paths,
+        test_mask_paths,
+        strict=True,
+    ):
+        composite_flowmorph_decoded_frame(raw_path, output_path, mask_path)
+""",
+)
+flowmorph = replace_once(
+    flowmorph,
+    '        "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,\n'
+    '        "images": {\n',
+    """        "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
+        "interior_masking": "interpolated continuous masks + exact background",
+        "raw_unmasked_frames_saved": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
+        "images": {
+""",
+)
+flowmorph_cell["source"] = flowmorph.splitlines(keepends=True)
+
+recursive_cell = find_cell(
+    notebook,
+    "for round_number, round_spec in enumerate(FLOWMORPH_ROUND_SPECS",
+)
+recursive = source(recursive_cell)
+recursive = replace_once(
+    recursive,
+    """    proposal_directory = round_directory / "proposals"
+    for directory in (round_directory, image_directory, proposal_directory):
+        directory.mkdir(parents=True, exist_ok=True)
+""",
+    """    proposal_directory = round_directory / "proposals"
+    mask_directory = round_directory / "interpolated_masks"
+    raw_directory = round_directory / "raw_unmasked"
+    for directory in (
+        round_directory,
+        image_directory,
+        proposal_directory,
+        mask_directory,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES:
+        raw_directory.mkdir(parents=True, exist_ok=True)
+""",
+)
+recursive = replace_once(
+    recursive,
+    """            frame_records.append({
+                "uid": uid,
+                "fraction": fraction,
+                "output_path": image_directory / f"{uid}.png",
+            })
+""",
+    """            output_path = image_directory / f"{uid}.png"
+            mask_path = write_interpolated_flowmorph_mask(
+                left,
+                right,
+                fraction,
+                mask_directory / f"{uid}.png",
+            )
+            frame_records.append({
+                "uid": uid,
+                "fraction": fraction,
+                "output_path": output_path,
+                "mask_path": mask_path,
+                "raw_output_path": (
+                    raw_directory / f"{uid}.png"
+                    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
+                    else output_path
+                ),
+            })
+""",
+)
+recursive = replace_once(
+    recursive,
+    '            "left_image_sha256": file_sha256(left["path"]),\n',
+    """            "left_image_sha256": file_sha256(flowmorph_endpoint_path(left)),
+            "left_mask_sha256": file_sha256(flowmorph_edit_mask_path(left)),
+""",
+)
+recursive = replace_once(
+    recursive,
+    '            "right_image_sha256": file_sha256(right["path"]),\n',
+    """            "right_image_sha256": file_sha256(flowmorph_endpoint_path(right)),
+            "right_mask_sha256": file_sha256(flowmorph_edit_mask_path(right)),
+""",
+)
+recursive = replace_once(
+    recursive,
+    '            "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,\n',
+    """            "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
+            "interior_masking": "interpolated_continuous_masks_exact_background",
+            "save_raw_unmasked_frames": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
+""",
+)
+recursive = replace_once(
+    recursive,
+    """        if completion_path.is_file() and all(item["output_path"].is_file() for item in frame_records):
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            completed = completion.get("pair_fingerprint") == pair_fingerprint
+""",
+    """        expected_frame_artifacts = [
+            artifact
+            for item in frame_records
+            for artifact in (
+                item["output_path"],
+                item["mask_path"],
+                *(
+                    [item["raw_output_path"]]
+                    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
+                    else []
+                ),
+            )
+        ]
+        if completion_path.is_file() and all(
+            artifact.is_file() for artifact in expected_frame_artifacts
+        ):
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            completed = completion.get("pair_fingerprint") == pair_fingerprint
+""",
+)
+recursive = replace_once(
+    recursive,
+    """        record["uid"]: (
+            record["path"],
+            SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
+        )
+""",
+    """        record["uid"]: (
+            flowmorph_endpoint_path(record),
+            SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
+        )
+""",
+)
+recursive = replace_once(
+    recursive,
+    """            chunk_frames.extend(rendered)
+            chunk_paths.extend(item["output_path"] for item in job["frame_records"])
+""",
+    """            chunk_frames.extend(rendered)
+            chunk_paths.extend(
+                item["raw_output_path"] for item in job["frame_records"]
+            )
+""",
+)
+recursive = replace_once(
+    recursive,
+    """        SEQUENCE_SESSION.decode_frames_to_paths(chunk_frames, chunk_paths)
+        print(f"Decoded with batch_size={SEQUENCE_SESSION.last_decode_batch_size}")
+        for job in chunk_jobs:
+""",
+    """        SEQUENCE_SESSION.decode_frames_to_paths(chunk_frames, chunk_paths)
+        print(f"Decoded with batch_size={SEQUENCE_SESSION.last_decode_batch_size}")
+        for job in chunk_jobs:
+            for frame_record in job["frame_records"]:
+                composite_flowmorph_decoded_frame(
+                    frame_record["raw_output_path"],
+                    frame_record["output_path"],
+                    frame_record["mask_path"],
+                )
+        for job in chunk_jobs:
+""",
+)
+recursive = replace_once(
+    recursive,
+    """                    "image": str(item["output_path"]),
+                    "shared_prompt": job["proposal"].prompt,
+""",
+    """                    "image": str(item["output_path"]),
+                    "raw_unmasked_image": (
+                        str(item["raw_output_path"])
+                        if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
+                        else None
+                    ),
+                    "interpolated_edit_mask": str(item["mask_path"]),
+                    "shared_prompt": job["proposal"].prompt,
+""",
+)
+recursive = replace_once(
+    recursive,
+    '            "latest_png": str(chunk_paths[-1]),\n',
+    """            "latest_png": str(
+                chunk_jobs[-1]["frame_records"][-1]["output_path"]
+            ),
+            "latest_raw_unmasked_png": (
+                str(chunk_paths[-1])
+                if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
+                else None
+            ),
+""",
+)
+recursive = replace_once(
+    recursive,
+    """                "path": str(frame_record["output_path"]),
+                "proposal_path": str(job["proposal_path"]),
+""",
+    """                "path": str(frame_record["output_path"]),
+                "flowmorph_endpoint_path": str(frame_record["output_path"]),
+                "flowmorph_endpoint_role": "masked_flowmorph_midpoint",
+                "flowmorph_edit_mask_path": str(frame_record["mask_path"]),
+                "raw_flowmorph_path": (
+                    str(frame_record["raw_output_path"])
+                    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
+                    else None
+                ),
+                "proposal_path": str(job["proposal_path"]),
+""",
+)
+recursive = replace_once(
+    recursive,
+    '        "one_shared_prompt_per_gap": True,\n',
+    """        "one_shared_prompt_per_gap": True,
+        "interior_masking": "interpolated continuous masks + exact background",
+        "raw_unmasked_frames_saved": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
+""",
+)
+recursive = replace_once(
+    recursive,
+    '    "one_openai_prompt_per_gap": True,\n',
+    """    "one_openai_prompt_per_gap": True,
+    "interior_masking": "interpolated continuous masks + exact background",
+    "raw_unmasked_frames_saved": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
+""",
+)
+recursive_cell["source"] = recursive.splitlines(keepends=True)
 
 assembly_markdown = find_cell(notebook, "## 10. Assemble, preview")
 assembly_markdown["source"] = lines(

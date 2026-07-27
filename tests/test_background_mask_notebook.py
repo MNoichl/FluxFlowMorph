@@ -78,6 +78,48 @@ def test_background_mask_notebook_uses_weak_previous_inpaint_source() -> None:
     assert "image=mask_source" not in code
 
 
+def test_background_mask_notebook_hands_final_anchors_to_flowmorph() -> None:
+    _, code = _load_notebook()
+    assert '"flowmorph_endpoint_path": str(output_path)' in code
+    assert (
+        '"flowmorph_endpoint_role": "final_background_composited_anchor"'
+        in code
+    )
+    assert "def flowmorph_endpoint_path(record):" in code
+    assert "flowmorph_endpoint_path(bootstrap_left)" in code
+    assert "flowmorph_endpoint_path(bootstrap_right)" in code
+    assert "file_sha256(flowmorph_endpoint_path(record))" in code
+    assert "flowmorph_endpoint_path(record)," in code
+    assert '"raw_generation_path",' in code
+    assert '"trajectory_edit_mask_path",' in code
+    assert (
+        'type(SEQUENCE_RUNNER.pipeline).__name__ != "Flux2KleinPipeline"'
+        in code
+    )
+    assert code.index("release_flux_pipeline()") < code.index(
+        "SEQUENCE_RUNNER = FlowMorphRunner.from_config("
+    )
+
+
+def test_background_mask_notebook_masks_flowmorph_interior_frames() -> None:
+    _, code = _load_notebook()
+    assert "FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES = True" in code
+    assert "def flowmorph_edit_mask_path(record):" in code
+    assert "def write_interpolated_flowmorph_mask(" in code
+    assert "interpolate_grayscale_edit_masks(" in code
+    assert "def composite_flowmorph_decoded_frame(" in code
+    assert "composite_flowmorph_decoded_frame(" in code
+    assert '"flowmorph_edit_mask_path": str(frame_record["mask_path"])' in code
+    assert '"flowmorph_endpoint_role": "masked_flowmorph_midpoint"' in code
+    assert (
+        '"interior_masking": '
+        '"interpolated_continuous_masks_exact_background"'
+        in code
+    )
+    assert '"raw_flowmorph_path": (' in code
+    assert 'raw_directory = round_directory / "raw_unmasked"' in code
+
+
 def test_background_mask_notebook_has_github_colab_link() -> None:
     notebook, _ = _load_notebook()
     first_cell = "".join(notebook["cells"][0]["source"])

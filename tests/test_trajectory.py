@@ -13,6 +13,7 @@ from flowmorph_klein.trajectory import (
     TrajectoryArchiveError,
     composite_generated_activity,
     composite_generated_on_background,
+    interpolate_grayscale_edit_masks,
     list_image_members,
     make_background_edit_mask,
     make_strong_trajectory_reference,
@@ -259,6 +260,41 @@ def test_background_composite_uses_white_mask_for_generated_content() -> None:
     array = np.asarray(result)
     assert np.array_equal(array[:, :4], np.full((4, 4, 3), (238, 233, 218)))
     assert np.array_equal(array[:, 4:], np.full((4, 4, 3), (200, 30, 20)))
+
+
+def test_interpolate_grayscale_edit_masks_preserves_continuous_values() -> None:
+    source = Image.fromarray(
+        np.array([[0, 64], [128, 255]], dtype=np.uint8),
+        mode="L",
+    )
+    target = Image.fromarray(
+        np.array([[255, 128], [64, 0]], dtype=np.uint8),
+        mode="L",
+    )
+
+    midpoint = interpolate_grayscale_edit_masks(source, target, 0.5)
+
+    assert midpoint.mode == "L"
+    assert np.array_equal(
+        np.asarray(midpoint),
+        np.array([[128, 96], [96, 128]], dtype=np.uint8),
+    )
+    assert np.array_equal(
+        np.asarray(interpolate_grayscale_edit_masks(source, target, 0.0)),
+        np.asarray(source),
+    )
+    assert np.array_equal(
+        np.asarray(interpolate_grayscale_edit_masks(source, target, 1.0)),
+        np.asarray(target),
+    )
+
+
+def test_interpolate_grayscale_edit_masks_validates_alpha() -> None:
+    mask = Image.new("L", (2, 2), 255)
+    with pytest.raises(ValueError, match="alpha"):
+        interpolate_grayscale_edit_masks(mask, mask, -0.01)
+    with pytest.raises(ValueError, match="alpha"):
+        interpolate_grayscale_edit_masks(mask, mask, 1.01)
 
 
 class _FakeImageProcessor:
