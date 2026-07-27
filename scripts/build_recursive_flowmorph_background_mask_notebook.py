@@ -293,7 +293,7 @@ mask_validation = dedent(
         raise ValueError("MASK_PROMPT_REWRITE_MAX_OUTPUT_TOKENS must be at least 1000")
     if not 1 <= MASK_PROMPT_REWRITE_MAX_ATTEMPTS <= 10:
         raise ValueError("MASK_PROMPT_REWRITE_MAX_ATTEMPTS must lie in [1, 10]")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", MASK_PROMPT_CACHE_SUBDIRECTORY):
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", MASK_PROMPT_CACHE_SUBDIRECTORY):
         raise ValueError(
             "MASK_PROMPT_CACHE_SUBDIRECTORY may contain letters, numbers, underscores, and hyphens"
         )

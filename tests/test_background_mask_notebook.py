@@ -132,6 +132,11 @@ def test_background_mask_notebook_rewrites_each_prompt_from_mask_geometry() -> N
     assert "MASK_PROMPT_REWRITE_MAX_OUTPUT_TOKENS = 6000" in code
     assert "MASK_PROMPT_REWRITE_MAX_ATTEMPTS = 3" in code
     assert "MASK_PROMPT_REWRITE_DISPLAY_MASK = True" in code
+    assert (
+        're.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", '
+        "MASK_PROMPT_CACHE_SUBDIRECTORY)"
+        in code
+    )
     assert "class MaskPromptPlan(BaseModel):" in code
     assert "MASK_PROMPT_SYSTEM_PROMPT" in code
     assert "lobes, islands," in code
