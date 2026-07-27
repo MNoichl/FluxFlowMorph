@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import pprint
 from pathlib import Path
 from textwrap import dedent
 
@@ -54,6 +55,63 @@ def replace_between(text: str, start: str, end: str, replacement: str) -> str:
     start_index = text.index(start)
     end_index = text.index(end, start_index)
     return text[:start_index] + replacement + text[end_index:]
+
+
+# These are the user-edited prompts recovered from the last executed notebook.
+# Keep them here so rebuilding the notebook cannot silently restore the sparse
+# prompts inherited from the trajectory-init template.
+PRESERVED_BASE_STAGES = [
+    {
+        "id": "01_cosmos_physics",
+        "science": "Astronomy & Physics",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of the physical cosmos: a flowing garland of night-blooming moonflowers, evening primrose, and star-shaped blossoms spreading across the whole panel, comet-vines and tendrils curling into every corner, sun, moon, and scattered stars set as small emblems among the leaves, a delicate armillary sphere and a prism woven into the scrollwork. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, chalky indigo-blue and pale gold, antique and weathered.",
+    },
+    {
+        "id": "02_chemistry_materials",
+        "science": "Chemistry & Materials",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of transformation: flowering vines and scrolling acanthus climbing the full height of the panel around slender alembics and a pear-shaped retort, crystalline buds and mineral clusters sprouting all along the stems, sulphur-yellow blossoms and looping distillation coils threading the whole field, a small glowing crucible set among them. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, warm amber and soft verdigris, antique and weathered.",
+    },
+    {
+        "id": "03_geosciences",
+        "science": "Geosciences & Earth",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of earth and sky: a dense braid of fern, moss, and ivy filling the panel, banded agates and small shells clustered along the swags, a terrestrial globe wreathed in leaves at the crook of the scroll, cloud and wave motifs rippling through the ornament from edge to edge. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, cool slate-blue and mineral green, antique and weathered.",
+    },
+    {
+        "id": "04_ecology_evolution",
+        "science": "Ecology & Evolution",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of life and deep time: a teeming all-over garland of wildflowers, grasses, and ferns alive with insects, snails, and small birds, spiral ammonites curling as volutes through the scrollwork, a branching tree-of-life motif spreading its limbs across the field, chrysalises and seed-pods tucked among the blooms. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, mossy green and fossil-ochre, antique and weathered.",
+    },
+    {
+        "id": "05_botany",
+        "science": "Botany & Plant Science",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of the plant kingdom: a rich, full festoon of tulips, roses, poppies, and fruiting branches wound with wheat and vine across the whole panel, herbarium sprigs with small labels threaded through the scroll, a comb of honey and a magnifier nestled among the abundant blooms. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, verdant green with rose-red and gold, antique and weathered.",
+    },
+    {
+        "id": "06_genetics_cell",
+        "science": "Genetics, Cell & Molecular Biology",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of heredity and the cell: pea-pod tendrils twisting into paired helical scrolls that spread across the panel, split pomegranates set as seeded medallions among the leaves, a honeycomb lattice running as a border, rosettes of clustered berries repeating like cells through the ornament. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, pale pearl-rose and warm ochre, antique and weathered.",
+    },
+    {
+        "id": "07_medicine_body",
+        "science": "Medicine & the Body",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of healing: a full garland of medicinal poppy, foxglove, and willow winding across the panel around a serpent-and-staff entwined with flowering vines, an anatomical heart set as a small medallion in the scroll, apothecary phials and a quiet memento-mori skull half-hidden among the abundant leaves. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, soft carmine and ivory with herb-green, antique and weathered.",
+    },
+    {
+        "id": "08_neuroscience_mind",
+        "science": "Neuroscience & Mind",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of the mind: branching dendrite-vines and coral spreading in a dense all-over tracery across the panel, a brain worked as an ornate medallion at the heart of the scroll, moths and songbirds perched throughout the tendrils, a small labyrinth and a pendulum woven into the ornament. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, chalky blue-violet and dim silver, antique and weathered.",
+    },
+    {
+        "id": "09_philosophy_society",
+        "science": "Philosophy & Social Sciences",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of thought and society: a flowing garland of laurel and olive filling the panel around a cartouche of an owl perched on books beside an hourglass, scales of justice and a globe woven into the scrollwork, Platonic solids set as ornamental bosses repeating among the leaves. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, warm sepia and old gold, antique and weathered.",
+    },
+    {
+        "id": "10_computation_math",
+        "science": "Computation & Mathematics",
+        "prompt": "RIJKSOIL, a floral fresco wall ornament of pure form: a dense interlacing arabesque lattice blooming into stylized geometric flowers across the whole panel, an orrery and interlocking clock gears set within the scroll, compasses and nested Platonic solids repeating through the ornament, a spiral of stars winding through it to close the circle. Painted as a floral fresco wall ornament on aged lime plaster, light airy brushstrokes and delicate translucent washes, a richly ornamental composition of flowing garlands, festoons, and scrolling acanthus spreading to fill the whole panel, densely distributed yet weightless, in the manner of Renaissance grottesche and Baroque wall painting, chalky faded pigments and fine hairline cracks, cool silver-grey and brass turning toward indigo, antique and weathered.",
+    },
+]
 
 
 notebook = json.loads(TEMPLATE.read_text(encoding="utf-8"))
@@ -120,6 +178,14 @@ settings = source(settings_cell).replace(
     "IMAGE_INFERENCE_STEPS = 28",
     "IMAGE_INFERENCE_STEPS = 50",
     1,
+).replace(
+    "IMAGE_GUIDANCE_SCALE = 4.0",
+    "IMAGE_GUIDANCE_SCALE = 7.0",
+    1,
+).replace(
+    "IMAGE_LORA_SCALE = 1.0",
+    "IMAGE_LORA_SCALE = 1.2",
+    1,
 )
 mask_settings = dedent(
     """
@@ -165,6 +231,17 @@ settings = replace_between(
     mask_settings,
 )
 settings_cell["source"] = settings.splitlines(keepends=True)
+
+prompts_cell = find_cell(notebook, "SCIENCE_FRESCOES = [")
+prompts_cell["source"] = (
+    "BASE_STAGES = "
+    + pprint.pformat(
+        PRESERVED_BASE_STAGES,
+        sort_dicts=False,
+        width=100,
+    )
+    + "\n"
+).splitlines(keepends=True)
 
 validation_cell = find_cell(notebook, "def trajectory_generation_prompt")
 validation = source(validation_cell)
@@ -237,6 +314,19 @@ validation = validation.replace(
     "TRAJECTORY_FRAME_OFFSET",
     "MASK_FRAME_OFFSET",
 )
+for active_check in (
+    """if FLOWMORPH_FIT_LORA_SCALE != IMAGE_LORA_SCALE:
+    raise ValueError("FlowMorph fit LoRA scale must match IMAGE_LORA_SCALE")""",
+    """if FLOWMORPH_RENDER_LORA_SCALE != IMAGE_LORA_SCALE:
+    raise ValueError("FlowMorph render LoRA scale must match IMAGE_LORA_SCALE")""",
+    """if FLOWMORPH_GUIDANCE_SCALE != IMAGE_GUIDANCE_SCALE:
+    raise ValueError("FlowMorph guidance must match IMAGE_GUIDANCE_SCALE")""",
+):
+    validation = validation.replace(
+        active_check,
+        "\n".join(f"# {line}" for line in active_check.splitlines()),
+        1,
+    )
 validation_cell["source"] = validation.splitlines(keepends=True)
 
 staging_cell = find_cell(notebook, "TRAJECTORY_DRIVE_ARCHIVE")

@@ -23,6 +23,22 @@ def _load_notebook() -> tuple[dict, str]:
     return notebook, code
 
 
+def _literal_assignment(notebook: dict, name: str):
+    for cell in notebook["cells"]:
+        if cell["cell_type"] != "code":
+            continue
+        tree = ast.parse("".join(cell.get("source", [])))
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            ):
+                return ast.literal_eval(node.value)
+    raise AssertionError(f"Notebook assignment not found: {name}")
+
+
 def test_background_mask_notebook_is_parseable() -> None:
     notebook, _ = _load_notebook()
     assert notebook["nbformat"] == 4
@@ -89,12 +105,23 @@ def test_background_mask_notebook_uses_weak_previous_latent_img2img() -> None:
 
 
 def test_background_mask_notebook_removes_sparse_prompt_regression() -> None:
-    _, code = _load_notebook()
+    notebook, code = _load_notebook()
+    assert "IMAGE_GUIDANCE_SCALE = 7.0" in code
+    assert "IMAGE_LORA_SCALE = 1.2" in code
     assert "MASK_REMOVE_SPARSE_PROMPT_LANGUAGE = True" in code
     assert '"soft translucent washes": "opaque layered oil paint"' in code
     assert '"chalky faded pigments": "deep luminous oil pigments"' in code
     assert "complete full-frame image before masking" in code
     assert "large unpainted areas" in code
+    stages = _literal_assignment(notebook, "BASE_STAGES")
+    prompts = "\n".join(stage["prompt"] for stage in stages)
+    assert "a flowing garland of night-blooming moonflowers" in prompts
+    assert "a full garland of medicinal poppy, foxglove, and willow" in prompts
+    assert "a dense interlacing arabesque lattice" in prompts
+    assert "a loose spray of night-blooming moonflowers" not in prompts
+    assert "# if FLOWMORPH_FIT_LORA_SCALE != IMAGE_LORA_SCALE:" in code
+    assert "# if FLOWMORPH_RENDER_LORA_SCALE != IMAGE_LORA_SCALE:" in code
+    assert "# if FLOWMORPH_GUIDANCE_SCALE != IMAGE_GUIDANCE_SCALE:" in code
 
 
 def test_background_mask_notebook_does_not_reapply_masks_in_flowmorph() -> None:
