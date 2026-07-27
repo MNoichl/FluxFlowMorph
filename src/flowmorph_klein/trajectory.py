@@ -451,30 +451,6 @@ def composite_generated_on_background(
     return Image.composite(output, background, resized_mask)
 
 
-def interpolate_grayscale_edit_masks(
-    source_mask: Image.Image,
-    target_mask: Image.Image,
-    alpha: float,
-) -> Image.Image:
-    """Linearly interpolate continuous white-edit/black-protect masks."""
-
-    if not 0.0 <= alpha <= 1.0:
-        raise ValueError("mask interpolation alpha must lie in [0, 1]")
-    source = source_mask.convert("L")
-    target = target_mask.convert("L")
-    if target.size != source.size:
-        target = target.resize(source.size, Image.Resampling.LANCZOS)
-    source_array = np.asarray(source, dtype=np.float32)
-    target_array = np.asarray(target, dtype=np.float32)
-    interpolated = (
-        (1.0 - float(alpha)) * source_array + float(alpha) * target_array
-    )
-    return Image.fromarray(
-        np.clip(np.round(interpolated), 0.0, 255.0).astype(np.uint8),
-        mode="L",
-    )
-
-
 def prepare_flux2_klein_masked_inpaint_inputs(
     pipeline: Any,
     edit_mask: Image.Image,
@@ -728,7 +704,6 @@ __all__ = [
     "TrajectoryArchiveError",
     "composite_generated_activity",
     "composite_generated_on_background",
-    "interpolate_grayscale_edit_masks",
     "list_image_members",
     "make_background_edit_mask",
     "make_strong_trajectory_reference",

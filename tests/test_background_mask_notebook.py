@@ -44,24 +44,31 @@ def test_background_mask_notebook_loads_continuous_masks() -> None:
     assert "MASK_FEATHER = 0.0" in code
     assert "prepare_grayscale_edit_mask(" in code
     assert "make_background_edit_mask(" not in code
-    assert "do_binarize=False" in code
-    assert "pipeline.mask_processor.config.do_binarize" in code
     assert '"continuous_values_preserved": True' in code
     assert '"mask_polarity": "white_editable_black_protected"' in code
 
 
-def test_background_mask_notebook_uses_official_continuous_inpaint() -> None:
+def test_background_mask_notebook_generates_before_masking() -> None:
     _, code = _load_notebook()
-    assert "Flux2KleinInpaintPipeline.from_pretrained(" in code
-    assert "mask_image=mask_result.mask" in code
-    assert "image=inpaint_source" in code
+    assert "Flux2KleinPipeline.from_pretrained(" in code
+    assert "Flux2KleinInpaintPipeline" not in code
+    assert "mask_image=mask_result.mask" not in code
+    assert "image=inpaint_source" not in code
     assert "prepare_flux2_klein_masked_inpaint_inputs(" not in code
     assert "callback_on_step_end=masked_inputs.callback_on_step_end" not in code
-    assert "MASK_DENOISE_STRENGTH = 1.0" in code
+    assert "IMAGE_INFERENCE_STEPS = 50" in code
     assert "MASK_PREVIOUS_INIT_DENOISE_STRENGTH = 0.85" in code
+    assert '"mask_used_by_model": False' in code
+    assert (
+        '"mask_application": "post_decode_continuous_alpha_composite"'
+        in code
+    )
+    assert code.index("raw_image = result.images[0].convert") < code.index(
+        "final_image = composite_generated_on_background("
+    )
 
 
-def test_background_mask_notebook_uses_weak_previous_inpaint_source() -> None:
+def test_background_mask_notebook_uses_weak_previous_latent_img2img() -> None:
     _, code = _load_notebook()
     assert "PREVIOUS_INIT_ENABLED = True" in code
     assert "PREVIOUS_INIT_BLEND = 0.12" in code
@@ -70,7 +77,10 @@ def test_background_mask_notebook_uses_weak_previous_inpaint_source() -> None:
     assert "make_soft_reference(" in code
     assert "composite_generated_on_background(" in code
     assert "if init_image is None:" in code
-    assert "else MASK_PREVIOUS_INIT_DENOISE_STRENGTH" in code
+    assert "prepare_flux2_klein_img2img_inputs(" in code
+    assert "strength=MASK_PREVIOUS_INIT_DENOISE_STRENGTH" in code
+    assert "sigmas=list(generation_inputs.sigmas)" in code
+    assert "latents=generation_inputs.latents" in code
     assert "previous = image.copy()" in code
     assert '"previous_init_used": previous_init is not None' in code
     assert '"source_mask_used_as_latent_init": False' in code
@@ -78,46 +88,23 @@ def test_background_mask_notebook_uses_weak_previous_inpaint_source() -> None:
     assert "image=mask_source" not in code
 
 
-def test_background_mask_notebook_hands_final_anchors_to_flowmorph() -> None:
+def test_background_mask_notebook_removes_sparse_prompt_regression() -> None:
     _, code = _load_notebook()
-    assert '"flowmorph_endpoint_path": str(output_path)' in code
-    assert (
-        '"flowmorph_endpoint_role": "final_background_composited_anchor"'
-        in code
-    )
-    assert "def flowmorph_endpoint_path(record):" in code
-    assert "flowmorph_endpoint_path(bootstrap_left)" in code
-    assert "flowmorph_endpoint_path(bootstrap_right)" in code
-    assert "file_sha256(flowmorph_endpoint_path(record))" in code
-    assert "flowmorph_endpoint_path(record)," in code
-    assert '"raw_generation_path",' in code
-    assert '"trajectory_edit_mask_path",' in code
-    assert (
-        'type(SEQUENCE_RUNNER.pipeline).__name__ != "Flux2KleinPipeline"'
-        in code
-    )
-    assert code.index("release_flux_pipeline()") < code.index(
-        "SEQUENCE_RUNNER = FlowMorphRunner.from_config("
-    )
+    assert "MASK_REMOVE_SPARSE_PROMPT_LANGUAGE = True" in code
+    assert '"soft translucent washes": "opaque layered oil paint"' in code
+    assert '"chalky faded pigments": "deep luminous oil pigments"' in code
+    assert "complete full-frame image before masking" in code
+    assert "large unpainted areas" in code
 
 
-def test_background_mask_notebook_masks_flowmorph_interior_frames() -> None:
+def test_background_mask_notebook_does_not_reapply_masks_in_flowmorph() -> None:
     _, code = _load_notebook()
-    assert "FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES = True" in code
-    assert "def flowmorph_edit_mask_path(record):" in code
-    assert "def write_interpolated_flowmorph_mask(" in code
-    assert "interpolate_grayscale_edit_masks(" in code
-    assert "def composite_flowmorph_decoded_frame(" in code
-    assert "composite_flowmorph_decoded_frame(" in code
-    assert '"flowmorph_edit_mask_path": str(frame_record["mask_path"])' in code
-    assert '"flowmorph_endpoint_role": "masked_flowmorph_midpoint"' in code
-    assert (
-        '"interior_masking": '
-        '"interpolated_continuous_masks_exact_background"'
-        in code
-    )
-    assert '"raw_flowmorph_path": (' in code
-    assert 'raw_directory = round_directory / "raw_unmasked"' in code
+    assert "interpolate_grayscale_edit_masks" not in code
+    assert "flowmorph_edit_mask_path" not in code
+    assert "write_interpolated_flowmorph_mask" not in code
+    assert "composite_flowmorph_decoded_frame" not in code
+    assert "interior_masking" not in code
+    assert 'raw_directory = round_directory / "raw_unmasked"' not in code
 
 
 def test_background_mask_notebook_has_github_colab_link() -> None:

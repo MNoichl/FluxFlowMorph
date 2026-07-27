@@ -56,12 +56,6 @@ def replace_between(text: str, start: str, end: str, replacement: str) -> str:
     return text[:start_index] + replacement + text[end_index:]
 
 
-def replace_once(text: str, old: str, new: str) -> str:
-    if text.count(old) != 1:
-        raise RuntimeError(f"Expected exactly one occurrence of {old!r}")
-    return text.replace(old, new, 1)
-
-
 notebook = json.loads(TEMPLATE.read_text(encoding="utf-8"))
 notebook["cells"] = [
     cell
@@ -79,7 +73,6 @@ for index, cell in enumerate(notebook["cells"]):
                 '"repository_commit": project_com mit,',
                 '"repository_commit": project_commit,',
             )
-            .replace("Flux2KleinPipeline", "Flux2KleinInpaintPipeline")
             .splitlines(keepends=True)
         )
 
@@ -94,12 +87,12 @@ notebook["cells"][0]["source"] = lines(
     - black is protected background;
     - white is fully editable;
     - every gray value retains proportional influence without binarization;
-    - anchor 1 begins independently;
-    - the pinned official `Flux2KleinInpaintPipeline` performs mask-aware generation;
+    - anchor 1 is generated normally with the high-quality `Flux2KleinPipeline`;
     - every later anchor uses a weak blurred, background-blended, grained version
-      of the previous generated anchor as the inpainting source image;
-    - protected regions remain locked and are composited to `OUTPUT_BACKGROUND_RGB`;
-    - the pipeline's default mask binarization is explicitly disabled so gradients survive.
+      of the previous generated anchor through conventional latent img2img;
+    - the mask never enters the model as an image or conditioning signal;
+    - after decoding, the continuous mask reveals the generated painting over
+      `OUTPUT_BACKGROUND_RGB`.
 
     Run the trial first to verify mask polarity and gradients before generating anchors.
     """
@@ -110,7 +103,8 @@ notebook["cells"][1]["source"] = lines(
 
     Point the mask ZIP settings at naturally ordered black/white or grayscale files.
     Values are preserved by default. `OUTPUT_BACKGROUND_RGB` is the flat color written
-    outside the editable mask. Previous-anchor initialization affects only editable areas.
+    outside the editable mask. The model first creates a complete painting; masking is a
+    separate post-generation operation, so a blank canvas cannot suppress the result.
     """
 )
 
@@ -121,6 +115,10 @@ settings_cell = find_cell(
 settings = source(settings_cell).replace(
     'PROJECT_NAME = "science_path_trajectory_flowmorph"',
     'PROJECT_NAME = "science_path_trajectory_background_mask"',
+    1,
+).replace(
+    "IMAGE_INFERENCE_STEPS = 28",
+    "IMAGE_INFERENCE_STEPS = 50",
     1,
 )
 mask_settings = dedent(
@@ -140,9 +138,8 @@ mask_settings = dedent(
     MASK_MIN_EDITABLE_FRACTION = 0.001
     MASK_MAX_EDITABLE_FRACTION = 1.0
 
-    # Generation and weak sequential continuity.
+    # Full-frame generation, post-generation masking, and weak sequential continuity.
     OUTPUT_BACKGROUND_RGB = (238, 233, 218)
-    MASK_DENOISE_STRENGTH = 1.0  # First anchor/trial: full repaint from the mask.
     MASK_PREVIOUS_INIT_DENOISE_STRENGTH = 0.85
     PREVIOUS_INIT_ENABLED = True
     PREVIOUS_INIT_BLEND = 0.12
@@ -150,10 +147,12 @@ mask_settings = dedent(
     PREVIOUS_INIT_GRAIN_STRENGTH = 0.035
     PREVIOUS_INIT_BACKGROUND_RGB = OUTPUT_BACKGROUND_RGB
     SAVE_PREVIOUS_INITS = True
-    FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES = True
+    MASK_REMOVE_SPARSE_PROMPT_LANGUAGE = True
     MASK_PROMPT_INSTRUCTION = (
-        "Arrange the described painted forms densely within the available shaped field, "
-        "with natural cropped edges and a calm unpainted surround."
+        "Render a complete full-frame image before masking, using large connected forms, "
+        "opaque layered oil paint, deep luminous pigments, substantial texture, and rich "
+        "chiaroscuro throughout the canvas. Avoid faint line drawing, translucent washes, "
+        "and large unpainted areas; the external grayscale mask creates the final open background."
     )
     TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True
 
@@ -183,8 +182,6 @@ mask_validation = dedent(
         raise ValueError("MASK_FEATHER cannot be negative")
     if not 0 <= MASK_MIN_EDITABLE_FRACTION < MASK_MAX_EDITABLE_FRACTION <= 1:
         raise ValueError("Editable-fraction limits must satisfy 0 <= min < max <= 1")
-    if not 0 < MASK_DENOISE_STRENGTH <= 1:
-        raise ValueError("MASK_DENOISE_STRENGTH must lie in (0, 1]")
     if not 0 < MASK_PREVIOUS_INIT_DENOISE_STRENGTH <= 1:
         raise ValueError(
             "MASK_PREVIOUS_INIT_DENOISE_STRENGTH must lie in (0, 1]"
@@ -199,13 +196,31 @@ mask_validation = dedent(
         not 0 <= channel <= 255 for channel in PREVIOUS_INIT_BACKGROUND_RGB
     ):
         raise ValueError("PREVIOUS_INIT_BACKGROUND_RGB must contain three values in [0, 255]")
-    if not isinstance(FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES, bool):
-        raise ValueError("FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES must be boolean")
 
     def trajectory_generation_prompt(prompt):
         base = prompt
         if TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE:
             base = re.sub(r"\\bsymmetr(?:ical|ically)\\b", "", base, flags=re.IGNORECASE)
+        if MASK_REMOVE_SPARSE_PROMPT_LANGUAGE:
+            replacements = {
+                "soft translucent washes": "opaque layered oil paint",
+                "chalky faded pigments": "deep luminous oil pigments",
+                (
+                    "an asymmetric composition gathered to one side with a few sprigs "
+                    "drifting across otherwise bare plaster and most of the surface left empty"
+                ): (
+                    "a richly populated asymmetric composition of large connected forms "
+                    "distributed throughout the canvas"
+                ),
+                "otherwise bare plaster": "richly painted plaster",
+                "empty plaster": "painted field",
+                "open plaster": "painted field",
+                "bare wall": "painted wall",
+                "empty wall": "painted wall",
+                "empty space": "painted space",
+            }
+            for old, new in replacements.items():
+                base = base.replace(old, new)
         return " ".join(base.split()) + " " + MASK_PROMPT_INSTRUCTION
     """
 ).lstrip()
@@ -247,32 +262,12 @@ pipeline_setup = model[
     : model.index("if RUN_TRIAL_KEYFRAME:")
 ]
 pipeline_setup = pipeline_setup.replace(
-    "Flux2KleinPipeline",
-    "Flux2KleinInpaintPipeline",
-)
-pipeline_setup = pipeline_setup.replace(
-    "    pipeline.vae.enable_tiling()\n    return pipeline, report\n",
-    """    pipeline.vae.enable_tiling()
-    pipeline.mask_processor = type(pipeline.mask_processor)(
-        vae_scale_factor=pipeline.vae_scale_factor * 2,
-        vae_latent_channels=pipeline.latent_channels,
-        do_normalize=False,
-        do_binarize=False,
-        do_convert_rgb=False,
-        do_convert_grayscale=True,
-    )
-    if pipeline.mask_processor.config.do_binarize:
-        raise RuntimeError("Continuous inpaint masks require do_binarize=False")
-    return pipeline, report
-""",
-)
-pipeline_setup = pipeline_setup.replace(
     'if "FLUX_PIPE" in globals() and globals().get("FLUX_PIPE_LORA_SCALE") != float(IMAGE_LORA_SCALE):\n',
     """if (
     "FLUX_PIPE" in globals()
-    and type(globals()["FLUX_PIPE"]).__name__ != "Flux2KleinInpaintPipeline"
+    and type(globals()["FLUX_PIPE"]).__name__ != "Flux2KleinPipeline"
 ):
-    print("Mask backend changed to the official inpaint pipeline; rebuilding.")
+    print("Anchor backend changed to the standard generation pipeline; rebuilding.")
     release_flux_pipeline()
 if "FLUX_PIPE" in globals() and globals().get("FLUX_PIPE_LORA_SCALE") != float(IMAGE_LORA_SCALE):
 """,
@@ -280,15 +275,14 @@ if "FLUX_PIPE" in globals() and globals().get("FLUX_PIPE_LORA_SCALE") != float(I
 pipeline_setup = pipeline_setup.replace(
     'else:\n    print("Reusing the fused pipeline at the current LoRA scale.")\n',
     """else:
-    print("Reusing the fused official inpaint pipeline at the current LoRA scale.")
-if FLUX_PIPE.mask_processor.config.do_binarize:
-    raise RuntimeError("The active inpaint pipeline unexpectedly binarizes masks")
+    print("Reusing the fused standard generation pipeline at the current LoRA scale.")
+if type(FLUX_PIPE).__name__ != "Flux2KleinPipeline":
+    raise RuntimeError("Masked anchors require the standard Flux2KleinPipeline")
 """,
 )
 model_cell["source"] = code_blocks(
     """
     import gc
-    import math
     import os
     import random
     import shutil
@@ -299,7 +293,7 @@ model_cell["source"] = code_blocks(
     from flowmorph_klein.lora import load_flux2_lora
     from flowmorph_klein.trajectory import (
         composite_generated_on_background,
-        interpolate_grayscale_edit_masks,
+        prepare_flux2_klein_img2img_inputs,
         prepare_grayscale_edit_mask,
     )
 
@@ -327,57 +321,71 @@ model_cell["source"] = code_blocks(
     def generate_masked_anchor(mask_source, prompt, seed, init_image=None):
         mask_result = build_background_mask(mask_source)
         generator = torch.Generator(device="cuda").manual_seed(seed)
-        background = Image.new(
-            "RGB",
-            (IMAGE_WIDTH, IMAGE_HEIGHT),
-            OUTPUT_BACKGROUND_RGB,
-        )
         if init_image is None:
-            inpaint_source = background
-        else:
-            inpaint_source = composite_generated_on_background(
-                init_image,
-                mask_result.mask,
-                background_rgb=OUTPUT_BACKGROUND_RGB,
+            generation_mode = "text_to_image"
+            generation_inputs = None
+            result = FLUX_PIPE(
+                prompt=prompt,
+                width=IMAGE_WIDTH,
+                height=IMAGE_HEIGHT,
+                num_inference_steps=IMAGE_INFERENCE_STEPS,
+                guidance_scale=IMAGE_GUIDANCE_SCALE,
+                generator=generator,
+                output_type="pil",
             )
-            background.close()
-        denoise_strength = (
-            MASK_DENOISE_STRENGTH
-            if init_image is None
-            else MASK_PREVIOUS_INIT_DENOISE_STRENGTH
-        )
-        result = FLUX_PIPE(
-            prompt=prompt,
-            image=inpaint_source,
-            mask_image=mask_result.mask,
-            width=IMAGE_WIDTH,
-            height=IMAGE_HEIGHT,
-            num_inference_steps=IMAGE_INFERENCE_STEPS,
-            strength=denoise_strength,
-            guidance_scale=IMAGE_GUIDANCE_SCALE,
-            generator=generator,
-            output_type="pil",
-        )
+        else:
+            generation_mode = "latent_img2img_from_weak_previous_anchor"
+            generation_inputs = prepare_flux2_klein_img2img_inputs(
+                FLUX_PIPE,
+                init_image,
+                width=IMAGE_WIDTH,
+                height=IMAGE_HEIGHT,
+                num_inference_steps=IMAGE_INFERENCE_STEPS,
+                strength=MASK_PREVIOUS_INIT_DENOISE_STRENGTH,
+                generator=generator,
+            )
+            result = FLUX_PIPE(
+                prompt=prompt,
+                width=IMAGE_WIDTH,
+                height=IMAGE_HEIGHT,
+                num_inference_steps=IMAGE_INFERENCE_STEPS,
+                sigmas=list(generation_inputs.sigmas),
+                latents=generation_inputs.latents,
+                guidance_scale=IMAGE_GUIDANCE_SCALE,
+                generator=generator,
+                output_type="pil",
+            )
         if not result.images:
-            inpaint_source.close()
-            raise RuntimeError("FLUX inpaint returned no image")
+            raise RuntimeError("FLUX returned no anchor image")
         raw_image = result.images[0].convert("RGB")
         final_image = composite_generated_on_background(
             raw_image,
             mask_result.mask,
             background_rgb=OUTPUT_BACKGROUND_RGB,
         )
-        inpaint_report = {
+        generation_report = {
             "backend": type(FLUX_PIPE).__name__,
-            "continuous_mask": not FLUX_PIPE.mask_processor.config.do_binarize,
-            "strength": float(denoise_strength),
-            "effective_denoising_steps": min(
-                IMAGE_INFERENCE_STEPS,
-                max(1, math.ceil(IMAGE_INFERENCE_STEPS * denoise_strength)),
+            "mode": generation_mode,
+            "mask_used_by_model": False,
+            "mask_application": "post_decode_continuous_alpha_composite",
+            "requested_img2img_strength": (
+                generation_inputs.requested_strength
+                if generation_inputs is not None
+                else None
+            ),
+            "effective_start_sigma": (
+                generation_inputs.effective_start_sigma
+                if generation_inputs is not None
+                else None
+            ),
+            "effective_denoising_steps": (
+                generation_inputs.denoising_steps
+                if generation_inputs is not None
+                else IMAGE_INFERENCE_STEPS
             ),
             "used_previous_init": init_image is not None,
         }
-        return final_image, raw_image, mask_result, inpaint_report, inpaint_source
+        return final_image, raw_image, mask_result, generation_report
 
     """,
     pipeline_setup,
@@ -401,8 +409,7 @@ model_cell["source"] = code_blocks(
             trial_image,
             trial_raw,
             trial_mask,
-            trial_inpaint_report,
-            trial_inpaint_source,
+            trial_generation_report,
         ) = generate_masked_anchor(
             trial_mask_source,
             trial_generation_prompt,
@@ -415,12 +422,10 @@ model_cell["source"] = code_blocks(
         trial_directory.mkdir(parents=True, exist_ok=False)
         trial_path = trial_directory / "trial_background_locked.png"
         trial_raw_path = trial_directory / "trial_raw.png"
-        trial_inpaint_source_path = trial_directory / "trial_inpaint_source.png"
         trial_source_path = trial_directory / "grayscale_mask_source.png"
         trial_mask_path = trial_directory / "edit_mask_white_is_editable.png"
         trial_image.save(trial_path)
         trial_raw.save(trial_raw_path)
-        trial_inpaint_source.save(trial_inpaint_source_path)
         trial_mask_source.save(trial_source_path)
         trial_mask.mask.save(trial_mask_path)
         (trial_directory / "settings.json").write_text(json.dumps({
@@ -435,23 +440,23 @@ model_cell["source"] = code_blocks(
             "editable_fraction": trial_mask.editable_fraction,
             "mask_polarity": "white_editable_black_protected",
             "mask_values_preserved_without_binarization": True,
-            "inpaint_backend": trial_inpaint_report["backend"],
-            "inpaint_source_path": str(trial_inpaint_source_path),
+            "generation_backend": trial_generation_report["backend"],
+            "generation_mode": trial_generation_report["mode"],
+            "mask_used_by_model": trial_generation_report["mask_used_by_model"],
+            "mask_application": trial_generation_report["mask_application"],
             "previous_init_used": False,
             "source_used_as_latent_init": False,
             "source_used_as_image_reference": False,
-            "denoise_strength": trial_inpaint_report["strength"],
             "effective_denoising_steps": (
-                trial_inpaint_report["effective_denoising_steps"]
+                trial_generation_report["effective_denoising_steps"]
             ),
             "generation_prompt": trial_generation_prompt,
         }, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8")
         previews = [
             ("Loaded grayscale mask source", trial_mask_source.convert("RGB")),
             ("Effective mask — WHITE edits, BLACK protects, GRAY is partial", trial_mask.mask.convert("RGB")),
-            ("Official inpaint source canvas", trial_inpaint_source.copy()),
-            ("Raw official FLUX.2 Klein inpaint result", trial_raw.copy()),
-            ("Final exact-background result", trial_image.copy()),
+            ("Raw full-frame FLUX.2 Klein generation before masking", trial_raw.copy()),
+            ("Final exact-background masked result", trial_image.copy()),
         ]
         for heading, preview in previews:
             preview.thumbnail((TRIAL_DISPLAY_MAX_WIDTH, TRIAL_DISPLAY_MAX_WIDTH))
@@ -461,21 +466,18 @@ model_cell["source"] = code_blocks(
         print({
             "path": str(trial_path),
             "raw_path": str(trial_raw_path),
-            "inpaint_source_path": str(trial_inpaint_source_path),
             "source_path": str(trial_source_path),
             "mask_path": str(trial_mask_path),
             "editable_fraction": trial_mask.editable_fraction,
             "seed": trial_seed,
             "prompt_index": trial_index,
         })
-        trial_inpaint_source.close()
         del (
             trial_image,
             trial_raw,
             trial_mask_source,
             trial_mask,
-            trial_inpaint_report,
-            trial_inpaint_source,
+            trial_generation_report,
         )
     else:
         print("Trial skipped.")
@@ -487,10 +489,11 @@ anchor_markdown["source"] = lines(
     """
     ## 7. Generate background-masked cyclic anchor paintings
 
-    Each selected ZIP frame is loaded directly as a continuous grayscale mask. Anchor 1
-    starts independently. Every later anchor uses a weak blurred, background-blended,
-    grained version of the preceding generated anchor as the official inpainting source
-    inside editable regions. Protected regions remain the exact selected background color.
+    Each selected ZIP frame is loaded directly as a continuous grayscale reveal mask.
+    Anchor 1 is a normal full-frame text-to-image generation. Every later anchor uses
+    conventional latent img2img from a weak blurred, background-blended, grained version
+    of the preceding masked anchor. Only after decoding is the grayscale mask composited
+    over the exact selected background color.
     """
 )
 
@@ -510,10 +513,12 @@ anchor_cell["source"] = lines(
         "gamma": MASK_GAMMA,
         "expansion": MASK_EXPANSION,
         "feather": MASK_FEATHER,
-        "first_denoise_strength": MASK_DENOISE_STRENGTH,
         "previous_init_denoise_strength": MASK_PREVIOUS_INIT_DENOISE_STRENGTH,
-        "inpaint_backend": "Flux2KleinInpaintPipeline",
-        "pipeline_mask_binarization": False,
+        "generation_backend": "Flux2KleinPipeline",
+        "first_anchor_mode": "text_to_image",
+        "later_anchor_mode": "latent_img2img_from_weak_previous_anchor",
+        "mask_application": "post_decode_continuous_alpha_composite",
+        "mask_used_by_model": False,
         "polarity": "white_editable_black_protected",
         "continuous_values_preserved": True,
         "previous_init_enabled": PREVIOUS_INIT_ENABLED,
@@ -523,7 +528,7 @@ anchor_cell["source"] = lines(
         "previous_init_background_rgb": list(PREVIOUS_INIT_BACKGROUND_RGB),
         "source_mask_used_as_latent_init": False,
         "source_used_as_image_reference": False,
-        "previous_init_used_as_inpaint_source": True,
+        "previous_init_used_as_latent_img2img_source": True,
     }
     expected_anchor_contract = [
         {
@@ -603,8 +608,7 @@ anchor_cell["source"] = lines(
                 image,
                 raw_image,
                 mask_result,
-                inpaint_report,
-                inpaint_source,
+                generation_report,
             ) = generate_masked_anchor(
                 mask_source,
                 generation_prompt,
@@ -626,8 +630,6 @@ anchor_cell["source"] = lines(
                 "generation_prompt": generation_prompt,
                 "seed": seed,
                 "path": str(output_path),
-                "flowmorph_endpoint_path": str(output_path),
-                "flowmorph_endpoint_role": "final_background_composited_anchor",
                 "raw_generation_path": str(raw_path),
                 "trajectory_index": trajectory["trajectory_index"],
                 "trajectory_member": trajectory["member"],
@@ -640,10 +642,14 @@ anchor_cell["source"] = lines(
                 "previous_init_used": previous_init is not None,
                 "editable_fraction": mask_result.editable_fraction,
                 "mask_contract": MASK_CONTRACT,
-                "inpaint_backend": inpaint_report["backend"],
-                "inpaint_denoise_strength": inpaint_report["strength"],
+                "generation_backend": generation_report["backend"],
+                "generation_mode": generation_report["mode"],
+                "mask_used_by_model": generation_report["mask_used_by_model"],
+                "mask_application": generation_report["mask_application"],
+                "img2img_strength": generation_report["requested_img2img_strength"],
+                "effective_start_sigma": generation_report["effective_start_sigma"],
                 "effective_denoising_steps": (
-                    inpaint_report["effective_denoising_steps"]
+                    generation_report["effective_denoising_steps"]
                 ),
             }
             BASE_RECORDS.append(record)
@@ -665,11 +671,10 @@ anchor_cell["source"] = lines(
             mask_source.close()
             if previous_init is not None:
                 previous_init.close()
-            inpaint_source.close()
             raw_image.close()
             image.close()
             mask_result.mask.close()
-            del inpaint_report, inpaint_source
+            del generation_report
         if previous is not None:
             previous.close()
             del previous
@@ -749,444 +754,6 @@ contact_cell["source"] = lines(
     })
     """
 )
-
-flowmorph_cell = find_cell(
-    notebook,
-    "from flowmorph_klein.sequence import FlowMorphSequenceSession",
-)
-flowmorph = source(flowmorph_cell)
-flowmorph = replace_once(
-    flowmorph,
-    """release_flux_pipeline()
-
-def usage_payload(response):
-""",
-    """release_flux_pipeline()
-if "FLUX_PIPE" in globals():
-    raise RuntimeError("The standalone inpaint pipeline was not fully released")
-
-def flowmorph_endpoint_path(record):
-    declared = record.get("flowmorph_endpoint_path", record.get("path"))
-    if not declared:
-        raise RuntimeError(f"{record.get('uid', '<unknown>')} has no endpoint image")
-    endpoint_path = Path(declared)
-    if not endpoint_path.is_file():
-        raise FileNotFoundError(f"Missing FlowMorph endpoint: {endpoint_path}")
-    if record.get("kind") == "base":
-        final_path = record.get("path")
-        if (
-            not final_path
-            or endpoint_path.resolve() != Path(final_path).resolve()
-        ):
-            raise RuntimeError(
-                f"{record['uid']} must fit the final composited anchor, not another artifact"
-            )
-        for artifact_key in (
-            "raw_generation_path",
-            "trajectory_source_path",
-            "trajectory_edit_mask_path",
-            "previous_init_path",
-        ):
-            artifact = record.get(artifact_key)
-            if (
-                artifact
-                and endpoint_path.resolve() == Path(artifact).resolve()
-            ):
-                raise RuntimeError(
-                    f"{record['uid']} endpoint incorrectly points at {artifact_key}"
-                )
-        if record.get("inpaint_backend") != "Flux2KleinInpaintPipeline":
-            raise RuntimeError(
-                f"{record['uid']} was not made by the corrected official inpaint backend; "
-                "regenerate the anchors before FlowMorph fitting"
-            )
-        if (
-            record.get("mask_contract", {}).get("continuous_values_preserved")
-            is not True
-        ):
-            raise RuntimeError(
-                f"{record['uid']} does not carry the continuous-mask contract"
-            )
-    with Image.open(endpoint_path) as opened:
-        if opened.size != (IMAGE_WIDTH, IMAGE_HEIGHT):
-            raise RuntimeError(
-                f"{record['uid']} endpoint is {opened.size}, expected "
-                f"{(IMAGE_WIDTH, IMAGE_HEIGHT)}"
-            )
-    return str(endpoint_path)
-
-def flowmorph_edit_mask_path(record):
-    declared = (
-        record.get("flowmorph_edit_mask_path")
-        or record.get("trajectory_edit_mask_path")
-    )
-    if not declared:
-        raise RuntimeError(
-            f"{record.get('uid', '<unknown>')} has no continuous edit mask"
-        )
-    mask_path = Path(declared)
-    if not mask_path.is_file():
-        raise FileNotFoundError(f"Missing FlowMorph edit mask: {mask_path}")
-    return mask_path
-
-def write_interpolated_flowmorph_mask(left, right, alpha, output_path):
-    with Image.open(flowmorph_edit_mask_path(left)) as opened:
-        source_mask = opened.convert("L")
-    with Image.open(flowmorph_edit_mask_path(right)) as opened:
-        target_mask = opened.convert("L")
-    interpolated = interpolate_grayscale_edit_masks(
-        source_mask,
-        target_mask,
-        alpha,
-    )
-    if interpolated.size != (IMAGE_WIDTH, IMAGE_HEIGHT):
-        interpolated = interpolated.resize(
-            (IMAGE_WIDTH, IMAGE_HEIGHT),
-            Image.Resampling.LANCZOS,
-        )
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    interpolated.save(output_path, format="PNG", compress_level=4)
-    source_mask.close()
-    target_mask.close()
-    interpolated.close()
-    return output_path
-
-def composite_flowmorph_decoded_frame(raw_path, output_path, mask_path):
-    with Image.open(raw_path) as opened:
-        raw_image = opened.convert("RGB")
-    with Image.open(mask_path) as opened:
-        edit_mask = opened.convert("L")
-    final_image = composite_generated_on_background(
-        raw_image,
-        edit_mask,
-        background_rgb=OUTPUT_BACKGROUND_RGB,
-    )
-    output_path = Path(output_path)
-    final_image.save(output_path, format="PNG", compress_level=4)
-    raw_image.close()
-    edit_mask.close()
-    final_image.close()
-    return output_path
-
-for base_record in BASE_RECORDS:
-    flowmorph_endpoint_path(base_record)
-    flowmorph_edit_mask_path(base_record)
-print(
-    "FlowMorph handoff verified: final background-composited anchors are the "
-    "only endpoint images, and every endpoint has a continuous edit mask."
-)
-
-def usage_payload(response):
-""",
-)
-flowmorph = replace_once(
-    flowmorph,
-    '    "conditioning": "piecewise_source_midpoint_target_embeddings",\n',
-    """    "conditioning": "piecewise_source_midpoint_target_embeddings",
-    "base_endpoint_role": "final_background_composited_anchor",
-    "anchor_backend": "Flux2KleinInpaintPipeline",
-    "flowmorph_backend": "Flux2KleinPipeline",
-    "interior_masking": "interpolated_continuous_masks_exact_background",
-    "save_raw_unmasked_frames": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
-""",
-)
-flowmorph = replace_once(
-    flowmorph,
-    '    "input.source_image": str(bootstrap_left["path"]),\n'
-    '    "input.target_image": str(bootstrap_right["path"]),\n',
-    '    "input.source_image": flowmorph_endpoint_path(bootstrap_left),\n'
-    '    "input.target_image": flowmorph_endpoint_path(bootstrap_right),\n',
-)
-flowmorph = replace_once(
-    flowmorph,
-    """SEQUENCE_RUNNER.prepare(resume=session_resume)
-SEQUENCE_SESSION = FlowMorphSequenceSession(
-""",
-    """SEQUENCE_RUNNER.prepare(resume=session_resume)
-if type(SEQUENCE_RUNNER.pipeline).__name__ != "Flux2KleinPipeline":
-    raise RuntimeError(
-        "FlowMorph must use the ordinary differentiable Flux2KleinPipeline; "
-        f"found {type(SEQUENCE_RUNNER.pipeline).__name__}"
-    )
-SEQUENCE_SESSION = FlowMorphSequenceSession(
-""",
-)
-flowmorph = replace_once(
-    flowmorph,
-    '        "image_sha256": file_sha256(record["path"]),\n',
-    '        "image_sha256": file_sha256(flowmorph_endpoint_path(record)),\n',
-)
-flowmorph = replace_once(
-    flowmorph,
-    """        record["uid"]: (
-            record["path"],
-            SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
-        )
-""",
-    """        record["uid"]: (
-            flowmorph_endpoint_path(record),
-            SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
-        )
-""",
-)
-flowmorph = replace_once(
-    flowmorph,
-    """    test_output_paths = [
-        test_directory / f"alpha_{alpha:.4f}.png"
-        for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS
-    ]
-    SEQUENCE_SESSION.decode_frames_to_paths(test_frames, test_output_paths)
-""",
-    """    test_output_paths = [
-        test_directory / f"alpha_{alpha:.4f}.png"
-        for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS
-    ]
-    test_mask_directory = test_directory / "interpolated_masks"
-    test_raw_directory = test_directory / "raw_unmasked"
-    test_mask_paths = [
-        write_interpolated_flowmorph_mask(
-            test_left,
-            test_right,
-            alpha,
-            test_mask_directory / f"alpha_{alpha:.4f}.png",
-        )
-        for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS
-    ]
-    test_decode_paths = test_output_paths
-    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES:
-        test_raw_directory.mkdir(parents=True, exist_ok=True)
-        test_decode_paths = [
-            test_raw_directory / path.name
-            for path in test_output_paths
-        ]
-    SEQUENCE_SESSION.decode_frames_to_paths(test_frames, test_decode_paths)
-    for raw_path, output_path, mask_path in zip(
-        test_decode_paths,
-        test_output_paths,
-        test_mask_paths,
-        strict=True,
-    ):
-        composite_flowmorph_decoded_frame(raw_path, output_path, mask_path)
-""",
-)
-flowmorph = replace_once(
-    flowmorph,
-    '        "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,\n'
-    '        "images": {\n',
-    """        "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
-        "interior_masking": "interpolated continuous masks + exact background",
-        "raw_unmasked_frames_saved": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
-        "images": {
-""",
-)
-flowmorph_cell["source"] = flowmorph.splitlines(keepends=True)
-
-recursive_cell = find_cell(
-    notebook,
-    "for round_number, round_spec in enumerate(FLOWMORPH_ROUND_SPECS",
-)
-recursive = source(recursive_cell)
-recursive = replace_once(
-    recursive,
-    """    proposal_directory = round_directory / "proposals"
-    for directory in (round_directory, image_directory, proposal_directory):
-        directory.mkdir(parents=True, exist_ok=True)
-""",
-    """    proposal_directory = round_directory / "proposals"
-    mask_directory = round_directory / "interpolated_masks"
-    raw_directory = round_directory / "raw_unmasked"
-    for directory in (
-        round_directory,
-        image_directory,
-        proposal_directory,
-        mask_directory,
-    ):
-        directory.mkdir(parents=True, exist_ok=True)
-    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES:
-        raw_directory.mkdir(parents=True, exist_ok=True)
-""",
-)
-recursive = replace_once(
-    recursive,
-    """            frame_records.append({
-                "uid": uid,
-                "fraction": fraction,
-                "output_path": image_directory / f"{uid}.png",
-            })
-""",
-    """            output_path = image_directory / f"{uid}.png"
-            mask_path = write_interpolated_flowmorph_mask(
-                left,
-                right,
-                fraction,
-                mask_directory / f"{uid}.png",
-            )
-            frame_records.append({
-                "uid": uid,
-                "fraction": fraction,
-                "output_path": output_path,
-                "mask_path": mask_path,
-                "raw_output_path": (
-                    raw_directory / f"{uid}.png"
-                    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
-                    else output_path
-                ),
-            })
-""",
-)
-recursive = replace_once(
-    recursive,
-    '            "left_image_sha256": file_sha256(left["path"]),\n',
-    """            "left_image_sha256": file_sha256(flowmorph_endpoint_path(left)),
-            "left_mask_sha256": file_sha256(flowmorph_edit_mask_path(left)),
-""",
-)
-recursive = replace_once(
-    recursive,
-    '            "right_image_sha256": file_sha256(right["path"]),\n',
-    """            "right_image_sha256": file_sha256(flowmorph_endpoint_path(right)),
-            "right_mask_sha256": file_sha256(flowmorph_edit_mask_path(right)),
-""",
-)
-recursive = replace_once(
-    recursive,
-    '            "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,\n',
-    """            "guidance_scale": FLOWMORPH_GUIDANCE_SCALE,
-            "interior_masking": "interpolated_continuous_masks_exact_background",
-            "save_raw_unmasked_frames": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
-""",
-)
-recursive = replace_once(
-    recursive,
-    """        if completion_path.is_file() and all(item["output_path"].is_file() for item in frame_records):
-            completion = json.loads(completion_path.read_text(encoding="utf-8"))
-            completed = completion.get("pair_fingerprint") == pair_fingerprint
-""",
-    """        expected_frame_artifacts = [
-            artifact
-            for item in frame_records
-            for artifact in (
-                item["output_path"],
-                item["mask_path"],
-                *(
-                    [item["raw_output_path"]]
-                    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
-                    else []
-                ),
-            )
-        ]
-        if completion_path.is_file() and all(
-            artifact.is_file() for artifact in expected_frame_artifacts
-        ):
-            completion = json.loads(completion_path.read_text(encoding="utf-8"))
-            completed = completion.get("pair_fingerprint") == pair_fingerprint
-""",
-)
-recursive = replace_once(
-    recursive,
-    """        record["uid"]: (
-            record["path"],
-            SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
-        )
-""",
-    """        record["uid"]: (
-            flowmorph_endpoint_path(record),
-            SEQUENCE_ASSET_ROOT / f"{record['uid']}.png",
-        )
-""",
-)
-recursive = replace_once(
-    recursive,
-    """            chunk_frames.extend(rendered)
-            chunk_paths.extend(item["output_path"] for item in job["frame_records"])
-""",
-    """            chunk_frames.extend(rendered)
-            chunk_paths.extend(
-                item["raw_output_path"] for item in job["frame_records"]
-            )
-""",
-)
-recursive = replace_once(
-    recursive,
-    """        SEQUENCE_SESSION.decode_frames_to_paths(chunk_frames, chunk_paths)
-        print(f"Decoded with batch_size={SEQUENCE_SESSION.last_decode_batch_size}")
-        for job in chunk_jobs:
-""",
-    """        SEQUENCE_SESSION.decode_frames_to_paths(chunk_frames, chunk_paths)
-        print(f"Decoded with batch_size={SEQUENCE_SESSION.last_decode_batch_size}")
-        for job in chunk_jobs:
-            for frame_record in job["frame_records"]:
-                composite_flowmorph_decoded_frame(
-                    frame_record["raw_output_path"],
-                    frame_record["output_path"],
-                    frame_record["mask_path"],
-                )
-        for job in chunk_jobs:
-""",
-)
-recursive = replace_once(
-    recursive,
-    """                    "image": str(item["output_path"]),
-                    "shared_prompt": job["proposal"].prompt,
-""",
-    """                    "image": str(item["output_path"]),
-                    "raw_unmasked_image": (
-                        str(item["raw_output_path"])
-                        if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
-                        else None
-                    ),
-                    "interpolated_edit_mask": str(item["mask_path"]),
-                    "shared_prompt": job["proposal"].prompt,
-""",
-)
-recursive = replace_once(
-    recursive,
-    '            "latest_png": str(chunk_paths[-1]),\n',
-    """            "latest_png": str(
-                chunk_jobs[-1]["frame_records"][-1]["output_path"]
-            ),
-            "latest_raw_unmasked_png": (
-                str(chunk_paths[-1])
-                if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
-                else None
-            ),
-""",
-)
-recursive = replace_once(
-    recursive,
-    """                "path": str(frame_record["output_path"]),
-                "proposal_path": str(job["proposal_path"]),
-""",
-    """                "path": str(frame_record["output_path"]),
-                "flowmorph_endpoint_path": str(frame_record["output_path"]),
-                "flowmorph_endpoint_role": "masked_flowmorph_midpoint",
-                "flowmorph_edit_mask_path": str(frame_record["mask_path"]),
-                "raw_flowmorph_path": (
-                    str(frame_record["raw_output_path"])
-                    if FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES
-                    else None
-                ),
-                "proposal_path": str(job["proposal_path"]),
-""",
-)
-recursive = replace_once(
-    recursive,
-    '        "one_shared_prompt_per_gap": True,\n',
-    """        "one_shared_prompt_per_gap": True,
-        "interior_masking": "interpolated continuous masks + exact background",
-        "raw_unmasked_frames_saved": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
-""",
-)
-recursive = replace_once(
-    recursive,
-    '    "one_openai_prompt_per_gap": True,\n',
-    """    "one_openai_prompt_per_gap": True,
-    "interior_masking": "interpolated continuous masks + exact background",
-    "raw_unmasked_frames_saved": FLOWMORPH_SAVE_RAW_UNMASKED_FRAMES,
-""",
-)
-recursive_cell["source"] = recursive.splitlines(keepends=True)
 
 assembly_markdown = find_cell(notebook, "## 10. Assemble, preview")
 assembly_markdown["source"] = lines(
