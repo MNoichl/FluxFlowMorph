@@ -104,15 +104,16 @@ def test_background_mask_notebook_uses_weak_previous_latent_img2img() -> None:
     assert "image=mask_source" not in code
 
 
-def test_background_mask_notebook_removes_sparse_prompt_regression() -> None:
+def test_background_mask_notebook_preserves_user_prompts_and_settings() -> None:
     notebook, code = _load_notebook()
     assert "IMAGE_GUIDANCE_SCALE = 7.0" in code
     assert "IMAGE_LORA_SCALE = 1.2" in code
-    assert "MASK_REMOVE_SPARSE_PROMPT_LANGUAGE = True" in code
-    assert '"soft translucent washes": "opaque layered oil paint"' in code
-    assert '"chalky faded pigments": "deep luminous oil pigments"' in code
-    assert "complete full-frame image before masking" in code
-    assert "large unpainted areas" in code
+    assert 'MASK_ZIP_FILENAME = "mask_2.zip"' in code
+    assert 'OPENAI_KEY_FILENAME = "openaiapikey.txt"' in code
+    assert "MASK_REMOVE_SPARSE_PROMPT_LANGUAGE" not in code
+    assert "MASK_PROMPT_INSTRUCTION" not in code
+    assert '"soft translucent washes": "opaque layered oil paint"' not in code
+    assert '"chalky faded pigments": "deep luminous oil pigments"' not in code
     stages = _literal_assignment(notebook, "BASE_STAGES")
     prompts = "\n".join(stage["prompt"] for stage in stages)
     assert "a flowing garland of night-blooming moonflowers" in prompts
@@ -122,6 +123,45 @@ def test_background_mask_notebook_removes_sparse_prompt_regression() -> None:
     assert "# if FLOWMORPH_FIT_LORA_SCALE != IMAGE_LORA_SCALE:" in code
     assert "# if FLOWMORPH_RENDER_LORA_SCALE != IMAGE_LORA_SCALE:" in code
     assert "# if FLOWMORPH_GUIDANCE_SCALE != IMAGE_GUIDANCE_SCALE:" in code
+
+
+def test_background_mask_notebook_rewrites_each_prompt_from_mask_geometry() -> None:
+    _, code = _load_notebook()
+    assert "MASK_PROMPT_REWRITE_ENABLED = True" in code
+    assert 'MASK_PROMPT_REWRITE_IMAGE_DETAIL = "original"' in code
+    assert "MASK_PROMPT_REWRITE_MAX_OUTPUT_TOKENS = 6000" in code
+    assert "MASK_PROMPT_REWRITE_MAX_ATTEMPTS = 3" in code
+    assert "MASK_PROMPT_REWRITE_DISPLAY_MASK = True" in code
+    assert "class MaskPromptPlan(BaseModel):" in code
+    assert "MASK_PROMPT_SYSTEM_PROMPT" in code
+    assert "lobes, islands," in code
+    assert "Use flexible matter" in code
+    assert "Respect dark gaps" in code
+    assert "measure_effective_mask_geometry(" in code
+    assert "components_largest_first" in code
+    assert "Deterministic measurements of the effective reveal geometry" in code
+    assert "MASK_PROMPT_GEOMETRY_THRESHOLD = 0.35" in code
+    assert "MASK_PROMPT_MIN_COMPONENT_FRACTION = 0.0005" in code
+    assert "MASK_PROMPT_MAX_COMPONENTS = 12" in code
+    assert "effective_mask_data_url(" in code
+    assert 'return f"data:image/png;base64,{encoded}"' in code
+    assert "OPENAI_CLIENT.responses.parse(" in code
+    assert "Complete original prompt:" in code
+    assert 'base_prompt = stage["prompt"]' in code
+    assert "MASK_PROMPT_REWRITE_MAX_ATTEMPTS + 1" in code
+    assert '"type": "input_image"' in code
+    assert '"detail": MASK_PROMPT_REWRITE_IMAGE_DETAIL' in code
+    assert "text_format=MaskPromptPlan" in code
+    assert "validate_mask_rewritten_prompt(" in code
+    assert "resolve_mask_aware_prompt(" in code
+    assert 'MASK_PROMPT_CACHE_SUBDIRECTORY = "_mask_prompt_cache"' in code
+    assert 'RUN_DIRECTORY / "metadata" / "mask_prompt_plans"' in code
+    assert 'generation_prompt = prompt_record["generation_prompt"]' in code
+    assert '"mask_prompt_fingerprint": prompt_record["fingerprint"]' in code
+    assert '"mask_used_by_prompt_planner": MASK_PROMPT_REWRITE_ENABLED' in code
+    assert "**Remote spatial analysis**" in code
+    assert "**Remote object layout**" in code
+    assert "**Adapted FLUX prompt**" in code
 
 
 def test_background_mask_notebook_does_not_reapply_masks_in_flowmorph() -> None:

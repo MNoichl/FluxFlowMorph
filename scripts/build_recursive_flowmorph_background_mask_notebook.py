@@ -148,7 +148,9 @@ notebook["cells"][0]["source"] = lines(
     - anchor 1 is generated normally with the high-quality `Flux2KleinPipeline`;
     - every later anchor uses a weak blurred, background-blended, grained version
       of the previous generated anchor through conventional latent img2img;
-    - the mask never enters the model as an image or conditioning signal;
+    - the effective mask and unchanged original prompt are sent to the OpenAI
+      vision model so it can write a detailed prompt around the actual geometry;
+    - the mask never enters FLUX as an image or latent conditioning signal;
     - after decoding, the continuous mask reveals the generated painting over
       `OUTPUT_BACKGROUND_RGB`.
 
@@ -161,8 +163,9 @@ notebook["cells"][1]["source"] = lines(
 
     Point the mask ZIP settings at naturally ordered black/white or grayscale files.
     Values are preserved by default. `OUTPUT_BACKGROUND_RGB` is the flat color written
-    outside the editable mask. The model first creates a complete painting; masking is a
-    separate post-generation operation, so a blank canvas cannot suppress the result.
+    outside the editable mask. Before FLUX generation, the remote vision model receives
+    the unchanged original prompt and effective mask, then writes a detailed descriptive
+    prompt for that geometry. Masking remains a separate post-generation operation.
     """
 )
 
@@ -204,6 +207,21 @@ mask_settings = dedent(
     MASK_MIN_EDITABLE_FRACTION = 0.001
     MASK_MAX_EDITABLE_FRACTION = 1.0
 
+    # Remote vision planning. BASE_STAGES stays untouched and directly editable.
+    MASK_PROMPT_REWRITE_ENABLED = True
+    MASK_PROMPT_REWRITE_IMAGE_DETAIL = "original"
+    MASK_PROMPT_REWRITE_MAX_OUTPUT_TOKENS = 6000
+    MASK_PROMPT_REWRITE_MAX_ATTEMPTS = 3
+    MASK_PROMPT_REWRITE_REUSE_CACHE = True
+    MASK_PROMPT_REWRITE_FORCE_REFRESH = False
+    MASK_PROMPT_REWRITE_DISPLAY = True
+    MASK_PROMPT_REWRITE_DISPLAY_MASK = True
+    MASK_PROMPT_DISPLAY_MAX_SIDE = 320
+    MASK_PROMPT_CACHE_SUBDIRECTORY = "_mask_prompt_cache"
+    MASK_PROMPT_GEOMETRY_THRESHOLD = 0.35
+    MASK_PROMPT_MIN_COMPONENT_FRACTION = 0.0005
+    MASK_PROMPT_MAX_COMPONENTS = 12
+
     # Full-frame generation, post-generation masking, and weak sequential continuity.
     OUTPUT_BACKGROUND_RGB = (238, 233, 218)
     MASK_PREVIOUS_INIT_DENOISE_STRENGTH = 0.85
@@ -213,13 +231,7 @@ mask_settings = dedent(
     PREVIOUS_INIT_GRAIN_STRENGTH = 0.035
     PREVIOUS_INIT_BACKGROUND_RGB = OUTPUT_BACKGROUND_RGB
     SAVE_PREVIOUS_INITS = True
-    MASK_REMOVE_SPARSE_PROMPT_LANGUAGE = True
-    MASK_PROMPT_INSTRUCTION = (
-        "Render a complete full-frame image before masking, using large connected forms, "
-        "opaque layered oil paint, deep luminous pigments, substantial texture, and rich "
-        "chiaroscuro throughout the canvas. Avoid faint line drawing, translucent washes, "
-        "and large unpainted areas; the external grayscale mask creates the final open background."
-    )
+
     TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True
 
     """
@@ -273,32 +285,32 @@ mask_validation = dedent(
         not 0 <= channel <= 255 for channel in PREVIOUS_INIT_BACKGROUND_RGB
     ):
         raise ValueError("PREVIOUS_INIT_BACKGROUND_RGB must contain three values in [0, 255]")
+    if MASK_PROMPT_REWRITE_IMAGE_DETAIL not in {"low", "high", "original", "auto"}:
+        raise ValueError(
+            "MASK_PROMPT_REWRITE_IMAGE_DETAIL must be low, high, original, or auto"
+        )
+    if MASK_PROMPT_REWRITE_MAX_OUTPUT_TOKENS < 1000:
+        raise ValueError("MASK_PROMPT_REWRITE_MAX_OUTPUT_TOKENS must be at least 1000")
+    if not 1 <= MASK_PROMPT_REWRITE_MAX_ATTEMPTS <= 10:
+        raise ValueError("MASK_PROMPT_REWRITE_MAX_ATTEMPTS must lie in [1, 10]")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", MASK_PROMPT_CACHE_SUBDIRECTORY):
+        raise ValueError(
+            "MASK_PROMPT_CACHE_SUBDIRECTORY may contain letters, numbers, underscores, and hyphens"
+        )
+    if MASK_PROMPT_DISPLAY_MAX_SIDE < 128:
+        raise ValueError("MASK_PROMPT_DISPLAY_MAX_SIDE must be at least 128")
+    if not 0 < MASK_PROMPT_GEOMETRY_THRESHOLD < 1:
+        raise ValueError("MASK_PROMPT_GEOMETRY_THRESHOLD must lie in (0, 1)")
+    if not 0 <= MASK_PROMPT_MIN_COMPONENT_FRACTION < 0.1:
+        raise ValueError(
+            "MASK_PROMPT_MIN_COMPONENT_FRACTION must lie in [0, 0.1)"
+        )
+    if not 1 <= MASK_PROMPT_MAX_COMPONENTS <= 50:
+        raise ValueError("MASK_PROMPT_MAX_COMPONENTS must lie in [1, 50]")
 
     def trajectory_generation_prompt(prompt):
-        base = prompt
-        if TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE:
-            base = re.sub(r"\\bsymmetr(?:ical|ically)\\b", "", base, flags=re.IGNORECASE)
-        if MASK_REMOVE_SPARSE_PROMPT_LANGUAGE:
-            replacements = {
-                "soft translucent washes": "opaque layered oil paint",
-                "chalky faded pigments": "deep luminous oil pigments",
-                (
-                    "an asymmetric composition gathered to one side with a few sprigs "
-                    "drifting across otherwise bare plaster and most of the surface left empty"
-                ): (
-                    "a richly populated asymmetric composition of large connected forms "
-                    "distributed throughout the canvas"
-                ),
-                "otherwise bare plaster": "richly painted plaster",
-                "empty plaster": "painted field",
-                "open plaster": "painted field",
-                "bare wall": "painted wall",
-                "empty wall": "painted wall",
-                "empty space": "painted space",
-            }
-            for old, new in replacements.items():
-                base = base.replace(old, new)
-        return " ".join(base.split()) + " " + MASK_PROMPT_INSTRUCTION
+        # Compatibility helper only: no local stylistic rewrite is performed.
+        return prompt
     """
 ).lstrip()
 validation = replace_between(
@@ -372,13 +384,20 @@ if type(FLUX_PIPE).__name__ != "Flux2KleinPipeline":
 )
 model_cell["source"] = code_blocks(
     """
+    import base64
     import gc
+    import hashlib
+    import io
     import os
     import random
     import shutil
+    import time
+    import numpy as np
+    from scipy import ndimage
     from huggingface_hub import hf_hub_download
     from IPython.display import Markdown, display
     from PIL import Image
+    from pydantic import BaseModel, Field, ValidationError
     from flowmorph_klein.art_loop import make_soft_reference
     from flowmorph_klein.lora import load_flux2_lora
     from flowmorph_klein.trajectory import (
@@ -408,8 +427,481 @@ model_cell["source"] = code_blocks(
             )
         return result
 
-    def generate_masked_anchor(mask_source, prompt, seed, init_image=None):
-        mask_result = build_background_mask(mask_source)
+    class MaskPromptPlan(BaseModel):
+        spatial_analysis: str = Field(min_length=80, max_length=1800)
+        object_layout: str = Field(min_length=120, max_length=2200)
+        rewritten_prompt: str = Field(min_length=300, max_length=6000)
+
+    MASK_PROMPT_SYSTEM_PROMPT = f'''
+    Role: You are a meticulous art director rewriting one FLUX.2 Klein prompt for
+    the {LORA_TRIGGER} oil-painting LoRA.
+
+    Input: You receive (1) a science/theme, (2) the complete original art prompt,
+    and (3) the exact grayscale reveal geometry for the final painting. In that
+    geometry, bright pixels are where painted content will remain visible, dark
+    pixels are absent background, and gray pixels are soft edge transitions.
+
+    Task: Rewrite the complete art prompt in rich visual detail so FLUX composes
+    the subject organically inside the bright geometry before the exact reveal is
+    applied. Inspect the geometry itself. Translate its actual lobes, islands,
+    corridors, bends, diagonals, voids, edge contacts, relative areas, and visual
+    center of gravity into a concrete composition.
+
+    Required planning:
+    - Assign every important object from the original prompt to a plausible broad
+      lobe or island, using explicit canvas locations, relative sizes, orientation,
+      overlap, and visual hierarchy.
+    - Put complete recognizable objects well inside broad spaces. Do not position
+      faces, globes, clocks, vessels, brains, books, or other focal objects where a
+      contour would slice through them.
+    - Use flexible matter—vines, acanthus, stems, ribbons, smoke, clouds, roots,
+      cloth, tendrils, chains, wave motifs, and shadows—to travel through narrow
+      corridors, join neighboring masses, curl around internal voids, and taper
+      naturally before boundaries.
+    - Treat isolated bright islands as deliberate satellite ornaments related to
+      the main subject. Respect dark gaps by separating objects rather than placing
+      one large object across them.
+    - Where the bright geometry meets a canvas edge, describe a natural entrance
+      or exit such as a cropped garland, branch, drapery fold, or shadow—not a
+      severed focal object.
+    - Preserve the science, named objects, palette, aged-plaster fresco character,
+      Baroque/Renaissance-grottesche language, oil materiality, and every useful
+      stylistic fact from the original. You may change placement, scale, grouping,
+      orientation, and which flexible element connects objects.
+    - Make the result dense enough to occupy the described composition, with large
+      coherent masses and material texture rather than tiny scattered icons.
+
+    Rewritten-prompt contract:
+    - It begins exactly with "{LORA_TRIGGER}," and contains that trigger once.
+    - It is a self-contained literal description of the final artwork, normally
+      300–550 words. Repeat all desired content and style; do not refer back to
+      the input.
+    - It must not mention a mask, white/black areas, editable/protected pixels,
+      alpha, compositing, cutouts, source material, prompt rewriting, or instructions
+      to an editor. Convert all of that into ordinary spatial art direction.
+    - Do not say "keep", "preserve", "place into the mask", or "fit the mask".
+
+    Output fields:
+    - spatial_analysis: a precise prose reading of the supplied geometry.
+    - object_layout: a detailed mapping from the original objects to that geometry.
+    - rewritten_prompt: only the final self-contained FLUX prompt.
+    '''.strip()
+
+    MASK_PROMPT_FORBIDDEN_TERMS = (
+        "mask",
+        "white area",
+        "white region",
+        "black area",
+        "black region",
+        "editable",
+        "protected pixels",
+        "alpha",
+        "composite",
+        "compositing",
+        "cutout",
+        "source prompt",
+        "rewrite",
+        "rewritten",
+        "fit the mask",
+        "place into the mask",
+        "keep",
+        "preserve",
+        "retain",
+    )
+    MASK_PROMPT_MEMORY = {}
+
+    def effective_mask_data_url(mask):
+        image = mask.convert("L")
+        image.thumbnail((VISION_IMAGE_MAX_SIDE, VISION_IMAGE_MAX_SIDE))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+
+    def effective_mask_sha256(mask):
+        buffer = io.BytesIO()
+        mask.convert("L").save(buffer, format="PNG", optimize=True)
+        return hashlib.sha256(buffer.getvalue()).hexdigest()
+
+    def measure_effective_mask_geometry(mask):
+        values = np.asarray(mask.convert("L"), dtype=np.float32) / 255.0
+        height, width = values.shape
+        binary = values >= MASK_PROMPT_GEOMETRY_THRESHOLD
+        labels, component_count = ndimage.label(
+            binary,
+            structure=np.ones((3, 3), dtype=np.uint8),
+        )
+        minimum_pixels = max(
+            1,
+            int(round(
+                MASK_PROMPT_MIN_COMPONENT_FRACTION * width * height
+            )),
+        )
+        components = []
+        for label_index, component_slice in enumerate(
+            ndimage.find_objects(labels),
+            start=1,
+        ):
+            if component_slice is None:
+                continue
+            component = labels[component_slice] == label_index
+            area_pixels = int(component.sum())
+            if area_pixels < minimum_pixels:
+                continue
+            y_slice, x_slice = component_slice
+            y0, y1 = y_slice.start, y_slice.stop
+            x0, x1 = x_slice.start, x_slice.stop
+            local_y, local_x = np.nonzero(component)
+            centroid_x = (x0 + float(local_x.mean())) / width
+            centroid_y = (y0 + float(local_y.mean())) / height
+            edge_contacts = []
+            if y0 == 0:
+                edge_contacts.append("top")
+            if y1 == height:
+                edge_contacts.append("bottom")
+            if x0 == 0:
+                edge_contacts.append("left")
+            if x1 == width:
+                edge_contacts.append("right")
+            component_values = values[component_slice][component]
+            components.append({
+                "area_fraction": round(area_pixels / (width * height), 4),
+                "bbox_normalized": {
+                    "left": round(x0 / width, 4),
+                    "top": round(y0 / height, 4),
+                    "right": round(x1 / width, 4),
+                    "bottom": round(y1 / height, 4),
+                },
+                "centroid_normalized": {
+                    "x": round(centroid_x, 4),
+                    "y": round(centroid_y, 4),
+                },
+                "mean_editability": round(
+                    float(component_values.mean()),
+                    4,
+                ),
+                "edge_contacts": edge_contacts,
+            })
+        components.sort(
+            key=lambda item: item["area_fraction"],
+            reverse=True,
+        )
+        kept_components = components[:MASK_PROMPT_MAX_COMPONENTS]
+        weight_total = float(values.sum())
+        if weight_total > 0:
+            y_grid, x_grid = np.indices(values.shape, dtype=np.float32)
+            weighted_centroid = {
+                "x": round(float((x_grid * values).sum() / weight_total) / width, 4),
+                "y": round(float((y_grid * values).sum() / weight_total) / height, 4),
+            }
+        else:
+            weighted_centroid = None
+        return {
+            "coordinate_system": (
+                "normalized canvas coordinates: x=0 left, x=1 right, "
+                "y=0 top, y=1 bottom"
+            ),
+            "width": width,
+            "height": height,
+            "threshold": MASK_PROMPT_GEOMETRY_THRESHOLD,
+            "bright_coverage_fraction": round(float(binary.mean()), 4),
+            "mean_editability": round(float(values.mean()), 4),
+            "gray_transition_fraction": round(
+                float(((values > 0) & (values < 1)).mean()),
+                4,
+            ),
+            "weighted_centroid_normalized": weighted_centroid,
+            "component_count_before_size_filter": int(component_count),
+            "component_count_after_size_filter": len(components),
+            "component_count_reported": len(kept_components),
+            "components_largest_first": kept_components,
+        }
+
+    def mask_prompt_usage(response):
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        return (
+            usage.model_dump(mode="json")
+            if hasattr(usage, "model_dump")
+            else str(usage)
+        )
+
+    def extract_mask_prompt_plan(response):
+        parsed = getattr(response, "output_parsed", None)
+        if parsed is not None:
+            return parsed
+        refusals = []
+        for output in response.output:
+            if output.type != "message":
+                continue
+            for item in output.content:
+                if item.type == "refusal":
+                    refusals.append(item.refusal)
+                elif getattr(item, "parsed", None) is not None:
+                    return item.parsed
+        if refusals:
+            raise RuntimeError(
+                "OpenAI refused the mask-aware prompt request: "
+                + " | ".join(refusals)
+            )
+        raise RuntimeError("OpenAI returned no parsed mask-aware prompt")
+
+    def validate_mask_rewritten_prompt(prompt):
+        clean = " ".join(prompt.split())
+        if not clean.startswith(f"{LORA_TRIGGER},"):
+            raise ValueError(
+                f"Rewritten prompt must begin exactly with {LORA_TRIGGER},"
+            )
+        if clean.casefold().count(LORA_TRIGGER.casefold()) != 1:
+            raise ValueError("Rewritten prompt must contain the LoRA trigger once")
+        if len(clean) < 900:
+            raise ValueError(
+                "Rewritten prompt is too brief for geometry-specific art direction"
+            )
+        found = [
+            term
+            for term in MASK_PROMPT_FORBIDDEN_TERMS
+            if re.search(rf"\\b{re.escape(term)}\\b", clean, re.IGNORECASE)
+        ]
+        if found:
+            raise ValueError(
+                "Rewritten prompt exposes production language: "
+                + ", ".join(found)
+            )
+        return clean
+
+    def mask_prompt_request_fingerprint(stage, effective_mask, base_prompt):
+        geometry = measure_effective_mask_geometry(effective_mask)
+        contract = {
+            "model": OPENAI_MODEL,
+            "reasoning_effort": OPENAI_REASONING_EFFORT,
+            "image_detail": MASK_PROMPT_REWRITE_IMAGE_DETAIL,
+            "system_prompt": MASK_PROMPT_SYSTEM_PROMPT,
+            "science": stage["science"],
+            "original_prompt": stage["prompt"],
+            "prepared_base_prompt": base_prompt,
+            "effective_mask_sha256": effective_mask_sha256(effective_mask),
+            "deterministic_geometry": geometry,
+        }
+        serialized = json.dumps(
+            contract,
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(serialized).hexdigest(), contract
+
+    def request_mask_prompt_plan(stage, effective_mask, base_prompt):
+        geometry = measure_effective_mask_geometry(effective_mask)
+        request_text = f'''
+        Science/theme:
+        {stage["science"]}
+
+        Complete original prompt:
+        {base_prompt}
+
+        Deterministic measurements of the effective reveal geometry:
+        {json.dumps(geometry, indent=2, ensure_ascii=False)}
+
+        Inspect the attached effective grayscale reveal geometry. Write a detailed
+        spatial analysis, map the original objects into the actual bright shapes,
+        then return a complete self-contained rewritten generation prompt.
+        '''.strip()
+        correction = ""
+        last_error = None
+        for attempt in range(1, MASK_PROMPT_REWRITE_MAX_ATTEMPTS + 1):
+            try:
+                response = OPENAI_CLIENT.responses.parse(
+                    model=OPENAI_MODEL,
+                    reasoning={"effort": OPENAI_REASONING_EFFORT},
+                    store=False,
+                    max_output_tokens=MASK_PROMPT_REWRITE_MAX_OUTPUT_TOKENS,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": MASK_PROMPT_SYSTEM_PROMPT,
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": request_text + correction,
+                                },
+                                {
+                                    "type": "input_image",
+                                    "image_url": effective_mask_data_url(
+                                        effective_mask
+                                    ),
+                                    "detail": MASK_PROMPT_REWRITE_IMAGE_DETAIL,
+                                },
+                            ],
+                        },
+                    ],
+                    text_format=MaskPromptPlan,
+                )
+                plan = extract_mask_prompt_plan(response)
+                plan.rewritten_prompt = validate_mask_rewritten_prompt(
+                    plan.rewritten_prompt
+                )
+                return plan, response
+            except (ValidationError, json.JSONDecodeError, ValueError) as error:
+                last_error = error
+                correction = (
+                    "\\n\\nThe previous response failed validation: "
+                    f"{error}. Return complete valid structured output, make the "
+                    "rewritten prompt detailed and self-contained, begin it with "
+                    f"{LORA_TRIGGER}, and remove all production-language terms."
+                )
+                if attempt < MASK_PROMPT_REWRITE_MAX_ATTEMPTS:
+                    time.sleep(min(2 ** (attempt - 1), 4))
+                    continue
+                raise RuntimeError(
+                    "Mask-aware prompt rewriting failed after "
+                    f"{attempt} attempts: {last_error}"
+                ) from error
+        raise RuntimeError(f"Mask-aware prompt rewriting failed: {last_error}")
+
+    def resolve_mask_aware_prompt(stage, effective_mask, stage_index):
+        # Deliberately pass the user's prompt byte-for-byte unchanged. All
+        # substantive adaptation belongs to the remote model.
+        base_prompt = stage["prompt"]
+        fingerprint, request_contract = mask_prompt_request_fingerprint(
+            stage,
+            effective_mask,
+            base_prompt,
+        )
+        if fingerprint in MASK_PROMPT_MEMORY:
+            return MASK_PROMPT_MEMORY[fingerprint]
+
+        run_plan_directory = RUN_DIRECTORY / "metadata" / "mask_prompt_plans"
+        run_plan_directory.mkdir(parents=True, exist_ok=True)
+        persistent_cache_directory = (
+            Path(drive_base)
+            / PROJECT_NAME
+            / MASK_PROMPT_CACHE_SUBDIRECTORY
+        )
+        persistent_cache_directory.mkdir(parents=True, exist_ok=True)
+        cache_path = (
+            persistent_cache_directory
+            / f"{stage['id']}_{fingerprint[:20]}.json"
+        )
+        run_plan_path = (
+            run_plan_directory
+            / f"{stage_index:03d}_{stage['id']}.json"
+        )
+
+        cache_hit = False
+        response_id = None
+        usage = None
+        if not MASK_PROMPT_REWRITE_ENABLED:
+            plan = MaskPromptPlan(
+                spatial_analysis=(
+                    "Mask-aware rewriting is disabled by settings, so no remote "
+                    "spatial analysis of the effective reveal geometry is used."
+                ),
+                object_layout=(
+                    "The original prepared prompt is passed through without a "
+                    "remote spatial rewrite. Object locations therefore follow "
+                    "the original prompt rather than a geometry-specific plan."
+                ),
+                rewritten_prompt=base_prompt,
+            )
+        elif (
+            MASK_PROMPT_REWRITE_REUSE_CACHE
+            and not MASK_PROMPT_REWRITE_FORCE_REFRESH
+            and cache_path.is_file()
+        ):
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                if cached.get("fingerprint") != fingerprint:
+                    raise ValueError("fingerprint mismatch")
+                plan = MaskPromptPlan.model_validate(cached["plan"])
+                plan.rewritten_prompt = validate_mask_rewritten_prompt(
+                    plan.rewritten_prompt
+                )
+                response_id = cached.get("openai_response_id")
+                usage = cached.get("usage")
+                cache_hit = True
+            except Exception as error:
+                print(
+                    f"Ignoring invalid mask-prompt cache for {stage['id']}: "
+                    f"{error}"
+                )
+                plan, response = request_mask_prompt_plan(
+                    stage,
+                    effective_mask,
+                    base_prompt,
+                )
+                response_id = response.id
+                usage = mask_prompt_usage(response)
+        else:
+            plan, response = request_mask_prompt_plan(
+                stage,
+                effective_mask,
+                base_prompt,
+            )
+            response_id = response.id
+            usage = mask_prompt_usage(response)
+
+        payload = {
+            "fingerprint": fingerprint,
+            "stage_index": stage_index,
+            "stage_id": stage["id"],
+            "science": stage["science"],
+            "enabled": MASK_PROMPT_REWRITE_ENABLED,
+            "cache_hit": cache_hit,
+            "request_contract": request_contract,
+            "plan": plan.model_dump(mode="json"),
+            "openai_model": OPENAI_MODEL,
+            "openai_response_id": response_id,
+            "usage": usage,
+            "effective_mask_image_stored_in_manifest": False,
+        }
+        if MASK_PROMPT_REWRITE_ENABLED and not cache_hit:
+            cache_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\\n",
+                encoding="utf-8",
+            )
+        run_plan_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\\n",
+            encoding="utf-8",
+        )
+        result = (plan.rewritten_prompt, payload)
+        MASK_PROMPT_MEMORY[fingerprint] = result
+        print(
+            f"Mask-aware prompt {stage_index + 1}/{len(ACTIVE_BASE_STAGES)} "
+            f"ready for {stage['id']} "
+            f"({'cache' if cache_hit else 'new rewrite'})."
+        )
+        if MASK_PROMPT_REWRITE_DISPLAY:
+            display(Markdown(f"#### Mask-aware plan — {stage['id']}"))
+            if MASK_PROMPT_REWRITE_DISPLAY_MASK:
+                mask_preview = effective_mask.convert("L")
+                mask_preview.thumbnail(
+                    (MASK_PROMPT_DISPLAY_MAX_SIDE, MASK_PROMPT_DISPLAY_MAX_SIDE)
+                )
+                display(mask_preview)
+                mask_preview.close()
+            display(Markdown(
+                "**Remote spatial analysis**\\n\\n"
+                f"{plan.spatial_analysis}\\n\\n"
+                "**Remote object layout**\\n\\n"
+                f"{plan.object_layout}\\n\\n"
+                "**Adapted FLUX prompt**\\n\\n"
+                f"{plan.rewritten_prompt}"
+            ))
+        return result
+
+    def generate_masked_anchor(
+        mask_source,
+        prompt,
+        seed,
+        init_image=None,
+        mask_result=None,
+    ):
+        if mask_result is None:
+            mask_result = build_background_mask(mask_source)
         generator = torch.Generator(device="cuda").manual_seed(seed)
         if init_image is None:
             generation_mode = "text_to_image"
@@ -494,17 +986,28 @@ model_cell["source"] = code_blocks(
         trial_trajectory = TRAJECTORY_RECORDS[trial_index]
         with Image.open(trial_trajectory["path"]) as opened:
             trial_mask_source = opened.convert("L")
-        trial_generation_prompt = trajectory_generation_prompt(trial_stage["prompt"])
+        trial_mask = build_background_mask(trial_mask_source)
+        (
+            trial_generation_prompt,
+            trial_prompt_plan_report,
+        ) = resolve_mask_aware_prompt(
+            trial_stage,
+            trial_mask.mask,
+            trial_index,
+        )
         (
             trial_image,
             trial_raw,
-            trial_mask,
+            returned_trial_mask,
             trial_generation_report,
         ) = generate_masked_anchor(
             trial_mask_source,
             trial_generation_prompt,
             trial_seed,
+            mask_result=trial_mask,
         )
+        if returned_trial_mask is not trial_mask:
+            raise RuntimeError("Trial mask object unexpectedly changed")
         trial_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         trial_directory = (
             RUN_DIRECTORY / "trials" / f"{trial_stamp}_{trial_stage['id']}_{trial_seed}"
@@ -540,6 +1043,7 @@ model_cell["source"] = code_blocks(
             "effective_denoising_steps": (
                 trial_generation_report["effective_denoising_steps"]
             ),
+            "mask_prompt_rewrite": trial_prompt_plan_report,
             "generation_prompt": trial_generation_prompt,
         }, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8")
         previews = [
@@ -567,6 +1071,8 @@ model_cell["source"] = code_blocks(
             trial_raw,
             trial_mask_source,
             trial_mask,
+            returned_trial_mask,
+            trial_prompt_plan_report,
             trial_generation_report,
         )
     else:
@@ -580,10 +1086,12 @@ anchor_markdown["source"] = lines(
     ## 7. Generate background-masked cyclic anchor paintings
 
     Each selected ZIP frame is loaded directly as a continuous grayscale reveal mask.
-    Anchor 1 is a normal full-frame text-to-image generation. Every later anchor uses
-    conventional latent img2img from a weak blurred, background-blended, grained version
-    of the preceding masked anchor. Only after decoding is the grayscale mask composited
-    over the exact selected background color.
+    The remote vision model first rewrites each complete prompt in detail around the
+    effective white geometry, assigning focal objects to broad lobes and flexible
+    ornament to corridors and edges. Anchor 1 is then normal text-to-image generation.
+    Every later anchor uses conventional latent img2img from a weak blurred,
+    background-blended, grained version of the preceding masked anchor. Only after
+    decoding is the grayscale mask composited over the exact selected background color.
     """
 )
 
@@ -609,6 +1117,11 @@ anchor_cell["source"] = lines(
         "later_anchor_mode": "latent_img2img_from_weak_previous_anchor",
         "mask_application": "post_decode_continuous_alpha_composite",
         "mask_used_by_model": False,
+        "mask_used_by_prompt_planner": MASK_PROMPT_REWRITE_ENABLED,
+        "mask_prompt_planner_model": (
+            OPENAI_MODEL if MASK_PROMPT_REWRITE_ENABLED else None
+        ),
+        "mask_prompt_rewrite_image_detail": MASK_PROMPT_REWRITE_IMAGE_DETAIL,
         "polarity": "white_editable_black_protected",
         "continuous_values_preserved": True,
         "previous_init_enabled": PREVIOUS_INIT_ENABLED,
@@ -620,18 +1133,51 @@ anchor_cell["source"] = lines(
         "source_used_as_image_reference": False,
         "previous_init_used_as_latent_img2img_source": True,
     }
+
+    MASK_PROMPT_RECORDS = []
+    for index, (stage, trajectory) in enumerate(
+        zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)
+    ):
+        with Image.open(trajectory["path"]) as opened:
+            planning_mask_source = opened.convert("L")
+        planning_mask_result = build_background_mask(planning_mask_source)
+        generation_prompt, prompt_plan_report = resolve_mask_aware_prompt(
+            stage,
+            planning_mask_result.mask,
+            index,
+        )
+        MASK_PROMPT_RECORDS.append({
+            "generation_prompt": generation_prompt,
+            "fingerprint": prompt_plan_report["fingerprint"],
+            "cache_hit": prompt_plan_report["cache_hit"],
+            "plan_path": str(
+                RUN_DIRECTORY
+                / "metadata"
+                / "mask_prompt_plans"
+                / f"{index:03d}_{stage['id']}.json"
+            ),
+        })
+        planning_mask_source.close()
+        planning_mask_result.mask.close()
+
     expected_anchor_contract = [
         {
             "uid": f"base_{index:03d}",
             "science": stage["science"],
             "prompt": stage["prompt"],
-            "generation_prompt": trajectory_generation_prompt(stage["prompt"]),
+            "generation_prompt": prompt_record["generation_prompt"],
+            "mask_prompt_fingerprint": prompt_record["fingerprint"],
             "trajectory_member": trajectory["member"],
             "trajectory_member_sha256": trajectory["member_sha256"],
             "mask_contract": MASK_CONTRACT,
         }
-        for index, (stage, trajectory) in enumerate(
-            zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)
+        for index, (stage, trajectory, prompt_record) in enumerate(
+            zip(
+                ACTIVE_BASE_STAGES,
+                TRAJECTORY_RECORDS,
+                MASK_PROMPT_RECORDS,
+                strict=True,
+            )
         )
     ]
 
@@ -647,6 +1193,9 @@ anchor_cell["source"] = lines(
                 "science": record["science"],
                 "prompt": record["prompt"],
                 "generation_prompt": record.get("generation_prompt"),
+                "mask_prompt_fingerprint": record.get(
+                    "mask_prompt_fingerprint"
+                ),
                 "trajectory_member": record["trajectory_member"],
                 "trajectory_member_sha256": record["trajectory_member_sha256"],
                 "mask_contract": record.get("mask_contract"),
@@ -669,8 +1218,13 @@ anchor_cell["source"] = lines(
         if SAVE_PREVIOUS_INITS:
             INIT_DIRECTORY.mkdir(parents=True, exist_ok=True)
         previous = None
-        for index, (stage, trajectory) in enumerate(
-            zip(ACTIVE_BASE_STAGES, TRAJECTORY_RECORDS, strict=True)
+        for index, (stage, trajectory, prompt_record) in enumerate(
+            zip(
+                ACTIVE_BASE_STAGES,
+                TRAJECTORY_RECORDS,
+                MASK_PROMPT_RECORDS,
+                strict=True,
+            )
         ):
             seed = BASE_SEED + index
             with Image.open(trajectory["path"]) as opened:
@@ -693,7 +1247,8 @@ anchor_cell["source"] = lines(
                         format="PNG",
                         compress_level=4,
                     )
-            generation_prompt = trajectory_generation_prompt(stage["prompt"])
+            generation_prompt = prompt_record["generation_prompt"]
+            prepared_mask_result = build_background_mask(mask_source)
             (
                 image,
                 raw_image,
@@ -704,7 +1259,10 @@ anchor_cell["source"] = lines(
                 generation_prompt,
                 seed,
                 init_image=previous_init,
+                mask_result=prepared_mask_result,
             )
+            if mask_result is not prepared_mask_result:
+                raise RuntimeError("Anchor mask object unexpectedly changed")
             mask_path = MASK_DIRECTORY / f"mask_{index:03d}.png"
             raw_path = RAW_DIRECTORY / f"{index:03d}_{stage['id']}_raw.png"
             output_path = BASE_DIRECTORY / f"{index:03d}_{stage['id']}.png"
@@ -718,6 +1276,9 @@ anchor_cell["source"] = lines(
                 "science": stage["science"],
                 "prompt": stage["prompt"],
                 "generation_prompt": generation_prompt,
+                "mask_prompt_fingerprint": prompt_record["fingerprint"],
+                "mask_prompt_cache_hit": prompt_record["cache_hit"],
+                "mask_prompt_plan_path": prompt_record["plan_path"],
                 "seed": seed,
                 "path": str(output_path),
                 "raw_generation_path": str(raw_path),
@@ -764,6 +1325,7 @@ anchor_cell["source"] = lines(
             raw_image.close()
             image.close()
             mask_result.mask.close()
+            del prepared_mask_result
             del generation_report
         if previous is not None:
             previous.close()
