@@ -155,16 +155,20 @@ def test_background_mask_notebook_has_bottom_flicker_diagnosis_cell() -> None:
     assert "FLICKER_ANALYSIS_MAX_SIDE = 256" in code
     assert "FLICKER_OUTLIER_MAD_MULTIPLIER = 3.5" in code
     assert "FLICKER_MINIMUM_OUTLIER_SCORE = 3.0" in code
-    assert "from flowmorph_klein.flicker_diagnostics import (" in code
+    assert "from flowmorph_klein.flicker_diagnostics import (" not in code
     assert "diagnose_cyclic_flicker(" in code
     assert "format_flicker_diagnostic_markdown(" in code
-    assert "def diagnose_cyclic_flicker(" not in code
-    assert "def format_flicker_diagnostic_markdown(" not in code
+    assert "def diagnose_cyclic_flicker(" in code
+    assert "def format_flicker_diagnostic_markdown(" in code
     assert '"images_modified": False' in code
+    assert '"project_package_reload_required": False' in code
     assert notebook["cells"][-2]["source"][0].startswith(
         "## 14. Read-only cyclic flicker diagnosis"
     )
     assert "FLICKER_DIAGNOSTIC_RESULT" in "".join(
+        notebook["cells"][-1]["source"]
+    )
+    assert "def diagnose_cyclic_flicker(" in "".join(
         notebook["cells"][-1]["source"]
     )
 

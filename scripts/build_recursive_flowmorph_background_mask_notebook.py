@@ -1987,6 +1987,101 @@ final_video_source = source(final_video_cell).replace(
 )
 final_video_cell["source"] = final_video_source.splitlines(keepends=True)
 
+flicker_inline_source = (
+    ROOT / "src" / "flowmorph_klein" / "flicker_diagnostics.py"
+).read_text(encoding="utf-8")
+flicker_runtime_source = dedent(
+    """
+    from IPython.display import Markdown, display
+
+    if RUN_FLICKER_DIAGNOSTIC:
+        diagnostic_records = globals().get("FINAL_RECORDS")
+        if diagnostic_records is None:
+            manifest_candidates = [
+                RUN_DIRECTORY
+                / "metadata"
+                / "final_recursive_flowmorph_sequence.json",
+                RUN_DIRECTORY
+                / "metadata"
+                / "final_recursive_flowmorph_sequence_tone_stabilized.json",
+                RUN_DIRECTORY
+                / "metadata"
+                / "final_recursive_sequence.json",
+            ]
+            diagnostic_manifest = next(
+                (path for path in manifest_candidates if path.is_file()),
+                None,
+            )
+            if diagnostic_manifest is None:
+                raise RuntimeError(
+                    "No final sequence is available for flicker diagnosis. "
+                    "Run the FlowMorph sequence or set RESUME_RUN_DIRECTORY "
+                    "to a completed run first."
+                )
+            diagnostic_records = json.loads(
+                diagnostic_manifest.read_text(encoding="utf-8")
+            )["records"]
+            print("Restored diagnostic records from", diagnostic_manifest)
+
+        final_gap_size = (
+            int(FLOWMORPH_ROUND_SPECS[-1]["midpoint_count"]) + 1
+        )
+        FLICKER_DIAGNOSTIC_RESULT = diagnose_cyclic_flicker(
+            diagnostic_records,
+            RUN_DIRECTORY / "diagnostics" / "flicker",
+            config=FlickerDiagnosticConfig(
+                analysis_max_side=FLICKER_ANALYSIS_MAX_SIDE,
+                outlier_mad_multiplier=(
+                    FLICKER_OUTLIER_MAD_MULTIPLIER
+                ),
+                minimum_outlier_score=(
+                    FLICKER_MINIMUM_OUTLIER_SCORE
+                ),
+                max_lag=FLICKER_MAX_LAG,
+                gap_size=final_gap_size,
+                render_batch_size=FLOWMORPH_RENDER_BATCH_SIZE,
+            ),
+        )
+        flicker_preview = Image.open(
+            FLICKER_DIAGNOSTIC_RESULT.plot_path
+        ).convert("RGB")
+        flicker_preview.thumbnail(
+            (CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000)
+        )
+        display(Markdown("### Raw FlowMorph flicker pattern diagnosis"))
+        display(flicker_preview)
+        flicker_preview.close()
+        display(Markdown(format_flicker_diagnostic_markdown(
+            FLICKER_DIAGNOSTIC_RESULT.report,
+            max_pulse_centers=40,
+            ranked_limit=10,
+        )))
+        strong_hypotheses = [
+            item
+            for item in FLICKER_DIAGNOSTIC_RESULT.report["hypotheses"]
+            if item.get("support") == "strong"
+        ]
+        print({
+            "raw_frames_analyzed": (
+                FLICKER_DIAGNOSTIC_RESULT.report["frame_count"]
+            ),
+            "pulse_centers": (
+                FLICKER_DIAGNOSTIC_RESULT.report["outlier_indices"]
+            ),
+            "strong_hypotheses": strong_hypotheses,
+            "dominant_periods": (
+                FLICKER_DIAGNOSTIC_RESULT.report["dominant_periods"][:5]
+            ),
+            "report": str(FLICKER_DIAGNOSTIC_RESULT.report_path),
+            "plot": str(FLICKER_DIAGNOSTIC_RESULT.plot_path),
+            "images_modified": False,
+            "project_package_reload_required": False,
+        })
+    else:
+        print("Flicker diagnosis disabled.")
+    """
+)
+
 notebook["cells"].extend(
     [
         {
@@ -2002,8 +2097,10 @@ notebook["cells"].extend(
                 centers, and tests whether high scores repeat at a particular midpoint
                 position, render-batch slot, whole-gap period, or other spectral period.
 
-                The PNG plot and complete JSON audit are written into the persistent run
-                directory. Tone stabilization is not used by this diagnosis.
+                The implementation is temporarily embedded in this cell, so it works in
+                the current kernel without reinstalling or reloading the project package.
+                The PNG plot and complete JSON audit are also written into the persistent
+                run directory. Tone stabilization is not used by this diagnosis.
                 """
             ),
         },
@@ -2013,103 +2110,9 @@ notebook["cells"].extend(
             "id": "background-mask-flicker-diagnosis",
             "metadata": {},
             "outputs": [],
-            "source": lines(
-                """
-                import json
-                from pathlib import Path
-                from PIL import Image
-                from IPython.display import Markdown, display
-                from flowmorph_klein.flicker_diagnostics import (
-                    FlickerDiagnosticConfig,
-                    diagnose_cyclic_flicker,
-                    format_flicker_diagnostic_markdown,
-                )
-
-                if RUN_FLICKER_DIAGNOSTIC:
-                    diagnostic_records = globals().get("FINAL_RECORDS")
-                    if diagnostic_records is None:
-                        manifest_candidates = [
-                            RUN_DIRECTORY
-                            / "metadata"
-                            / "final_recursive_flowmorph_sequence.json",
-                            RUN_DIRECTORY
-                            / "metadata"
-                            / "final_recursive_flowmorph_sequence_tone_stabilized.json",
-                            RUN_DIRECTORY
-                            / "metadata"
-                            / "final_recursive_sequence.json",
-                        ]
-                        diagnostic_manifest = next(
-                            (path for path in manifest_candidates if path.is_file()),
-                            None,
-                        )
-                        if diagnostic_manifest is None:
-                            raise RuntimeError(
-                                "No final sequence is available for flicker diagnosis. "
-                                "Run the FlowMorph sequence or set RESUME_RUN_DIRECTORY "
-                                "to a completed run first."
-                            )
-                        diagnostic_records = json.loads(
-                            diagnostic_manifest.read_text(encoding="utf-8")
-                        )["records"]
-                        print("Restored diagnostic records from", diagnostic_manifest)
-
-                    final_gap_size = (
-                        int(FLOWMORPH_ROUND_SPECS[-1]["midpoint_count"]) + 1
-                    )
-                    FLICKER_DIAGNOSTIC_RESULT = diagnose_cyclic_flicker(
-                        diagnostic_records,
-                        RUN_DIRECTORY / "diagnostics" / "flicker",
-                        config=FlickerDiagnosticConfig(
-                            analysis_max_side=FLICKER_ANALYSIS_MAX_SIDE,
-                            outlier_mad_multiplier=(
-                                FLICKER_OUTLIER_MAD_MULTIPLIER
-                            ),
-                            minimum_outlier_score=(
-                                FLICKER_MINIMUM_OUTLIER_SCORE
-                            ),
-                            max_lag=FLICKER_MAX_LAG,
-                            gap_size=final_gap_size,
-                            render_batch_size=FLOWMORPH_RENDER_BATCH_SIZE,
-                        ),
-                    )
-                    flicker_preview = Image.open(
-                        FLICKER_DIAGNOSTIC_RESULT.plot_path
-                    ).convert("RGB")
-                    flicker_preview.thumbnail(
-                        (CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000)
-                    )
-                    display(Markdown("### Raw FlowMorph flicker pattern diagnosis"))
-                    display(flicker_preview)
-                    flicker_preview.close()
-                    display(Markdown(format_flicker_diagnostic_markdown(
-                        FLICKER_DIAGNOSTIC_RESULT.report,
-                        max_pulse_centers=40,
-                        ranked_limit=10,
-                    )))
-                    strong_hypotheses = [
-                        item
-                        for item in FLICKER_DIAGNOSTIC_RESULT.report["hypotheses"]
-                        if item.get("support") == "strong"
-                    ]
-                    print({
-                        "raw_frames_analyzed": (
-                            FLICKER_DIAGNOSTIC_RESULT.report["frame_count"]
-                        ),
-                        "pulse_centers": (
-                            FLICKER_DIAGNOSTIC_RESULT.report["outlier_indices"]
-                        ),
-                        "strong_hypotheses": strong_hypotheses,
-                        "dominant_periods": (
-                            FLICKER_DIAGNOSTIC_RESULT.report["dominant_periods"][:5]
-                        ),
-                        "report": str(FLICKER_DIAGNOSTIC_RESULT.report_path),
-                        "plot": str(FLICKER_DIAGNOSTIC_RESULT.plot_path),
-                        "images_modified": False,
-                    })
-                else:
-                    print("Flicker diagnosis disabled.")
-                """
+            "source": code_blocks(
+                flicker_inline_source,
+                flicker_runtime_source,
             ),
         },
     ]
