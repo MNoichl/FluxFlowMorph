@@ -247,6 +247,20 @@ mask_settings = dedent(
     PREVIOUS_INIT_BACKGROUND_RGB = MASK_INIT_BACKGROUND_RGB
     SAVE_PREVIOUS_INITS = True
 
+    # Optional post-FlowMorph tonal outlier correction before previews and RIFE.
+    # Raw FlowMorph PNGs are never overwritten. Only detected outliers receive
+    # corrected copies; unchanged records continue to reference their raw PNGs.
+    TEMPORAL_TONE_STABILIZATION_ENABLED = True
+    TEMPORAL_TONE_WINDOW_RADIUS = 2
+    TEMPORAL_TONE_STRENGTH = 0.70
+    TEMPORAL_TONE_MEAN_THRESHOLD = 0.02
+    TEMPORAL_TONE_CONTRAST_THRESHOLD = 0.10
+    TEMPORAL_TONE_MAD_MULTIPLIER = 3.5
+    TEMPORAL_TONE_MAX_MEAN_SHIFT = 0.06
+    TEMPORAL_TONE_MAX_CONTRAST_SCALE_DELTA = 0.15
+    TEMPORAL_TONE_ANALYSIS_MAX_SIDE = 256
+    TEMPORAL_TONE_REUSE_EXISTING = True
+
     TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True
 
     """
@@ -321,6 +335,24 @@ mask_validation = dedent(
         not 0 <= channel <= 255 for channel in PREVIOUS_INIT_BACKGROUND_RGB
     ):
         raise ValueError("PREVIOUS_INIT_BACKGROUND_RGB must contain three values in [0, 255]")
+    if TEMPORAL_TONE_WINDOW_RADIUS < 1:
+        raise ValueError("TEMPORAL_TONE_WINDOW_RADIUS must be positive")
+    if not 0 <= TEMPORAL_TONE_STRENGTH <= 1:
+        raise ValueError("TEMPORAL_TONE_STRENGTH must lie in [0, 1]")
+    if TEMPORAL_TONE_MEAN_THRESHOLD < 0:
+        raise ValueError("TEMPORAL_TONE_MEAN_THRESHOLD cannot be negative")
+    if TEMPORAL_TONE_CONTRAST_THRESHOLD < 0:
+        raise ValueError("TEMPORAL_TONE_CONTRAST_THRESHOLD cannot be negative")
+    if TEMPORAL_TONE_MAD_MULTIPLIER < 0:
+        raise ValueError("TEMPORAL_TONE_MAD_MULTIPLIER cannot be negative")
+    if not 0 <= TEMPORAL_TONE_MAX_MEAN_SHIFT <= 1:
+        raise ValueError("TEMPORAL_TONE_MAX_MEAN_SHIFT must lie in [0, 1]")
+    if not 0 <= TEMPORAL_TONE_MAX_CONTRAST_SCALE_DELTA < 1:
+        raise ValueError(
+            "TEMPORAL_TONE_MAX_CONTRAST_SCALE_DELTA must lie in [0, 1)"
+        )
+    if TEMPORAL_TONE_ANALYSIS_MAX_SIDE < 32:
+        raise ValueError("TEMPORAL_TONE_ANALYSIS_MAX_SIDE must be at least 32")
     if MASK_PROMPT_REWRITE_IMAGE_DETAIL not in {"low", "high", "original", "auto"}:
         raise ValueError(
             "MASK_PROMPT_REWRITE_IMAGE_DETAIL must be low, high, original, or auto"
@@ -1760,8 +1792,141 @@ assembly_markdown["source"] = lines(
     are reapplied to its fitted endpoints or interpolated frames.
     Round 1 contributes one explicit midpoint, Round 2 contributes ten shared-prompt
     renders, and the final-to-first gap closes the loop before RIFE finishing.
+
+    If enabled, the reusable temporal-tone helper compares every final frame with its
+    cyclic neighbors and gently corrects only robust luminance/contrast outliers. Raw
+    FlowMorph PNGs remain untouched, while previews and RIFE use the corrected paths.
     """
 )
+
+assembly_cell = find_cell(
+    notebook,
+    "# A Colab reconnect clears Python variables while completed manifests",
+)
+assembly_source = source(assembly_cell)
+assembly_source = assembly_source.replace(
+    "from flowmorph_klein.visualization import make_contact_sheet\n",
+    """from flowmorph_klein.temporal_tone import (
+    TemporalToneConfig,
+    stabilize_cyclic_tone,
+)
+from flowmorph_klein.visualization import make_contact_sheet
+""",
+    1,
+)
+assembly_source = assembly_source.replace(
+    """    restored_manifest_candidates.extend([
+        RUN_DIRECTORY / "metadata" / "final_recursive_flowmorph_sequence.json",
+""",
+    """    restored_manifest_candidates.extend([
+        RUN_DIRECTORY
+        / "metadata"
+        / "final_recursive_flowmorph_sequence_tone_stabilized.json",
+        RUN_DIRECTORY / "metadata" / "final_recursive_flowmorph_sequence.json",
+""",
+    1,
+)
+assembly_source = assembly_source.replace(
+    """                *RUN_DIRECTORY.parent.glob(
+                    "*/metadata/final_recursive_flowmorph_sequence.json"
+                ),
+""",
+    """                *RUN_DIRECTORY.parent.glob(
+                    "*/metadata/final_recursive_flowmorph_sequence_tone_stabilized.json"
+                ),
+                *RUN_DIRECTORY.parent.glob(
+                    "*/metadata/final_recursive_flowmorph_sequence.json"
+                ),
+""",
+    1,
+)
+tone_stabilization = dedent(
+    """
+    raw_final_records = []
+    for item in FINAL_RECORDS:
+        raw_item = dict(item)
+        raw_item["path"] = item.get("raw_flowmorph_path", item["path"])
+        raw_final_records.append(raw_item)
+
+    if TEMPORAL_TONE_STABILIZATION_ENABLED:
+        tone_directory = RUN_DIRECTORY / "temporal_tone_stabilization"
+        raw_sequence_manifest = (
+            RUN_DIRECTORY / "metadata" / "final_recursive_flowmorph_sequence.json"
+        )
+        if not raw_sequence_manifest.is_file():
+            raw_sequence_manifest = Path(FINAL_SEQUENCE_MANIFEST)
+        tone_result = stabilize_cyclic_tone(
+            [item["path"] for item in raw_final_records],
+            tone_directory / "corrected_frames",
+            config=TemporalToneConfig(
+                window_radius=TEMPORAL_TONE_WINDOW_RADIUS,
+                strength=TEMPORAL_TONE_STRENGTH,
+                mean_threshold=TEMPORAL_TONE_MEAN_THRESHOLD,
+                contrast_threshold=TEMPORAL_TONE_CONTRAST_THRESHOLD,
+                mad_multiplier=TEMPORAL_TONE_MAD_MULTIPLIER,
+                max_mean_shift=TEMPORAL_TONE_MAX_MEAN_SHIFT,
+                max_contrast_scale_delta=(
+                    TEMPORAL_TONE_MAX_CONTRAST_SCALE_DELTA
+                ),
+                analysis_max_side=TEMPORAL_TONE_ANALYSIS_MAX_SIDE,
+            ),
+            report_path=tone_directory / "temporal_tone_report.json",
+            reuse_existing=TEMPORAL_TONE_REUSE_EXISTING,
+        )
+        stabilized_records = []
+        for item, raw_item, stabilized_path, frame_audit in zip(
+            FINAL_RECORDS,
+            raw_final_records,
+            tone_result.output_paths,
+            tone_result.report["frames"],
+            strict=True,
+        ):
+            stabilized = dict(item)
+            stabilized["raw_flowmorph_path"] = raw_item["path"]
+            stabilized["path"] = str(stabilized_path)
+            stabilized["temporal_tone_corrected"] = frame_audit["corrected"]
+            stabilized["temporal_tone_report_path"] = str(tone_result.report_path)
+            stabilized_records.append(stabilized)
+        FINAL_RECORDS = stabilized_records
+        tone_sequence_manifest = (
+            RUN_DIRECTORY
+            / "metadata"
+            / "final_recursive_flowmorph_sequence_tone_stabilized.json"
+        )
+        tone_sequence_manifest.write_text(json.dumps({
+            "project": PROJECT_NAME,
+            "cyclic": True,
+            "source_manifest": str(raw_sequence_manifest),
+            "temporal_tone_stabilization_enabled": True,
+            "temporal_tone_fingerprint": tone_result.report["fingerprint"],
+            "temporal_tone_report": str(tone_result.report_path),
+            "corrected_count": tone_result.report["corrected_count"],
+            "corrected_indices": tone_result.report["corrected_indices"],
+            "cache_hit": tone_result.cache_hit,
+            "final_count": len(FINAL_RECORDS),
+            "records": FINAL_RECORDS,
+        }, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8")
+        FINAL_SEQUENCE_MANIFEST = tone_sequence_manifest
+        print({
+            "temporal_tone_stabilization": True,
+            "corrected_frames": tone_result.report["corrected_count"],
+            "total_frames": len(FINAL_RECORDS),
+            "cache_hit": tone_result.cache_hit,
+            "raw_frames_preserved": True,
+            "report": str(tone_result.report_path),
+        })
+    else:
+        FINAL_RECORDS = raw_final_records
+        print("Temporal tone stabilization disabled; using raw FlowMorph frames.")
+
+    """
+)
+assembly_source = assembly_source.replace(
+    'if len(FINAL_RECORDS) < 3:\n',
+    tone_stabilization + 'if len(FINAL_RECORDS) < 3:\n',
+    1,
+)
+assembly_cell["source"] = assembly_source.splitlines(keepends=True)
 
 final_video_cell = find_cell(notebook, "recursive_flowmorph_trajectory_rife_ssim_loop.mp4")
 final_video_source = source(final_video_cell).replace(

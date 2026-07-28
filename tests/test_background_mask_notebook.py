@@ -130,6 +130,25 @@ def test_background_mask_notebook_mixes_weak_previous_reference_into_init() -> N
     assert "image=mask_source" not in code
 
 
+def test_background_mask_notebook_uses_loadable_temporal_tone_stabilizer() -> None:
+    _, code = _load_notebook()
+    assert "TEMPORAL_TONE_STABILIZATION_ENABLED = True" in code
+    assert "TEMPORAL_TONE_WINDOW_RADIUS = 2" in code
+    assert "TEMPORAL_TONE_STRENGTH = 0.70" in code
+    assert "TEMPORAL_TONE_MEAN_THRESHOLD = 0.02" in code
+    assert "TEMPORAL_TONE_CONTRAST_THRESHOLD = 0.10" in code
+    assert "TEMPORAL_TONE_MAD_MULTIPLIER = 3.5" in code
+    assert "TEMPORAL_TONE_MAX_MEAN_SHIFT = 0.06" in code
+    assert "TEMPORAL_TONE_MAX_CONTRAST_SCALE_DELTA = 0.15" in code
+    assert "from flowmorph_klein.temporal_tone import (" in code
+    assert "stabilize_cyclic_tone(" in code
+    assert "def stabilize_cyclic_tone(" not in code
+    assert '"raw_flowmorph_path"' in code
+    assert '"temporal_tone_corrected"' in code
+    assert "final_recursive_flowmorph_sequence_tone_stabilized.json" in code
+    assert '"raw_frames_preserved": True' in code
+
+
 def test_background_mask_notebook_preserves_user_prompts_and_settings() -> None:
     notebook, code = _load_notebook()
     assert "IMAGE_GUIDANCE_SCALE = 7.0" in code
