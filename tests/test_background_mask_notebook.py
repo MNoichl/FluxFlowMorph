@@ -81,7 +81,7 @@ def test_background_mask_notebook_uses_soft_mask_noise_img2img_without_postmask(
     assert "MASK_INIT_NOISE_LOW = 0" in code
     assert "MASK_INIT_NOISE_HIGH = 255" in code
     assert "MASK_INIT_NOISE_BEIGE_MIX = 0.18" in code
-    assert "MASK_INIT_BACKGROUND_NOISE_MIX = 0.04" in code
+    assert "MASK_INIT_BACKGROUND_NOISE_MIX = 0.09" in code
     assert "MASK_INIT_DENOISE_STRENGTH = 0.75" in code
     assert "smooth_mask_for_initialization(" in code
     assert "ImageFilter.GaussianBlur(radius=MASK_INIT_GAUSSIAN_BLUR)" in code
@@ -108,13 +108,18 @@ def test_background_mask_notebook_mixes_weak_previous_reference_into_init() -> N
     assert "PREVIOUS_INIT_BLEND = 0.12" in code
     assert "PREVIOUS_INIT_BLUR = 16.0" in code
     assert "PREVIOUS_INIT_GRAIN_STRENGTH = 0.035" in code
-    assert "MASK_INIT_PREVIOUS_MIX = 0.18" in code
+    assert "MASK_INIT_PREVIOUS_ACTIVE_MIX = 0.18" in code
+    assert "MASK_INIT_PREVIOUS_QUIET_MIX = 0.03" in code
     assert "make_soft_reference(" in code
     assert "build_mask_noise_initialization(" in code
     assert "Image.blend(" in code
     assert "mask_noise_init," in code
     assert "previous_reference," in code
-    assert "MASK_INIT_PREVIOUS_MIX," in code
+    assert "MASK_INIT_PREVIOUS_ACTIVE_MIX," in code
+    assert "MASK_INIT_PREVIOUS_QUIET_MIX," in code
+    assert "active_previous_init," in code
+    assert "quiet_previous_init," in code
+    assert '"gaussian_smoothed_activity_mask"' in code
     assert "prepare_flux2_klein_img2img_inputs(" in code
     assert "sigmas=list(generation_inputs.sigmas)" in code
     assert "latents=generation_inputs.latents" in code
