@@ -4,6 +4,8 @@ import ast
 import json
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = (
@@ -75,7 +77,7 @@ def test_background_mask_notebook_uses_soft_mask_noise_img2img_without_postmask(
     assert "callback_on_step_end=masked_inputs.callback_on_step_end" not in code
     assert "IMAGE_INFERENCE_STEPS = 50" in code
     assert "MASK_INIT_BACKGROUND_RGB = (238, 233, 218)" in code
-    assert "MASK_INIT_GAUSSIAN_BLUR = 32.0" in code
+    assert "MASK_INIT_GAUSSIAN_BLUR = 64.0" in code
     assert "MASK_INIT_NOISE_LOW = 0" in code
     assert "MASK_INIT_NOISE_HIGH = 255" in code
     assert "MASK_INIT_NOISE_BEIGE_MIX = 0.18" in code
@@ -194,6 +196,66 @@ def test_background_mask_notebook_rewrites_each_prompt_from_mask_geometry() -> N
     assert "**Remote object layout**" in code
     assert "**Adapted FLUX prompt**" in code
     assert "generation_prompt," in code
+
+
+def test_background_mask_notebook_enforces_flux_prompt_token_limit() -> None:
+    _, code = _load_notebook()
+    assert "FLUX_PROMPT_MAX_SEQUENCE_LENGTH = 512" in code
+    assert "def flux_prompt_token_count(prompt):" in code
+    assert "tokenizer.apply_chat_template(" in code
+    assert "add_generation_prompt=True" in code
+    assert "enable_thinking=False" in code
+    assert "truncation=False" in code
+    assert "def validate_flux_prompt_length(prompt, label=" in code
+    assert "token_count > FLUX_PROMPT_MAX_SEQUENCE_LENGTH" in code
+    assert "validate_flux_prompt_length(clean, \"Rewritten prompt\")" in code
+    assert "validate_flux_prompt_length(clean, \"Midpoint prompt\")" in code
+    assert "max_sequence_length=FLUX_PROMPT_MAX_SEQUENCE_LENGTH" in code
+    assert "FLUX_PROMPT_TOKENIZER = FLUX_PIPE.tokenizer" in code
+    assert "proposal.prompt = validate_midpoint_prompt(proposal.prompt)" in code
+    assert "FlowMorph conditioning prompt" in code
+    assert '"flux_prompt_token_count":' in code
+    assert '"flux_prompt_max_sequence_length": FLUX_PROMPT_MAX_SEQUENCE_LENGTH' in code
+
+
+def test_flux_prompt_limit_helper_rejects_only_overflow() -> None:
+    _, code = _load_notebook()
+    tree = ast.parse(code)
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"flux_prompt_token_count", "validate_flux_prompt_length"}
+    ]
+    assert {node.name for node in functions} == {
+        "flux_prompt_token_count",
+        "validate_flux_prompt_length",
+    }
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs == {
+                "tokenize": False,
+                "add_generation_prompt": True,
+                "enable_thinking": False,
+            }
+            return messages[0]["content"]
+
+        def __call__(self, text, **kwargs):
+            assert kwargs == {"padding": False, "truncation": False}
+            return {"input_ids": list(range(len(text)))}
+
+    namespace = {
+        "FLUX_PROMPT_MAX_SEQUENCE_LENGTH": 512,
+        "FLUX_PROMPT_TOKENIZER": FakeTokenizer(),
+    }
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), "<prompt-limit>", "exec"),
+        namespace,
+    )
+    assert namespace["validate_flux_prompt_length"]("x" * 512) == 512
+    with pytest.raises(ValueError, match="tokenizes to 513 tokens"):
+        namespace["validate_flux_prompt_length"]("x" * 513)
 
 
 def test_background_mask_notebook_does_not_reapply_masks_in_flowmorph() -> None:

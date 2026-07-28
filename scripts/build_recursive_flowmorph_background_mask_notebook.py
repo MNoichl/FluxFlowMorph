@@ -219,10 +219,12 @@ mask_settings = dedent(
     MASK_PROMPT_GEOMETRY_THRESHOLD = 0.35
     MASK_PROMPT_MIN_COMPONENT_FRACTION = 0.0005
     MASK_PROMPT_MAX_COMPONENTS = 12
+    # Official Flux2KleinPipeline prompt sequence limit, including chat-template tokens.
+    FLUX_PROMPT_MAX_SEQUENCE_LENGTH = 512
 
     # Soft noisy mask initialization. No mask is applied after FLUX decoding.
     MASK_INIT_BACKGROUND_RGB = (238, 233, 218)
-    MASK_INIT_GAUSSIAN_BLUR = 32.0
+    MASK_INIT_GAUSSIAN_BLUR = 64.0
     MASK_INIT_NOISE_LOW = 0
     MASK_INIT_NOISE_HIGH = 255
     # 0 = pure RGB noise; 1 = completely beige at the bright endpoint.
@@ -335,6 +337,13 @@ mask_validation = dedent(
         )
     if not 1 <= MASK_PROMPT_MAX_COMPONENTS <= 50:
         raise ValueError("MASK_PROMPT_MAX_COMPONENTS must lie in [1, 50]")
+    if not (
+        isinstance(FLUX_PROMPT_MAX_SEQUENCE_LENGTH, int)
+        and 32 <= FLUX_PROMPT_MAX_SEQUENCE_LENGTH <= 512
+    ):
+        raise ValueError(
+            "FLUX_PROMPT_MAX_SEQUENCE_LENGTH must be an integer in [32, 512]"
+        )
 
     def trajectory_generation_prompt(prompt):
         # Compatibility helper only: no local stylistic rewrite is performed.
@@ -410,6 +419,11 @@ if type(FLUX_PIPE).__name__ != "Flux2KleinPipeline":
     raise RuntimeError("Masked anchors require the standard Flux2KleinPipeline")
 """,
 )
+pipeline_setup += """
+# Retain the lightweight tokenizer after releasing the GPU-heavy generation pipeline.
+# Prompt validation must remain available during later OpenAI/FlowMorph rounds.
+FLUX_PROMPT_TOKENIZER = FLUX_PIPE.tokenizer
+"""
 model_cell["source"] = code_blocks(
     """
     import base64
@@ -514,6 +528,40 @@ model_cell["source"] = code_blocks(
         mask_noise_init.close()
         return generation_init, soft_mask, previous_reference
 
+    def flux_prompt_token_count(prompt):
+        tokenizer = globals().get("FLUX_PROMPT_TOKENIZER")
+        if tokenizer is None:
+            pipeline = globals().get("FLUX_PIPE")
+            tokenizer = getattr(pipeline, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError(
+                "The FLUX tokenizer is unavailable for prompt-length validation"
+            )
+        messages = [{"role": "user", "content": prompt}]
+        templated = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        input_ids = tokenizer(
+            templated,
+            padding=False,
+            truncation=False,
+        )["input_ids"]
+        if input_ids and isinstance(input_ids[0], list):
+            input_ids = input_ids[0]
+        return len(input_ids)
+
+    def validate_flux_prompt_length(prompt, label="Prompt"):
+        token_count = flux_prompt_token_count(prompt)
+        if token_count > FLUX_PROMPT_MAX_SEQUENCE_LENGTH:
+            raise ValueError(
+                f"{label} tokenizes to {token_count} tokens after the FLUX chat "
+                f"template; maximum is {FLUX_PROMPT_MAX_SEQUENCE_LENGTH}"
+            )
+        return token_count
+
     class MaskPromptPlan(BaseModel):
         spatial_analysis: str = Field(min_length=80, max_length=1800)
         object_layout: str = Field(min_length=120, max_length=2200)
@@ -561,8 +609,11 @@ model_cell["source"] = code_blocks(
     Rewritten-prompt contract:
     - It begins exactly with "{LORA_TRIGGER}," and contains that trigger exactly once.
     - It is a self-contained literal description of the final artwork, normally
-      300–550 words. Repeat all desired content and style; do not refer back to
+      220–320 words. Repeat all desired content and style; do not refer back to
       the input.
+    - After FLUX's Qwen chat template is applied, it must fit within
+      {FLUX_PROMPT_MAX_SEQUENCE_LENGTH} tokens. Prefer concise concrete description
+      over repetition.
     - It must not mention a mask, white/black areas, editable/protected pixels,
       alpha, compositing, cutouts, source material, prompt rewriting, or instructions
       to an editor. Convert all of that into ordinary spatial art direction.
@@ -756,6 +807,7 @@ model_cell["source"] = code_blocks(
                 "Rewritten prompt exposes production language: "
                 + ", ".join(found)
             )
+        validate_flux_prompt_length(clean, "Rewritten prompt")
         return clean
 
     def mask_prompt_request_fingerprint(stage, effective_mask, base_prompt):
@@ -838,8 +890,10 @@ model_cell["source"] = code_blocks(
                 correction = (
                     "\\n\\nThe previous response failed validation: "
                     f"{error}. Return complete valid structured output, make the "
-                    "rewritten prompt detailed and self-contained, begin it with "
-                    f"{LORA_TRIGGER}, and remove all production-language terms."
+                    "rewritten prompt detailed but more concise, keep its complete "
+                    f"chat-templated length below {FLUX_PROMPT_MAX_SEQUENCE_LENGTH} "
+                    f"tokens, begin it with {LORA_TRIGGER}, and remove all "
+                    "production-language terms."
                 )
                 if attempt < MASK_PROMPT_REWRITE_MAX_ATTEMPTS:
                     time.sleep(min(2 ** (attempt - 1), 4))
@@ -932,6 +986,10 @@ model_cell["source"] = code_blocks(
             response_id = response.id
             usage = mask_prompt_usage(response)
 
+        prompt_token_count = validate_flux_prompt_length(
+            plan.rewritten_prompt,
+            "Mask-adapted prompt",
+        )
         payload = {
             "fingerprint": fingerprint,
             "stage_index": stage_index,
@@ -941,6 +999,8 @@ model_cell["source"] = code_blocks(
             "cache_hit": cache_hit,
             "request_contract": request_contract,
             "plan": plan.model_dump(mode="json"),
+            "flux_prompt_token_count": prompt_token_count,
+            "flux_prompt_max_sequence_length": FLUX_PROMPT_MAX_SEQUENCE_LENGTH,
             "openai_model": OPENAI_MODEL,
             "openai_response_id": response_id,
             "usage": usage,
@@ -1002,6 +1062,7 @@ model_cell["source"] = code_blocks(
             guidance_scale=IMAGE_GUIDANCE_SCALE,
             generator=generator,
             output_type="pil",
+            max_sequence_length=FLUX_PROMPT_MAX_SEQUENCE_LENGTH,
         )
         if not result.images:
             raise RuntimeError("FLUX returned no anchor image")
@@ -1111,6 +1172,10 @@ model_cell["source"] = code_blocks(
             ),
             "mask_prompt_rewrite": trial_prompt_plan_report,
             "generation_prompt": trial_generation_prompt,
+            "generation_prompt_token_count": trial_prompt_plan_report[
+                "flux_prompt_token_count"
+            ],
+            "flux_prompt_max_sequence_length": FLUX_PROMPT_MAX_SEQUENCE_LENGTH,
         }, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8")
         previews = [
             ("Loaded grayscale mask source", trial_mask_source.convert("RGB")),
@@ -1201,6 +1266,7 @@ anchor_cell["source"] = lines(
             OPENAI_MODEL if MASK_PROMPT_REWRITE_ENABLED else None
         ),
         "mask_prompt_rewrite_image_detail": MASK_PROMPT_REWRITE_IMAGE_DETAIL,
+        "flux_prompt_max_sequence_length": FLUX_PROMPT_MAX_SEQUENCE_LENGTH,
         "polarity": (
             "bright_beige_tinted_noise_activity_"
             "dark_faintly_noisy_beige_quiet"
@@ -1375,6 +1441,10 @@ anchor_cell["source"] = lines(
                 "mask_prompt_fingerprint": prompt_record["fingerprint"],
                 "mask_prompt_cache_hit": prompt_record["cache_hit"],
                 "mask_prompt_plan_path": prompt_record["plan_path"],
+                "generation_prompt_token_count": validate_flux_prompt_length(
+                    generation_prompt,
+                    "Anchor generation prompt",
+                ),
                 "seed": seed,
                 "path": str(output_path),
                 "trajectory_index": trajectory["trajectory_index"],
@@ -1530,6 +1600,132 @@ contact_cell["source"] = lines(
     })
     """
 )
+
+midpoint_cell = find_cell(notebook, "class MidpointProposal")
+midpoint_source = source(midpoint_cell)
+midpoint_source = midpoint_source.replace(
+    '- The prompt begins exactly with "{LORA_TRIGGER}," and contains that trigger exactly once.\n',
+    """- The prompt begins exactly with "{LORA_TRIGGER}," and contains that trigger exactly once.
+- After FLUX's Qwen chat template is applied, the prompt must fit within
+  {FLUX_PROMPT_MAX_SEQUENCE_LENGTH} tokens. Prefer concise concrete description
+  over repetition.
+""",
+    1,
+)
+midpoint_source = midpoint_source.replace(
+    '        "system_prompt": MIDPOINT_SYSTEM_PROMPT,\n',
+    """        "system_prompt": MIDPOINT_SYSTEM_PROMPT,
+        "flux_prompt_max_sequence_length": FLUX_PROMPT_MAX_SEQUENCE_LENGTH,
+""",
+    1,
+)
+midpoint_source = midpoint_source.replace(
+    """    if found:
+        raise ValueError("Prompt contains production-language terms: " + ", ".join(found))
+    return clean
+""",
+    """    if found:
+        raise ValueError("Prompt contains production-language terms: " + ", ".join(found))
+    validate_flux_prompt_length(clean, "Midpoint prompt")
+    return clean
+""",
+    1,
+)
+midpoint_source = midpoint_source.replace(
+    """                f"\\n\\nThe previous result failed semantic validation: {error}. "
+                "Return a newly written literal prompt satisfying every prohibition."
+""",
+    """                f"\\n\\nThe previous result failed semantic validation: {error}. "
+                "Return a newly written literal prompt satisfying every prohibition "
+                f"and fitting within {FLUX_PROMPT_MAX_SEQUENCE_LENGTH} chat-templated tokens."
+""",
+    1,
+)
+midpoint_cell["source"] = midpoint_source.splitlines(keepends=True)
+
+sequence_cell = find_cell(notebook, "SEQUENCE_SESSION_CONTRACT")
+sequence_source = source(sequence_cell)
+sequence_source = sequence_source.replace(
+    """# The standalone anchor pipeline is fused and CPU-offloaded. Release it;
+# the sequence session loads one unfused differentiable model and retains it.
+release_flux_pipeline()
+""",
+    """# Audit every anchor prompt while the canonical tokenizer is available.
+BASE_PROMPT_TOKEN_COUNTS = {}
+for record in BASE_RECORDS:
+    BASE_PROMPT_TOKEN_COUNTS[record["uid"]] = {
+        "prompt": validate_flux_prompt_length(
+            record["prompt"],
+            f"{record['uid']} FlowMorph endpoint prompt",
+        ),
+        "generation_prompt": validate_flux_prompt_length(
+            record.get("generation_prompt", record["prompt"]),
+            f"{record['uid']} anchor generation prompt",
+        ),
+    }
+print({
+    "flux_prompt_max_sequence_length": FLUX_PROMPT_MAX_SEQUENCE_LENGTH,
+    "anchor_prompt_token_counts": BASE_PROMPT_TOKEN_COUNTS,
+})
+
+# The standalone anchor pipeline is fused and CPU-offloaded. Release it;
+# the sequence session loads one unfused differentiable model and retains it.
+# FLUX_PROMPT_TOKENIZER remains resident for later midpoint validation.
+release_flux_pipeline()
+""",
+    1,
+)
+sequence_source = sequence_source.replace(
+    """        if saved.get("combined_fingerprint") == combined_fingerprint:
+            return (
+                MidpointProposal.model_validate(saved["proposal"]),
+                saved.get("openai_response_id"),
+                saved.get("usage"),
+                combined_fingerprint,
+            )
+""",
+    """        if saved.get("combined_fingerprint") == combined_fingerprint:
+            proposal = MidpointProposal.model_validate(saved["proposal"])
+            proposal.prompt = validate_midpoint_prompt(proposal.prompt)
+            return (
+                proposal,
+                saved.get("openai_response_id"),
+                saved.get("usage"),
+                combined_fingerprint,
+            )
+""",
+    1,
+)
+sequence_source = sequence_source.replace(
+    '        "proposal": proposal.model_dump(mode="json"),\n',
+    """        "proposal": proposal.model_dump(mode="json"),
+        "flux_prompt_token_count": validate_flux_prompt_length(
+            proposal.prompt,
+            "Saved midpoint prompt",
+        ),
+        "flux_prompt_max_sequence_length": FLUX_PROMPT_MAX_SEQUENCE_LENGTH,
+""",
+    1,
+)
+sequence_source = sequence_source.replace(
+    '    "conditioning": "piecewise_source_midpoint_target_embeddings",\n',
+    """    "conditioning": "piecewise_source_midpoint_target_embeddings",
+    "flux_prompt_max_sequence_length": FLUX_PROMPT_MAX_SEQUENCE_LENGTH,
+""",
+    1,
+)
+sequence_source = sequence_source.replace(
+    """    if record_prompts or missing_prompts or missing_images:
+        new_prompts, new_images = SEQUENCE_SESSION.encode_missing_assets(
+""",
+    """    for prompt in [*record_prompts, *missing_prompts]:
+        validate_flux_prompt_length(prompt, "FlowMorph conditioning prompt")
+    if record_prompts or missing_prompts or missing_images:
+        new_prompts, new_images = SEQUENCE_SESSION.encode_missing_assets(
+""",
+    1,
+)
+sequence_cell["source"] = sequence_source.splitlines(keepends=True)
 
 assembly_markdown = find_cell(notebook, "## 10. Assemble, preview")
 assembly_markdown["source"] = lines(
