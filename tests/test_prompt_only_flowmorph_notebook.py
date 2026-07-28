@@ -85,11 +85,14 @@ def test_anchors_use_correct_weak_conventional_img2img_initialization() -> None:
     code = code_source(load_notebook())
     assert "make_soft_reference(" in code
     assert "prepare_flux2_klein_img2img_inputs(" in code
-    assert "BASE_REFERENCE_STRENGTH = 0.12" in code
+    assert "BASE_REFERENCE_STRENGTH" not in code
+    assert "REFERENCE_BACKGROUND" not in code
     assert "BASE_REFERENCE_BLUR = 16.0" in code
     assert "BASE_REFERENCE_GRAIN_STRENGTH = 0.035" in code
     assert "BASE_REFERENCE_DENOISE_STRENGTH = 0.75" in code
-    assert "REFERENCE_BACKGROUND = (238, 233, 218)" in code
+    assert "reference_blend=1.0" in code
+    assert "background_rgb=" not in code
+    assert "blurred_grained_previous_without_flat_canvas" in code
     assert 'kwargs["sigmas"] = list(generation_inputs.sigmas)' in code
     assert 'kwargs["latents"] = generation_inputs.latents' in code
     assert 'kwargs["image"] = reference' not in code

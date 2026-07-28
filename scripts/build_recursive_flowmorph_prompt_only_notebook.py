@@ -251,9 +251,13 @@ for old, new in (
     settings = replace_once(settings, old, new)
 settings = replace_once(
     settings,
+    "BASE_REFERENCE_STRENGTH = 0.12\n",
+    "",
+)
+settings = replace_once(
+    settings,
     "REFERENCE_BACKGROUND = (116, 105, 91)\n",
-    "BASE_REFERENCE_DENOISE_STRENGTH = 0.75\n"
-    "REFERENCE_BACKGROUND = (238, 233, 218)\n",
+    "BASE_REFERENCE_DENOISE_STRENGTH = 0.75\n",
 )
 settings = replace_once(
     settings,
@@ -316,6 +320,12 @@ validation = validation.replace(
     '    raise ValueError("This quality-first notebook requires 100 endpoint fitting steps")\n',
     "",
     1,
+)
+validation = replace_once(
+    validation,
+    'if not 0 < BASE_REFERENCE_STRENGTH <= 1.0:\n'
+    '    raise ValueError("BASE_REFERENCE_STRENGTH must lie in (0, 1]")\n',
+    "",
 )
 validation = replace_once(
     validation,
@@ -423,9 +433,10 @@ notebook["cells"][13]["source"] = lines(
 
     The first anchor is ordinary text-to-image. Later anchors optionally receive a
     weak blurred/grained previous painting as a conventional latent img2img start.
-    `BASE_REFERENCE_STRENGTH` controls how much previous content enters the soft
-    reference; `BASE_REFERENCE_DENOISE_STRENGTH` controls how strongly FLUX repaints
-    it toward the new prompt. No mask, spatial constraint, or post-composite is used.
+    Gaussian smoothing removes fine structure while optional grain prevents a
+    featureless wash. `BASE_REFERENCE_DENOISE_STRENGTH` controls how strongly FLUX
+    repaints the result toward the new prompt. No solid-color canvas, mask, spatial
+    constraint, or post-composite is used.
     """
 )
 notebook["cells"][14]["source"] = lines(
@@ -517,11 +528,12 @@ notebook["cells"][14]["source"] = lines(
             if previous is not None and BASE_CONTINUITY_ENABLED:
                 reference = make_soft_reference(
                     previous,
-                    reference_blend=BASE_REFERENCE_STRENGTH,
+                    # A blend of 1.0 means 100% blurred previous image. No
+                    # fixed beige/gray background canvas contributes.
+                    reference_blend=1.0,
                     blur_radius=BASE_REFERENCE_BLUR,
                     grain_strength=BASE_REFERENCE_GRAIN_STRENGTH,
                     grain_seed=seed,
-                    background_rgb=REFERENCE_BACKGROUND,
                 )
                 if SAVE_SOFT_REFERENCES:
                     REFERENCE_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -553,7 +565,9 @@ notebook["cells"][14]["source"] = lines(
                     str(reference_path) if reference_path else None
                 ),
                 "base_continuity_used": reference is not None,
-                "base_reference_blend": BASE_REFERENCE_STRENGTH,
+                "base_reference_source": (
+                    "blurred_grained_previous_without_flat_canvas"
+                ),
                 "base_reference_blur": BASE_REFERENCE_BLUR,
                 "base_reference_grain_strength": (
                     BASE_REFERENCE_GRAIN_STRENGTH
