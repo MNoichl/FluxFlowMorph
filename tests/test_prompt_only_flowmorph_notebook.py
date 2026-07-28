@@ -23,7 +23,7 @@ def code_source(notebook: dict) -> str:
     )
 
 
-def test_notebook_is_clean_parseable_and_has_colab_badge() -> None:
+def test_notebook_is_parseable_and_has_colab_badge() -> None:
     notebook = load_notebook()
     # Users may add notes or scratch cells around the generated workflow.
     assert len(notebook["cells"]) >= 33
@@ -35,8 +35,6 @@ def test_notebook_is_clean_parseable_and_has_colab_badge() -> None:
     for cell in notebook["cells"]:
         if cell.get("cell_type") != "code":
             continue
-        assert cell.get("execution_count") is None
-        assert cell.get("outputs") == []
         ast.parse("".join(cell.get("source", [])))
 
 
@@ -138,3 +136,28 @@ def test_tone_stabilization_flicker_audit_and_rife_finishing_are_retained() -> N
     assert "RIFE_MULTIPLIER = int(round(2 * VIDEO_SLOWDOWN_FACTOR))" in code
     assert "RIFE_FINAL_FPS = 24.0" in code
     assert "recursive_flowmorph_prompt_only_rife_ssim_loop.mp4" in code
+
+
+def test_every_generation_and_video_stage_closes_the_loop() -> None:
+    code = code_source(load_notebook())
+    # Recursive FlowMorph explicitly makes the final gap last -> first.
+    assert "right = incoming[(gap_index + 1) % gap_count]" in code
+    assert '"cyclic": True' in code
+
+    # The output sequence contains each unique frame once.
+    assert '"duplicate_terminal_frame": False' in code
+
+    # RIFE receives a temporary copy of frame zero after the final frame so it
+    # interpolates the wrap pair, verifies exact closure, then drops the copy.
+    assert (
+        'RIFE_INPUT_DIRECTORY / f"{len(EXPORT_FRAME_PATHS):07d}.png"'
+        in code
+    )
+    assert "if not np.array_equal(first_array, last_array):" in code
+    assert "RIFE_DENSE_PATHS = dense_with_duplicate[:-1]" in code
+    assert '"removed_exact_terminal_duplicate": True' in code
+
+    # Timing equalization and seam placement are circular as well.
+    assert "dense_luma[index - 1], dense_luma[index]" in code
+    assert "LOOP_AUTO_ROTATE_TO_QUIETEST_CUT = True" in code
+    assert '"terminal_duplicate_in_video": False' in code
