@@ -8,6 +8,7 @@ from PIL import Image
 from flowmorph_klein.flicker_diagnostics import (
     FlickerDiagnosticConfig,
     diagnose_cyclic_flicker,
+    format_flicker_diagnostic_markdown,
 )
 
 
@@ -55,6 +56,13 @@ def test_flicker_diagnostic_finds_repeated_gap_phase(tmp_path: Path) -> None:
     )
     assert gap_hypothesis["peak_phase"] == 3
     assert gap_hypothesis["support"] == "strong"
+    markdown = format_flicker_diagnostic_markdown(result.report)
+    assert "### Flicker diagnosis summary" in markdown
+    assert "#### Detected pulse centers" in markdown
+    assert "| 3 | frame_003 | 3 | 2 |" in markdown
+    assert "#### Mean score by render-batch slot" in markdown
+    assert "#### Strongest repeated lags" in markdown
+    assert "#### Dominant spectral periods" in markdown
 
 
 def test_flicker_diagnostic_prefers_raw_flowmorph_path(tmp_path: Path) -> None:

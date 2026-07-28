@@ -49,6 +49,178 @@ class FlickerDiagnosticResult:
     plot_path: Path
 
 
+def _markdown_cell(value: Any) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _markdown_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+    if not rows:
+        return "_None._"
+    heading = "| " + " | ".join(headers) + " |"
+    divider = "| " + " | ".join("---" for _ in headers) + " |"
+    body = [
+        "| " + " | ".join(_markdown_cell(value) for value in row) + " |"
+        for row in rows
+    ]
+    return "\n".join([heading, divider, *body])
+
+
+def format_flicker_diagnostic_markdown(
+    report: Mapping[str, Any],
+    *,
+    max_pulse_centers: int = 40,
+    ranked_limit: int = 10,
+) -> str:
+    """Format the useful JSON fields as notebook-visible Markdown tables."""
+
+    if max_pulse_centers < 1 or ranked_limit < 1:
+        raise ValueError("Markdown diagnostic limits must be positive")
+    frames = list(report.get("frames", ()))
+    pulse_frames = [frame for frame in frames if frame.get("outlier")]
+    pulse_rows = [
+        (
+            frame.get("index"),
+            frame.get("uid"),
+            frame.get("gap_phase"),
+            frame.get("render_batch_slot"),
+            frame.get("fraction"),
+            frame.get("flicker_score"),
+            frame.get("luminance_mean_robust_z"),
+            frame.get("luminance_contrast_robust_z"),
+            frame.get("saturation_robust_z"),
+            frame.get("edge_energy_robust_z"),
+        )
+        for frame in pulse_frames[:max_pulse_centers]
+    ]
+    gap_rows = [
+        (
+            row.get("phase"),
+            row.get("count"),
+            row.get("mean_score"),
+            row.get("median_score"),
+            row.get("outlier_count"),
+            row.get("outlier_rate"),
+        )
+        for row in report.get("gap_phase_summary", ())
+    ]
+    batch_rows = [
+        (
+            row.get("phase"),
+            row.get("count"),
+            row.get("mean_score"),
+            row.get("median_score"),
+            row.get("outlier_count"),
+            row.get("outlier_rate"),
+        )
+        for row in report.get("render_batch_slot_summary", ())
+    ]
+    ranked_lags = sorted(
+        report.get("autocorrelation_by_lag", ()),
+        key=lambda row: abs(float(row.get("correlation", 0.0))),
+        reverse=True,
+    )[:ranked_limit]
+    lag_rows = [
+        (row.get("lag"), row.get("correlation"))
+        for row in ranked_lags
+    ]
+    period_rows = [
+        (
+            row.get("period_frames"),
+            row.get("frequency_cycles_per_frame"),
+            row.get("amplitude"),
+        )
+        for row in report.get("dominant_periods", ())[:ranked_limit]
+    ]
+    hypothesis_rows = []
+    for hypothesis in report.get("hypotheses", ()):
+        evidence = ", ".join(
+            f"{key}={_markdown_cell(value)}"
+            for key, value in hypothesis.items()
+            if key not in {"mechanism", "support"}
+        )
+        hypothesis_rows.append(
+            (
+                hypothesis.get("mechanism"),
+                hypothesis.get("support"),
+                evidence,
+            )
+        )
+
+    truncated_note = (
+        f"\n\n_Showing the first {max_pulse_centers} of "
+        f"{len(pulse_frames)} pulse centers._"
+        if len(pulse_frames) > max_pulse_centers
+        else ""
+    )
+    return "\n\n".join(
+        [
+            "### Flicker diagnosis summary",
+            (
+                f"- Raw frames analyzed: **{report.get('frame_count', 0)}**\n"
+                f"- Pulse centers detected: **{report.get('outlier_count', 0)}**\n"
+                f"- Neighbor-affected frames: **{report.get('affected_count', 0)}**\n"
+                f"- Pulse-center score limit: "
+                f"**{_markdown_cell(report.get('outlier_score_limit'))}**\n"
+                f"- Images modified: **no**"
+            ),
+            "#### Detected pulse centers",
+            _markdown_table(
+                (
+                    "index",
+                    "uid",
+                    "gap phase",
+                    "batch slot",
+                    "alpha",
+                    "score",
+                    "luma z",
+                    "contrast z",
+                    "saturation z",
+                    "edge z",
+                ),
+                pulse_rows,
+            )
+            + truncated_note,
+            "#### Mean score by position within each final FlowMorph gap",
+            _markdown_table(
+                (
+                    "gap phase",
+                    "frames",
+                    "mean score",
+                    "median score",
+                    "pulses",
+                    "pulse rate",
+                ),
+                gap_rows,
+            ),
+            "#### Mean score by render-batch slot",
+            _markdown_table(
+                (
+                    "batch slot",
+                    "frames",
+                    "mean score",
+                    "median score",
+                    "pulses",
+                    "pulse rate",
+                ),
+                batch_rows,
+            ),
+            "#### Mechanism checks",
+            _markdown_table(("mechanism", "support", "evidence"), hypothesis_rows),
+            "#### Strongest repeated lags",
+            _markdown_table(("lag in frames", "autocorrelation"), lag_rows),
+            "#### Dominant spectral periods",
+            _markdown_table(
+                ("period in frames", "cycles per frame", "amplitude"),
+                period_rows,
+            ),
+        ]
+    )
+
+
 def _metric_array(path: Path, max_side: int) -> np.ndarray:
     with Image.open(path) as opened:
         sample = opened.convert("RGB")
@@ -438,4 +610,5 @@ __all__ = [
     "FlickerDiagnosticConfig",
     "FlickerDiagnosticResult",
     "diagnose_cyclic_flicker",
+    "format_flicker_diagnostic_markdown",
 ]

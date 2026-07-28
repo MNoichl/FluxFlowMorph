@@ -2022,6 +2022,7 @@ notebook["cells"].extend(
                 from flowmorph_klein.flicker_diagnostics import (
                     FlickerDiagnosticConfig,
                     diagnose_cyclic_flicker,
+                    format_flicker_diagnostic_markdown,
                 )
 
                 if RUN_FLICKER_DIAGNOSTIC:
@@ -2081,6 +2082,11 @@ notebook["cells"].extend(
                     display(Markdown("### Raw FlowMorph flicker pattern diagnosis"))
                     display(flicker_preview)
                     flicker_preview.close()
+                    display(Markdown(format_flicker_diagnostic_markdown(
+                        FLICKER_DIAGNOSTIC_RESULT.report,
+                        max_pulse_centers=40,
+                        ranked_limit=10,
+                    )))
                     strong_hypotheses = [
                         item
                         for item in FLICKER_DIAGNOSTIC_RESULT.report["hypotheses"]
