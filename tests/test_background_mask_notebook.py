@@ -183,6 +183,28 @@ def test_background_mask_notebook_slows_all_videos_threefold() -> None:
     assert 'ffmpeg, "-y", "-framerate", str(RIFE_FINAL_FPS)' in code
 
 
+def test_background_mask_notebook_reuses_one_canonical_fitted_endpoint() -> None:
+    _, code = _load_notebook()
+    assert '"endpoint_reconstructions"' in code
+    assert "ENDPOINT_RECONSTRUCTION_PATHS = {}" in code
+    assert "def render_canonical_endpoint_reconstructions(" in code
+    assert 'getattr(session, "render_endpoint_reconstructions", None)' in code
+    assert "def ensure_endpoint_reconstructions(" in code
+    assert "SEQUENCE_SESSION.decode_frames_to_paths(frames, missing_paths)" in code
+    assert '"flowmorph_endpoint_input_path"' in code
+    assert '"flowmorph_endpoint_reconstruction_path"' in code
+    assert '"canonical_endpoint_reconstruction_used"' in code
+    assert (
+        '"the same decoded fitted endpoint file is reused for incoming alpha=1 "'
+        in code
+    )
+    assert 'final_record["path"] = str(reconstruction_path)' in code
+    assert '"source original"' in code
+    assert '"source fitted α=0"' in code
+    assert '"target fitted α=1"' in code
+    assert '"target original"' in code
+
+
 def test_background_mask_notebook_preserves_user_prompts_and_settings() -> None:
     notebook, code = _load_notebook()
     assert "IMAGE_GUIDANCE_SCALE = 7.0" in code
@@ -228,6 +250,10 @@ def test_background_mask_notebook_rewrites_each_prompt_from_mask_geometry() -> N
     assert "lobes, islands," in code
     assert "Use flexible matter" in code
     assert "Let quiet gaps remain calmer without making them blank" in code
+    assert "Treat exposed wall and plaster as a relatively uniform" in code
+    assert "Do not create large shaded wall" in code
+    assert "Restrict shadows on exposed plaster" in code
+    assert "uniform, evenly illuminated plaster background without large shaded areas" in code
     assert "measure_effective_mask_geometry(" in code
     assert "components_largest_first" in code
     assert "Deterministic measurements of the smoothed initialization activity" in code

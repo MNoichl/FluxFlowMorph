@@ -97,6 +97,76 @@ def test_render_midpoints_uses_piecewise_endpoint_midpoint_conditioning(monkeypa
     assert [frame.alpha for frame in frames] == list(alphas)
 
 
+def test_render_endpoint_reconstructions_batches_each_cached_state_once(monkeypatch):
+    runner = FakeRunner()
+    session = FlowMorphSequenceSession(runner, render_batch_size=2)
+    observed = []
+
+    monkeypatch.setattr(
+        "flowmorph_klein.sequence.get_render_chain",
+        lambda schedule, indices: ("render-chain", schedule, indices),
+    )
+
+    def fake_render_latent_trajectory(
+        initial_state,
+        *,
+        predictor,
+        conditioning,
+        render_chain,
+        frame_index,
+    ):
+        del predictor
+        observed.append({
+            "states": initial_state.clone(),
+            "prompt_batch": conditioning.prompt_embeds.shape[0],
+            "render_chain": render_chain,
+            "frame_index": frame_index,
+        })
+        return initial_state + 10.0
+
+    monkeypatch.setattr(
+        "flowmorph_klein.sequence.render_latent_trajectory",
+        fake_render_latent_trajectory,
+    )
+    frames = session.render_endpoint_reconstructions(
+        endpoints=(endpoint(0.0), endpoint(1.0), endpoint(2.0)),
+        conditionings=(
+            conditioning("zero", 0.0),
+            conditioning("one", 1.0),
+            conditioning("two", 2.0),
+        ),
+    )
+
+    assert runner.scales == [1.25]
+    assert [item["states"].shape[0] for item in observed] == [2, 1]
+    assert [item["prompt_batch"] for item in observed] == [2, 1]
+    assert [item["frame_index"] for item in observed] == [0, 2]
+    assert [float(frame.start_state.mean()) for frame in frames] == [0.0, 1.0, 2.0]
+    assert [float(frame.final_latent.mean()) for frame in frames] == [10.0, 11.0, 12.0]
+    assert all(frame.alpha == 0.0 for frame in frames)
+    assert session.last_render_batch_size == 2
+
+
+@pytest.mark.parametrize(
+    ("endpoints", "conditionings"),
+    [
+        ((), ()),
+        ((endpoint(0.0),), ()),
+        ((), (conditioning("zero"),)),
+    ],
+)
+def test_render_endpoint_reconstructions_requires_matching_nonempty_inputs(
+    endpoints,
+    conditionings,
+):
+    session = FlowMorphSequenceSession(FakeRunner())
+    with pytest.raises(ValueError, match="one conditioning per endpoint"):
+        session.render_endpoint_reconstructions(
+            endpoints=endpoints,
+            conditionings=conditionings,
+        )
+
+
 def test_decode_frames_to_paths_uses_configured_batches(monkeypatch, tmp_path):
     runner = FakeRunner()
     runner.pipeline = SimpleNamespace(

@@ -38,7 +38,7 @@ from .endpoint_optimizer import (
     optimize_endpoint,
     optimize_endpoint_batch,
 )
-from .flow_schedule import get_start_state_metadata
+from .flow_schedule import get_render_chain, get_start_state_metadata
 from .flow_state import FlowMorphEndpoint
 from .flux2_latents import (
     decode_packed_latent,
@@ -47,7 +47,7 @@ from .flux2_latents import (
 )
 from .image_io import preprocess_endpoint_image
 from .pipeline import FlowMorphRunner, PipelineError, _module_dtype, _move_module
-from .renderer import RenderedLatentFrame, render_morph
+from .renderer import RenderedLatentFrame, render_latent_trajectory, render_morph
 from .types import PreprocessedImage, RenderConditioningMode
 
 
@@ -749,6 +749,124 @@ class FlowMorphSequenceSession:
         )
         del predictor, frames, piecewise_conditionings
         return output
+
+    def render_endpoint_reconstructions(
+        self,
+        *,
+        endpoints: Sequence[FlowMorphEndpoint],
+        conditionings: Sequence[ConditioningPackage],
+    ) -> tuple[RenderedLatentFrame, ...]:
+        """Render canonical fitted endpoints once, batched across a sequence.
+
+        A sequence endpoint participates as alpha=1 in its incoming gap and
+        alpha=0 in its outgoing gap. Rendering it once from its cached fitted
+        state and reusing the decoded image makes those two roles identical by
+        construction.
+        """
+
+        if not endpoints or len(endpoints) != len(conditionings):
+            raise ValueError(
+                "canonical endpoint rendering requires one conditioning per endpoint"
+            )
+        runner = self.runner
+        if runner.schedule is None:
+            raise PipelineError("prepared runner lacks schedule")
+        runner._set_lora_scale(runner.config.lora.render_scale)
+        predictor = runner._bound_predictor()
+        if self.cfg_execution is not None:
+            predictor.cfg_execution = self.cfg_execution
+        render_chain = get_render_chain(
+            runner.schedule,
+            runner.config.flowmorph.render_indices,
+        )
+        active_batch_size = min(self.render_batch_size, len(endpoints))
+        render_backed_off = False
+        while True:
+            frames: list[RenderedLatentFrame] = []
+            try:
+                for chunk_start in range(0, len(endpoints), active_batch_size):
+                    chunk_endpoints = endpoints[
+                        chunk_start : chunk_start + active_batch_size
+                    ]
+                    chunk_conditionings = conditionings[
+                        chunk_start : chunk_start + active_batch_size
+                    ]
+                    chunk_states = torch.cat(
+                        [
+                            endpoint.to(
+                                self.device,
+                                dtype=torch.float32,
+                            ).state
+                            for endpoint in chunk_endpoints
+                        ],
+                        dim=0,
+                    )
+                    prepared_conditionings = [
+                        item.to(self.device) for item in chunk_conditionings
+                    ]
+                    conditioning = (
+                        prepared_conditionings[0]
+                        if len(prepared_conditionings) == 1
+                        else stack_conditioning_packages(prepared_conditionings)
+                    )
+                    final_latents = render_latent_trajectory(
+                        chunk_states,
+                        predictor=predictor,
+                        conditioning=conditioning,
+                        render_chain=render_chain,
+                        frame_index=chunk_start,
+                    )
+                    for offset in range(len(chunk_endpoints)):
+                        frame_slice = slice(offset, offset + 1)
+                        frames.append(
+                            RenderedLatentFrame(
+                                index=chunk_start + offset,
+                                alpha=0.0,
+                                start_state=chunk_states[
+                                    frame_slice
+                                ].detach().cpu(),
+                                final_latent=final_latents[
+                                    frame_slice
+                                ].detach().cpu(),
+                                conditioning_mode=(
+                                    RenderConditioningMode.PROMPT_SCHEDULE
+                                ),
+                            )
+                        )
+                break
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+                is_oom = (
+                    isinstance(error, torch.cuda.OutOfMemoryError)
+                    or "out of memory" in str(error).lower()
+                )
+                if self.oom_backoff and is_oom and active_batch_size > 1:
+                    active_batch_size = max(1, (active_batch_size + 1) // 2)
+                    render_backed_off = True
+                    release_cuda_memory()
+                    print(
+                        "Canonical endpoint render OOM; retrying with "
+                        f"batch_size={active_batch_size}"
+                    )
+                    continue
+                if (
+                    self.oom_backoff
+                    and is_oom
+                    and predictor.cfg_execution == "batched"
+                ):
+                    predictor.cfg_execution = "sequential"
+                    self.cfg_execution = "sequential"
+                    release_cuda_memory()
+                    print(
+                        "Canonical endpoint render OOM with batched CFG; "
+                        "retrying sequential CFG"
+                    )
+                    continue
+                raise
+        self.last_render_batch_size = active_batch_size
+        if render_backed_off:
+            self.render_batch_size = active_batch_size
+        del predictor
+        return tuple(frames)
 
     def _decode_token_batch(self, tokens: Sequence[torch.Tensor]) -> list[Image.Image]:
         runner = self.runner

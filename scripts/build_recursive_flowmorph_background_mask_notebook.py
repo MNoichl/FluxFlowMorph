@@ -707,6 +707,11 @@ model_cell["source"] = code_blocks(
       orientation, and which flexible element connects objects.
     - Make the result dense enough to occupy the described composition, with large
       coherent masses and material texture rather than tiny scattered icons.
+    - Treat exposed wall and plaster as a relatively uniform, softly and evenly
+      illuminated warm beige or ivory field. Do not create large shaded wall
+      areas, broad cast-shadow bands, dramatic background gradients, vignetting,
+      or dark pools across the background. Restrict shadows on exposed plaster
+      to small, soft contact shadows immediately associated with the ornament.
 
     Rewritten-prompt contract:
     - It begins exactly with "{LORA_TRIGGER}," and contains that trigger exactly once.
@@ -720,6 +725,8 @@ model_cell["source"] = code_blocks(
       alpha, compositing, cutouts, source material, prompt rewriting, or instructions
       to an editor. Convert all of that into ordinary spatial art direction.
     - Do not say "keep", "preserve", "place into the mask", or "fit the mask".
+    - It explicitly describes the exposed plaster background as relatively
+      uniform and evenly lit, without large shaded wall areas or broad shadows.
 
     Output fields:
     - spatial_analysis: a precise prose reading of the supplied geometry.
@@ -947,7 +954,8 @@ model_cell["source"] = code_blocks(
         Inspect the attached smoothed grayscale activity map. Write a detailed
         spatial analysis, map the original objects around its active shapes and
         quiet intervals without hard clipping, then return a complete
-        self-contained adapted generation prompt.
+        self-contained adapted generation prompt. Explicitly describe a relatively
+        uniform, evenly illuminated plaster background without large shaded areas.
         '''.strip()
         correction = ""
         last_error = None
@@ -1752,6 +1760,126 @@ midpoint_cell["source"] = midpoint_source.splitlines(keepends=True)
 
 sequence_cell = find_cell(notebook, "SEQUENCE_SESSION_CONTRACT")
 sequence_source = source(sequence_cell)
+sequence_source = sequence_source.replace("import gc\n", "import gc\nimport torch\n", 1)
+sequence_source = sequence_source.replace(
+    "from flowmorph_klein.sequence import FlowMorphSequenceSession, SequenceEndpointRequest\n",
+    """from flowmorph_klein.conditioning import stack_conditioning_packages
+from flowmorph_klein.diagnostics import release_cuda_memory
+from flowmorph_klein.flow_schedule import get_render_chain
+from flowmorph_klein.renderer import RenderedLatentFrame, render_latent_trajectory
+from flowmorph_klein.sequence import FlowMorphSequenceSession, SequenceEndpointRequest
+from flowmorph_klein.types import RenderConditioningMode
+""",
+    1,
+)
+sequence_source = sequence_source.replace(
+    """def stable_fingerprint(payload):
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+""",
+    """def stable_fingerprint(payload):
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def render_canonical_endpoint_reconstructions(
+    session,
+    *,
+    endpoints,
+    conditionings,
+):
+    # New installs use the reusable implementation. The inline fallback keeps
+    # this cell runnable in an already-live Colab kernel without reloading the
+    # project package.
+    reusable = getattr(session, "render_endpoint_reconstructions", None)
+    if callable(reusable):
+        return reusable(endpoints=endpoints, conditionings=conditionings)
+    if not endpoints or len(endpoints) != len(conditionings):
+        raise ValueError(
+            "canonical endpoint rendering requires one conditioning per endpoint"
+        )
+    runner = session.runner
+    runner._set_lora_scale(runner.config.lora.render_scale)
+    predictor = runner._bound_predictor()
+    if session.cfg_execution is not None:
+        predictor.cfg_execution = session.cfg_execution
+    render_chain = get_render_chain(
+        runner.schedule,
+        runner.config.flowmorph.render_indices,
+    )
+    active_batch_size = min(session.render_batch_size, len(endpoints))
+    while True:
+        frames = []
+        try:
+            for chunk_start in range(0, len(endpoints), active_batch_size):
+                endpoint_chunk = endpoints[
+                    chunk_start:chunk_start + active_batch_size
+                ]
+                conditioning_chunk = conditionings[
+                    chunk_start:chunk_start + active_batch_size
+                ]
+                states = torch.cat([
+                    endpoint.to(session.device, dtype=torch.float32).state
+                    for endpoint in endpoint_chunk
+                ], dim=0)
+                prepared = [
+                    conditioning.to(session.device)
+                    for conditioning in conditioning_chunk
+                ]
+                conditioning = (
+                    prepared[0]
+                    if len(prepared) == 1
+                    else stack_conditioning_packages(prepared)
+                )
+                final_latents = render_latent_trajectory(
+                    states,
+                    predictor=predictor,
+                    conditioning=conditioning,
+                    render_chain=render_chain,
+                    frame_index=chunk_start,
+                )
+                for offset in range(len(endpoint_chunk)):
+                    frame_slice = slice(offset, offset + 1)
+                    frames.append(RenderedLatentFrame(
+                        index=chunk_start + offset,
+                        alpha=0.0,
+                        start_state=states[frame_slice].detach().cpu(),
+                        final_latent=final_latents[frame_slice].detach().cpu(),
+                        conditioning_mode=RenderConditioningMode.PROMPT_SCHEDULE,
+                    ))
+            break
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+            is_oom = (
+                isinstance(error, torch.cuda.OutOfMemoryError)
+                or "out of memory" in str(error).lower()
+            )
+            if FLOWMORPH_BATCH_OOM_BACKOFF and is_oom and active_batch_size > 1:
+                active_batch_size = max(1, (active_batch_size + 1) // 2)
+                release_cuda_memory()
+                print(
+                    "Canonical endpoint render OOM; retrying with "
+                    f"batch_size={active_batch_size}"
+                )
+                continue
+            if (
+                FLOWMORPH_BATCH_OOM_BACKOFF
+                and is_oom
+                and predictor.cfg_execution == "batched"
+            ):
+                predictor.cfg_execution = "sequential"
+                session.cfg_execution = "sequential"
+                release_cuda_memory()
+                print(
+                    "Canonical endpoint render OOM with batched CFG; "
+                    "retrying sequential CFG"
+                )
+                continue
+            raise
+    session.last_render_batch_size = active_batch_size
+    return tuple(frames)
+""",
+    1,
+)
 sequence_source = sequence_source.replace(
     """# The standalone anchor pipeline is fused and CPU-offloaded. Release it;
 # the sequence session loads one unfused differentiable model and retains it.
@@ -1832,16 +1960,364 @@ sequence_source = sequence_source.replace(
 """,
     1,
 )
+sequence_source = sequence_source.replace(
+    """SEQUENCE_ENDPOINT_ROOT = SEQUENCE_ROOT / "endpoints"
+SEQUENCE_ASSET_ROOT = SEQUENCE_ROOT / "encoded_inputs"
+for directory in (SEQUENCE_ROOT, SEQUENCE_ENDPOINT_ROOT, SEQUENCE_ASSET_ROOT):
+    directory.mkdir(parents=True, exist_ok=True)
+""",
+    """SEQUENCE_ENDPOINT_ROOT = SEQUENCE_ROOT / "endpoints"
+SEQUENCE_ENDPOINT_RECONSTRUCTION_ROOT = (
+    SEQUENCE_ROOT / "endpoint_reconstructions"
+)
+SEQUENCE_ASSET_ROOT = SEQUENCE_ROOT / "encoded_inputs"
+for directory in (
+    SEQUENCE_ROOT,
+    SEQUENCE_ENDPOINT_ROOT,
+    SEQUENCE_ENDPOINT_RECONSTRUCTION_ROOT,
+    SEQUENCE_ASSET_ROOT,
+):
+    directory.mkdir(parents=True, exist_ok=True)
+""",
+    1,
+)
+sequence_source = sequence_source.replace(
+    """ENDPOINT_CACHE = {}
+ENDPOINT_FINGERPRINTS = {}
+ROUND_MANIFESTS = []
+""",
+    """ENDPOINT_CACHE = {}
+ENDPOINT_FINGERPRINTS = {}
+ENDPOINT_RECONSTRUCTION_PATHS = {}
+ROUND_MANIFESTS = []
+""",
+    1,
+)
+sequence_source = replace_between(
+    sequence_source,
+    "def fit_sequence_endpoints(records, progress_label):\n",
+    "def fit_sequence_endpoint(record, progress_label):\n",
+    dedent(
+        """
+        def endpoint_reconstruction_path(record):
+            fingerprint = endpoint_fingerprint(record)
+            return (
+                SEQUENCE_ENDPOINT_RECONSTRUCTION_ROOT
+                / f"{record['uid']}_{fingerprint[:12]}.png"
+            )
+
+
+        def register_existing_endpoint_reconstructions(records):
+            for record in records:
+                path = endpoint_reconstruction_path(record)
+                if path.is_file():
+                    ENDPOINT_RECONSTRUCTION_PATHS[record["uid"]] = path
+                    ENDPOINT_FINGERPRINTS.setdefault(
+                        record["uid"],
+                        endpoint_fingerprint(record),
+                    )
+
+
+        def ensure_endpoint_reconstructions(records, progress_label):
+            unique_records = {
+                record["uid"]: record
+                for record in records
+                if record["uid"] in ENDPOINT_CACHE
+            }
+            missing_records = []
+            missing_paths = []
+            for uid, record in unique_records.items():
+                path = endpoint_reconstruction_path(record)
+                if path.is_file():
+                    ENDPOINT_RECONSTRUCTION_PATHS[uid] = path
+                    continue
+                missing_records.append(record)
+                missing_paths.append(path)
+            if not missing_records:
+                return
+            frames = render_canonical_endpoint_reconstructions(
+                SEQUENCE_SESSION,
+                endpoints=[
+                    ENDPOINT_CACHE[record["uid"]]
+                    for record in missing_records
+                ],
+                conditionings=[
+                    PROMPT_CONDITIONING_CACHE[record["prompt"]]
+                    for record in missing_records
+                ],
+            )
+            SEQUENCE_SESSION.decode_frames_to_paths(frames, missing_paths)
+            for record, path in zip(
+                missing_records,
+                missing_paths,
+                strict=True,
+            ):
+                ENDPOINT_RECONSTRUCTION_PATHS[record["uid"]] = path
+                print(
+                    f"{progress_label}: canonical endpoint "
+                    f"{record['uid']} -> {path.name}"
+                )
+            del frames
+
+
+        def fit_sequence_endpoints(records, progress_label):
+            global UNIQUE_ENDPOINT_FIT_COUNT
+            register_existing_endpoint_reconstructions(records)
+            unique_records = {
+                record["uid"]: record
+                for record in records
+                if record["uid"] not in ENDPOINT_CACHE
+            }
+            if unique_records:
+                requests = []
+                fingerprints = {}
+                for uid, record in unique_records.items():
+                    fingerprint = endpoint_fingerprint(record)
+                    fingerprints[uid] = fingerprint
+                    checkpoint_directory = (
+                        SEQUENCE_ENDPOINT_ROOT
+                        / f"{uid}_{fingerprint[:12]}"
+                    )
+                    requests.append(SequenceEndpointRequest(
+                        endpoint_key=uid,
+                        asset=IMAGE_ASSET_CACHE[uid],
+                        conditioning=(
+                            PROMPT_CONDITIONING_CACHE[record["prompt"]]
+                        ),
+                        checkpoint_directory=checkpoint_directory,
+                        resume=(
+                            RESUME_FLOWMORPH_SEQUENCE
+                            and checkpoint_directory.exists()
+                        ),
+                    ))
+                fitted = SEQUENCE_SESSION.fit_endpoints(
+                    requests,
+                    batch_size=FLOWMORPH_ENDPOINT_BATCH_SIZE,
+                )
+                for uid, result in fitted.items():
+                    ENDPOINT_CACHE[uid] = result.endpoint
+                    ENDPOINT_FINGERPRINTS[uid] = fingerprints[uid]
+                    UNIQUE_ENDPOINT_FIT_COUNT += 1
+                    print(
+                        f"{progress_label}: {uid}; "
+                        f"steps={result.completed_steps}; "
+                        f"checkpoint_reused={result.resumed}"
+                    )
+            ensure_endpoint_reconstructions(records, progress_label)
+
+
+        """
+    ),
+)
+sequence_source = sequence_source.replace(
+    """    test_sheet_paths = [Path(test_left["path"]), *test_output_paths, Path(test_right["path"])]
+""",
+    """    test_sheet_paths = [
+        Path(test_left["path"]),
+        ENDPOINT_RECONSTRUCTION_PATHS[test_left["uid"]],
+        *test_output_paths,
+        ENDPOINT_RECONSTRUCTION_PATHS[test_right["uid"]],
+        Path(test_right["path"]),
+    ]
+""",
+    1,
+)
+sequence_source = sequence_source.replace(
+    """        labels=[
+            "source",
+            *[f"alpha={alpha:.2f}" for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS],
+            "target",
+        ],
+""",
+    """        labels=[
+            "source original",
+            "source fitted α=0",
+            *[f"alpha={alpha:.2f}" for alpha in FLOWMORPH_ONE_GAP_TEST_ALPHAS],
+            "target fitted α=1",
+            "target original",
+        ],
+""",
+    1,
+)
 sequence_cell["source"] = sequence_source.splitlines(keepends=True)
+
+round_cell = find_cell(
+    notebook,
+    "for round_number, round_spec in enumerate(FLOWMORPH_ROUND_SPECS",
+)
+round_source = source(round_cell)
+round_source = round_source.replace(
+    """    incoming = list(CURRENT_RECORDS)
+    gap_count = len(incoming)
+""",
+    """    incoming = list(CURRENT_RECORDS)
+    register_existing_endpoint_reconstructions(incoming)
+    gap_count = len(incoming)
+""",
+    1,
+)
+round_source = round_source.replace(
+    """        del chunk_frames, chunk_paths
+        gc.collect()
+
+    outgoing = []
+""",
+    """        del chunk_frames, chunk_paths
+        gc.collect()
+
+    # Completed legacy pairs may predate canonical endpoint PNGs. Restore their
+    # cached fitted states and render only the missing endpoint reconstructions.
+    missing_endpoint_reconstructions = [
+        record
+        for record in incoming
+        if record["uid"] not in ENDPOINT_RECONSTRUCTION_PATHS
+    ]
+    if missing_endpoint_reconstructions:
+        fit_sequence_endpoints(
+            missing_endpoint_reconstructions,
+            f"Round {round_number} endpoint reconstruction",
+        )
+    unresolved_endpoint_reconstructions = [
+        record["uid"]
+        for record in incoming
+        if record["uid"] not in ENDPOINT_RECONSTRUCTION_PATHS
+    ]
+    if unresolved_endpoint_reconstructions:
+        raise RuntimeError(
+            "Canonical endpoint reconstructions are missing: "
+            + ", ".join(unresolved_endpoint_reconstructions)
+        )
+
+    outgoing = []
+""",
+    1,
+)
+round_source = round_source.replace(
+    """        proposal = job["proposal"]
+        outgoing.append(left)
+        for frame_record in job["frame_records"]:
+""",
+    """        proposal = job["proposal"]
+        endpoint_record = dict(left)
+        endpoint_record["flowmorph_endpoint_input_path"] = str(left["path"])
+        endpoint_record["flowmorph_endpoint_reconstruction_path"] = str(
+            ENDPOINT_RECONSTRUCTION_PATHS[left["uid"]]
+        )
+        endpoint_record["canonical_endpoint_reconstruction_available"] = True
+        outgoing.append(endpoint_record)
+        for frame_record in job["frame_records"]:
+""",
+    1,
+)
+round_source = round_source.replace(
+    """        "interpolation_method": "sequence-cached true FlowMorph interior-alpha renders",
+        "prompt_mode": prompt_mode,
+""",
+    """        "interpolation_method": "sequence-cached true FlowMorph with canonical endpoint reconstructions",
+        "endpoint_display_contract": (
+            "one decoded fitted endpoint reused for incoming alpha=1 "
+            "and outgoing alpha=0"
+        ),
+        "prompt_mode": prompt_mode,
+""",
+    1,
+)
+round_source = round_source.replace(
+    """    for item in outgoing:
+        preview_image = Image.open(item["path"]).convert("RGB")
+""",
+    """    for item in outgoing:
+        preview_path = item.get(
+            "flowmorph_endpoint_reconstruction_path",
+            item["path"],
+        )
+        preview_image = Image.open(preview_path).convert("RGB")
+""",
+    1,
+)
+round_source = round_source.replace(
+    """FINAL_RECORDS = CURRENT_RECORDS
+FINAL_SEQUENCE_MANIFEST = RUN_DIRECTORY / "metadata" / "final_recursive_flowmorph_sequence.json"
+""",
+    """FINAL_RECORDS = []
+for record in CURRENT_RECORDS:
+    final_record = dict(record)
+    reconstruction_path = ENDPOINT_RECONSTRUCTION_PATHS.get(record["uid"])
+    if reconstruction_path is not None:
+        final_record["flowmorph_endpoint_input_path"] = str(record["path"])
+        final_record["flowmorph_endpoint_reconstruction_path"] = str(
+            reconstruction_path
+        )
+        final_record["path"] = str(reconstruction_path)
+        final_record["canonical_endpoint_reconstruction_used"] = True
+    else:
+        final_record["canonical_endpoint_reconstruction_used"] = False
+    FINAL_RECORDS.append(final_record)
+
+FINAL_SEQUENCE_MANIFEST = RUN_DIRECTORY / "metadata" / "final_recursive_flowmorph_sequence.json"
+""",
+    1,
+)
+round_source = round_source.replace(
+    """    "interpolation_method": "one-model sequence-cached true FlowMorph",
+    "anchor_count": len(BASE_RECORDS),
+""",
+    """    "interpolation_method": (
+        "one-model sequence-cached true FlowMorph with one canonical "
+        "reconstruction per fitted endpoint"
+    ),
+    "endpoint_display_contract": (
+        "the same decoded fitted endpoint file is reused for incoming alpha=1 "
+        "and outgoing alpha=0"
+    ),
+    "anchor_count": len(BASE_RECORDS),
+""",
+    1,
+)
+round_source = round_source.replace(
+    """    "unique_endpoint_fits": UNIQUE_ENDPOINT_FIT_COUNT,
+    "pair_renders": FLOWMORPH_PAIR_RENDER_COUNT,
+""",
+    """    "unique_endpoint_fits": UNIQUE_ENDPOINT_FIT_COUNT,
+    "canonical_endpoint_reconstruction_count": len(
+        ENDPOINT_RECONSTRUCTION_PATHS
+    ),
+    "pair_renders": FLOWMORPH_PAIR_RENDER_COUNT,
+""",
+    1,
+)
+round_source = round_source.replace(
+    """    "unique_endpoint_fits": UNIQUE_ENDPOINT_FIT_COUNT,
+    "pair_renders": FLOWMORPH_PAIR_RENDER_COUNT,
+""",
+    """    "unique_endpoint_fits": UNIQUE_ENDPOINT_FIT_COUNT,
+    "canonical_endpoint_reconstructions": len(
+        ENDPOINT_RECONSTRUCTION_PATHS
+    ),
+    "pair_renders": FLOWMORPH_PAIR_RENDER_COUNT,
+""",
+    1,
+)
+round_source = round_source.replace(
+    """del ENDPOINT_CACHE, IMAGE_ASSET_CACHE, PROMPT_CONDITIONING_CACHE
+""",
+    """del ENDPOINT_CACHE, IMAGE_ASSET_CACHE, PROMPT_CONDITIONING_CACHE
+del ENDPOINT_RECONSTRUCTION_PATHS
+""",
+    1,
+)
+round_cell["source"] = round_source.splitlines(keepends=True)
 
 assembly_markdown = find_cell(notebook, "## 10. Assemble, preview")
 assembly_markdown["source"] = lines(
     """
     ## 10. Assemble, preview, and audit the generated cyclic sequence
 
-    The directly decoded, soft-mask-initialized anchors now enter the unchanged recursive
-    FlowMorph pipeline. FlowMorph receives ordinary completed anchor paintings; no masks
-    are reapplied to its fitted endpoints or interpolated frames.
+    The directly decoded, soft-mask-initialized anchors enter the recursive FlowMorph
+    pipeline as ordinary completed paintings; no masks are reapplied. Every unique
+    fitted endpoint is now rendered and decoded once into a canonical reconstruction.
+    That identical PNG is reused as the incoming alpha=1 and outgoing alpha=0 endpoint,
+    while the original anchor remains recorded separately for audit.
     Round 1 contributes one explicit midpoint, Round 2 contributes ten shared-prompt
     renders, and the final-to-first gap closes the loop before RIFE finishing.
 
