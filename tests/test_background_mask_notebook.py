@@ -132,7 +132,7 @@ def test_background_mask_notebook_mixes_weak_previous_reference_into_init() -> N
 
 def test_background_mask_notebook_uses_loadable_temporal_tone_stabilizer() -> None:
     _, code = _load_notebook()
-    assert "TEMPORAL_TONE_STABILIZATION_ENABLED = True" in code
+    assert "TEMPORAL_TONE_STABILIZATION_ENABLED = False" in code
     assert "TEMPORAL_TONE_WINDOW_RADIUS = 2" in code
     assert "TEMPORAL_TONE_STRENGTH = 0.70" in code
     assert "TEMPORAL_TONE_MEAN_THRESHOLD = 0.02" in code
@@ -149,10 +149,44 @@ def test_background_mask_notebook_uses_loadable_temporal_tone_stabilizer() -> No
     assert '"raw_frames_preserved": True' in code
 
 
+def test_background_mask_notebook_has_bottom_flicker_diagnosis_cell() -> None:
+    notebook, code = _load_notebook()
+    assert "RUN_FLICKER_DIAGNOSTIC = True" in code
+    assert "FLICKER_ANALYSIS_MAX_SIDE = 256" in code
+    assert "FLICKER_OUTLIER_MAD_MULTIPLIER = 3.5" in code
+    assert "FLICKER_MINIMUM_OUTLIER_SCORE = 3.0" in code
+    assert "from flowmorph_klein.flicker_diagnostics import (" in code
+    assert "diagnose_cyclic_flicker(" in code
+    assert "def diagnose_cyclic_flicker(" not in code
+    assert '"images_modified": False' in code
+    assert notebook["cells"][-2]["source"][0].startswith(
+        "## 14. Read-only cyclic flicker diagnosis"
+    )
+    assert "FLICKER_DIAGNOSTIC_RESULT" in "".join(
+        notebook["cells"][-1]["source"]
+    )
+
+
+def test_background_mask_notebook_slows_all_videos_threefold() -> None:
+    _, code = _load_notebook()
+    assert "VIDEO_SLOWDOWN_FACTOR = 3.0" in code
+    assert "SOURCE_SEQUENCE_FPS = 12.0 / VIDEO_SLOWDOWN_FACTOR" in code
+    assert "RIFE_MULTIPLIER = int(round(2 * VIDEO_SLOWDOWN_FACTOR))" in code
+    assert "RIFE_FINAL_FPS = 24.0" in code
+    assert 'ffmpeg, "-y", "-framerate", str(SOURCE_SEQUENCE_FPS)' in code
+    assert 'ffmpeg, "-y", "-framerate", str(RIFE_FINAL_FPS)' in code
+
+
 def test_background_mask_notebook_preserves_user_prompts_and_settings() -> None:
     notebook, code = _load_notebook()
     assert "IMAGE_GUIDANCE_SCALE = 7.0" in code
     assert "IMAGE_LORA_SCALE = 1.2" in code
+    assert "FLOWMORPH_FIT_LORA_SCALE = 1.2" in code
+    assert "FLOWMORPH_RENDER_LORA_SCALE = 1.2" in code
+    assert "FLOWMORPH_GUIDANCE_SCALE = 7.0" in code
+    assert "FLOWMORPH_SOURCE_OPTIMIZATION_STEPS = 50" in code
+    assert "FLOWMORPH_TARGET_OPTIMIZATION_STEPS = 50" in code
+    assert "BASE_SEED = 42 #98123479812734987 #1729" in code
     assert 'MASK_ZIP_FILENAME = "mask_2.zip"' in code
     assert 'OPENAI_KEY_FILENAME = "openaiapikey.txt"' in code
     assert "MASK_REMOVE_SPARSE_PROMPT_LANGUAGE" not in code
@@ -168,6 +202,7 @@ def test_background_mask_notebook_preserves_user_prompts_and_settings() -> None:
     assert "# if FLOWMORPH_FIT_LORA_SCALE != IMAGE_LORA_SCALE:" in code
     assert "# if FLOWMORPH_RENDER_LORA_SCALE != IMAGE_LORA_SCALE:" in code
     assert "# if FLOWMORPH_GUIDANCE_SCALE != IMAGE_GUIDANCE_SCALE:" in code
+    assert "# if FLOWMORPH_SOURCE_OPTIMIZATION_STEPS != 100:" in code
 
 
 def test_background_mask_notebook_rewrites_each_prompt_from_mask_geometry() -> None:

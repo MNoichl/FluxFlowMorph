@@ -176,6 +176,26 @@ settings = source(settings_cell).replace(
     'PROJECT_NAME = "science_path_trajectory_background_mask"',
     1,
 ).replace(
+    "FLOWMORPH_FIT_LORA_SCALE = 1.0",
+    "FLOWMORPH_FIT_LORA_SCALE = 1.2",
+    1,
+).replace(
+    "FLOWMORPH_RENDER_LORA_SCALE = 1.0",
+    "FLOWMORPH_RENDER_LORA_SCALE = 1.2",
+    1,
+).replace(
+    "FLOWMORPH_GUIDANCE_SCALE = 4.0",
+    "FLOWMORPH_GUIDANCE_SCALE = 7.0",
+    1,
+).replace(
+    "FLOWMORPH_SOURCE_OPTIMIZATION_STEPS = 100",
+    "FLOWMORPH_SOURCE_OPTIMIZATION_STEPS = 50",
+    1,
+).replace(
+    "FLOWMORPH_TARGET_OPTIMIZATION_STEPS = 100",
+    "FLOWMORPH_TARGET_OPTIMIZATION_STEPS = 50",
+    1,
+).replace(
     "IMAGE_INFERENCE_STEPS = 28",
     "IMAGE_INFERENCE_STEPS = 50",
     1,
@@ -186,6 +206,19 @@ settings = source(settings_cell).replace(
 ).replace(
     "IMAGE_LORA_SCALE = 1.0",
     "IMAGE_LORA_SCALE = 1.2",
+    1,
+).replace(
+    "BASE_SEED = 98123479812734987 #1729",
+    "BASE_SEED = 42 #98123479812734987 #1729",
+    1,
+).replace(
+    "SOURCE_SEQUENCE_FPS = 12.0",
+    """VIDEO_SLOWDOWN_FACTOR = 3.0
+SOURCE_SEQUENCE_FPS = 12.0 / VIDEO_SLOWDOWN_FACTOR""",
+    1,
+).replace(
+    "RIFE_MULTIPLIER = 2",
+    "RIFE_MULTIPLIER = int(round(2 * VIDEO_SLOWDOWN_FACTOR))",
     1,
 )
 mask_settings = dedent(
@@ -250,7 +283,7 @@ mask_settings = dedent(
     # Optional post-FlowMorph tonal outlier correction before previews and RIFE.
     # Raw FlowMorph PNGs are never overwritten. Only detected outliers receive
     # corrected copies; unchanged records continue to reference their raw PNGs.
-    TEMPORAL_TONE_STABILIZATION_ENABLED = True
+    TEMPORAL_TONE_STABILIZATION_ENABLED = False
     TEMPORAL_TONE_WINDOW_RADIUS = 2
     TEMPORAL_TONE_STRENGTH = 0.70
     TEMPORAL_TONE_MEAN_THRESHOLD = 0.02
@@ -260,6 +293,13 @@ mask_settings = dedent(
     TEMPORAL_TONE_MAX_CONTRAST_SCALE_DELTA = 0.15
     TEMPORAL_TONE_ANALYSIS_MAX_SIDE = 256
     TEMPORAL_TONE_REUSE_EXISTING = True
+
+    # Read-only flicker diagnosis rendered at the very end of the notebook.
+    RUN_FLICKER_DIAGNOSTIC = True
+    FLICKER_ANALYSIS_MAX_SIDE = 256
+    FLICKER_OUTLIER_MAD_MULTIPLIER = 3.5
+    FLICKER_MINIMUM_OUTLIER_SCORE = 3.0
+    FLICKER_MAX_LAG = 64
 
     TRAJECTORY_REMOVE_SYMMETRY_LANGUAGE = True
 
@@ -353,6 +393,16 @@ mask_validation = dedent(
         )
     if TEMPORAL_TONE_ANALYSIS_MAX_SIDE < 32:
         raise ValueError("TEMPORAL_TONE_ANALYSIS_MAX_SIDE must be at least 32")
+    if VIDEO_SLOWDOWN_FACTOR < 1:
+        raise ValueError("VIDEO_SLOWDOWN_FACTOR must be at least 1")
+    if FLICKER_ANALYSIS_MAX_SIDE < 32:
+        raise ValueError("FLICKER_ANALYSIS_MAX_SIDE must be at least 32")
+    if FLICKER_OUTLIER_MAD_MULTIPLIER < 0:
+        raise ValueError("FLICKER_OUTLIER_MAD_MULTIPLIER cannot be negative")
+    if FLICKER_MINIMUM_OUTLIER_SCORE < 0:
+        raise ValueError("FLICKER_MINIMUM_OUTLIER_SCORE cannot be negative")
+    if FLICKER_MAX_LAG < 1:
+        raise ValueError("FLICKER_MAX_LAG must be positive")
     if MASK_PROMPT_REWRITE_IMAGE_DETAIL not in {"low", "high", "original", "auto"}:
         raise ValueError(
             "MASK_PROMPT_REWRITE_IMAGE_DETAIL must be low, high, original, or auto"
@@ -402,6 +452,8 @@ validation = validation.replace(
     "MASK_FRAME_OFFSET",
 )
 for active_check in (
+    """if FLOWMORPH_SOURCE_OPTIMIZATION_STEPS != 100:
+    raise ValueError("This quality-first notebook requires 100 endpoint fitting steps")""",
     """if FLOWMORPH_FIT_LORA_SCALE != IMAGE_LORA_SCALE:
     raise ValueError("FlowMorph fit LoRA scale must match IMAGE_LORA_SCALE")""",
     """if FLOWMORPH_RENDER_LORA_SCALE != IMAGE_LORA_SCALE:
@@ -1934,6 +1986,128 @@ final_video_source = source(final_video_cell).replace(
     "recursive_flowmorph_background_mask_rife_ssim_loop.mp4",
 )
 final_video_cell["source"] = final_video_source.splitlines(keepends=True)
+
+notebook["cells"].extend(
+    [
+        {
+            "cell_type": "markdown",
+            "id": "background-mask-flicker-diagnosis-heading",
+            "metadata": {},
+            "source": lines(
+                """
+                ## 14. Read-only cyclic flicker diagnosis
+
+                This final cell measures the **raw FlowMorph frames** without changing
+                them. It compares each frame with its cyclic neighbors, identifies pulse
+                centers, and tests whether high scores repeat at a particular midpoint
+                position, render-batch slot, whole-gap period, or other spectral period.
+
+                The PNG plot and complete JSON audit are written into the persistent run
+                directory. Tone stabilization is not used by this diagnosis.
+                """
+            ),
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "id": "background-mask-flicker-diagnosis",
+            "metadata": {},
+            "outputs": [],
+            "source": lines(
+                """
+                import json
+                from pathlib import Path
+                from PIL import Image
+                from IPython.display import Markdown, display
+                from flowmorph_klein.flicker_diagnostics import (
+                    FlickerDiagnosticConfig,
+                    diagnose_cyclic_flicker,
+                )
+
+                if RUN_FLICKER_DIAGNOSTIC:
+                    diagnostic_records = globals().get("FINAL_RECORDS")
+                    if diagnostic_records is None:
+                        manifest_candidates = [
+                            RUN_DIRECTORY
+                            / "metadata"
+                            / "final_recursive_flowmorph_sequence.json",
+                            RUN_DIRECTORY
+                            / "metadata"
+                            / "final_recursive_flowmorph_sequence_tone_stabilized.json",
+                            RUN_DIRECTORY
+                            / "metadata"
+                            / "final_recursive_sequence.json",
+                        ]
+                        diagnostic_manifest = next(
+                            (path for path in manifest_candidates if path.is_file()),
+                            None,
+                        )
+                        if diagnostic_manifest is None:
+                            raise RuntimeError(
+                                "No final sequence is available for flicker diagnosis. "
+                                "Run the FlowMorph sequence or set RESUME_RUN_DIRECTORY "
+                                "to a completed run first."
+                            )
+                        diagnostic_records = json.loads(
+                            diagnostic_manifest.read_text(encoding="utf-8")
+                        )["records"]
+                        print("Restored diagnostic records from", diagnostic_manifest)
+
+                    final_gap_size = (
+                        int(FLOWMORPH_ROUND_SPECS[-1]["midpoint_count"]) + 1
+                    )
+                    FLICKER_DIAGNOSTIC_RESULT = diagnose_cyclic_flicker(
+                        diagnostic_records,
+                        RUN_DIRECTORY / "diagnostics" / "flicker",
+                        config=FlickerDiagnosticConfig(
+                            analysis_max_side=FLICKER_ANALYSIS_MAX_SIDE,
+                            outlier_mad_multiplier=(
+                                FLICKER_OUTLIER_MAD_MULTIPLIER
+                            ),
+                            minimum_outlier_score=(
+                                FLICKER_MINIMUM_OUTLIER_SCORE
+                            ),
+                            max_lag=FLICKER_MAX_LAG,
+                            gap_size=final_gap_size,
+                            render_batch_size=FLOWMORPH_RENDER_BATCH_SIZE,
+                        ),
+                    )
+                    flicker_preview = Image.open(
+                        FLICKER_DIAGNOSTIC_RESULT.plot_path
+                    ).convert("RGB")
+                    flicker_preview.thumbnail(
+                        (CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000)
+                    )
+                    display(Markdown("### Raw FlowMorph flicker pattern diagnosis"))
+                    display(flicker_preview)
+                    flicker_preview.close()
+                    strong_hypotheses = [
+                        item
+                        for item in FLICKER_DIAGNOSTIC_RESULT.report["hypotheses"]
+                        if item.get("support") == "strong"
+                    ]
+                    print({
+                        "raw_frames_analyzed": (
+                            FLICKER_DIAGNOSTIC_RESULT.report["frame_count"]
+                        ),
+                        "pulse_centers": (
+                            FLICKER_DIAGNOSTIC_RESULT.report["outlier_indices"]
+                        ),
+                        "strong_hypotheses": strong_hypotheses,
+                        "dominant_periods": (
+                            FLICKER_DIAGNOSTIC_RESULT.report["dominant_periods"][:5]
+                        ),
+                        "report": str(FLICKER_DIAGNOSTIC_RESULT.report_path),
+                        "plot": str(FLICKER_DIAGNOSTIC_RESULT.plot_path),
+                        "images_modified": False,
+                    })
+                else:
+                    print("Flicker diagnosis disabled.")
+                """
+            ),
+        },
+    ]
+)
 
 notebook["metadata"].setdefault("colab", {})["name"] = OUTPUT.name
 OUTPUT.parent.mkdir(parents=True, exist_ok=True)
