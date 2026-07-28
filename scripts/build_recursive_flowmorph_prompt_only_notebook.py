@@ -118,12 +118,21 @@ def temporary_environment(values: dict[str, str]):
                 os.environ[key] = value
 
 
-preserved_stages = None
+preserved_stage_cell_source = None
 preserved_settings: dict[str, object] = {}
 if OUTPUT.is_file():
     try:
         existing = json.loads(OUTPUT.read_text(encoding="utf-8"))
-        preserved_stages = literal_assignment(existing, "BASE_STAGES")
+        matching_stage_cells = [
+            source(cell)
+            for cell in existing["cells"]
+            if cell.get("cell_type") == "code"
+            and "BASE_STAGES = [" in source(cell)
+        ]
+        if len(matching_stage_cells) == 1:
+            # Preserve the complete editable cell, including alternative
+            # commented-out prompt sets and the user's formatting.
+            preserved_stage_cell_source = matching_stage_cells[0]
         for name in (
             "DRIVE_PROJECT_BASE",
             "OPENAI_KEY_FILENAME",
@@ -133,7 +142,7 @@ if OUTPUT.is_file():
             if value is not None:
                 preserved_settings[name] = value
     except json.JSONDecodeError:
-        preserved_stages = None
+        preserved_stage_cell_source = None
         preserved_settings = {}
 
 
@@ -217,6 +226,11 @@ settings = replace_once(
     'PROJECT_NAME = "science_path_recursive_flowmorph"',
     'PROJECT_NAME = "science_path_prompt_only_flowmorph"',
 )
+settings = replace_once(
+    settings,
+    "BASE_PROMPT_COUNT = 15",
+    "BASE_PROMPT_COUNT = None  # None uses every entry in BASE_STAGES.",
+)
 for old, new in (
     ("FLOWMORPH_FIT_LORA_SCALE = 1.0", "FLOWMORPH_FIT_LORA_SCALE = 1.2"),
     ("FLOWMORPH_RENDER_LORA_SCALE = 1.0", "FLOWMORPH_RENDER_LORA_SCALE = 1.2"),
@@ -280,16 +294,23 @@ for name, value in preserved_settings.items():
 settings_cell["source"] = settings.splitlines(keepends=True)
 
 
-if preserved_stages:
-    notebook["cells"][4]["source"] = (
-        "BASE_STAGES = "
-        + repr(preserved_stages)
-        + "\n"
-    ).splitlines(keepends=True)
+if preserved_stage_cell_source is not None:
+    notebook["cells"][4]["source"] = preserved_stage_cell_source.splitlines(
+        keepends=True
+    )
 
 
 validation_cell = notebook["cells"][10]
 validation = source(validation_cell)
+validation = replace_once(
+    validation,
+    "if not 3 <= BASE_PROMPT_COUNT <= len(BASE_STAGES):\n"
+    '    raise ValueError(f"BASE_PROMPT_COUNT must be between 3 and {len(BASE_STAGES)}")\n',
+    "if BASE_PROMPT_COUNT is None:\n"
+    "    BASE_PROMPT_COUNT = len(BASE_STAGES)\n"
+    "elif not 3 <= BASE_PROMPT_COUNT <= len(BASE_STAGES):\n"
+    '    raise ValueError(f"BASE_PROMPT_COUNT must be between 3 and {len(BASE_STAGES)}")\n',
+)
 validation = validation.replace(
     'if FLOWMORPH_SOURCE_OPTIMIZATION_STEPS != 100:\n'
     '    raise ValueError("This quality-first notebook requires 100 endpoint fitting steps")\n',

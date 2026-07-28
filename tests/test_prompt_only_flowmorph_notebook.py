@@ -25,7 +25,8 @@ def code_source(notebook: dict) -> str:
 
 def test_notebook_is_clean_parseable_and_has_colab_badge() -> None:
     notebook = load_notebook()
-    assert len(notebook["cells"]) == 33
+    # Users may add notes or scratch cells around the generated workflow.
+    assert len(notebook["cells"]) >= 33
     assert notebook["nbformat"] == 4
     assert "StillLife_Recursive_FlowMorph_Prompt_Only.ipynb" in "".join(
         notebook["cells"][0]["source"]
@@ -42,7 +43,12 @@ def test_notebook_is_clean_parseable_and_has_colab_badge() -> None:
 def test_notebook_is_prompt_only_without_mask_or_trajectory_inputs() -> None:
     code = code_source(load_notebook())
     assert "BASE_STAGES = [" in code
-    assert "BASE_PROMPT_COUNT = 15" in code
+    assert (
+        "BASE_PROMPT_COUNT = None  # None uses every entry in BASE_STAGES."
+        in code
+    )
+    assert "if BASE_PROMPT_COUNT is None:" in code
+    assert "BASE_PROMPT_COUNT = len(BASE_STAGES)" in code
     assert "MASK_" not in code
     assert "TRAJECTORY_" not in code
     assert "prepare_grayscale_edit_mask" not in code
