@@ -129,6 +129,7 @@ def test_ltx_download_has_disk_cleanup_preflight_and_rerun_safety() -> None:
     code = code_source(load_notebook())
     assert "DELETE_LOCAL_FLUX_CACHE_BEFORE_LTX = True" in code
     assert "CLEAN_INTERRUPTED_LTX_DOWNLOADS_IF_NEEDED = True" in code
+    assert "LTX_DISABLE_XET_FOR_DISK_SAFETY = True" in code
     assert '("models--" + MODEL_ID.replace("/", "--"))' in code
     assert "shutil.rmtree(flux_cache_directory)" in code
     assert "LTX_CACHE_DIR = HF_CACHE_DIR" in code
@@ -137,6 +138,8 @@ def test_ltx_download_has_disk_cleanup_preflight_and_rerun_safety() -> None:
     assert '"required_including_headroom_gib"' in code
     assert 'repo_cache.rglob("*.incomplete")' in code
     assert "from huggingface_hub.constants import HF_XET_CACHE" in code
+    assert 'os.environ["HF_HUB_DISABLE_XET"] = "1"' in code
+    assert "hf_hub_constants.HF_HUB_DISABLE_XET = True" in code
     assert "shutil.rmtree(xet_cache_path)" in code
     assert '"incomplete_ltx_gib_reclaimed"' in code
     assert '"xet_temporary_gib_reclaimed"' in code

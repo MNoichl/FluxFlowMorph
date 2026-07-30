@@ -173,6 +173,7 @@ settings = settings[:finishing_start] + dedent(
     LTX_CACHE_DIR = HF_CACHE_DIR
     DELETE_LOCAL_FLUX_CACHE_BEFORE_LTX = True
     CLEAN_INTERRUPTED_LTX_DOWNLOADS_IF_NEEDED = True
+    LTX_DISABLE_XET_FOR_DISK_SAFETY = True
     LTX_DOWNLOAD_HEADROOM_GIB = 5.0
 
     # Resumable output and notebook display.
@@ -593,6 +594,8 @@ notebook["cells"].extend(
             LTX_UPSAMPLER = None
 
             if LTX_PENDING_JOBS:
+                import os
+                import huggingface_hub.constants as hf_hub_constants
                 from huggingface_hub import snapshot_download
                 from huggingface_hub.constants import HF_XET_CACHE
                 from diffusers import AutoModel, LTXConditionPipeline
@@ -604,6 +607,14 @@ notebook["cells"].extend(
                     LTXVideoCondition,
                 )
                 from diffusers import LTXLatentUpsamplePipeline
+
+                # Xet reconstructs a target file while retaining a separate
+                # chunk cache, which can temporarily duplicate a large shard.
+                # Plain resumable HTTP is slower but materially safer on
+                # Colab's constrained ephemeral disk.
+                if LTX_DISABLE_XET_FOR_DISK_SAFETY:
+                    os.environ["HF_HUB_DISABLE_XET"] = "1"
+                    hf_hub_constants.HF_HUB_DISABLE_XET = True
 
                 # Ask the Hub what is still missing before starting another
                 # multi-gigabyte Xet transfer. This accounts for completed files
@@ -655,8 +666,11 @@ notebook["cells"].extend(
                     ),
                 })
                 if (
-                    ltx_free_bytes < ltx_required_bytes
-                    and CLEAN_INTERRUPTED_LTX_DOWNLOADS_IF_NEEDED
+                    CLEAN_INTERRUPTED_LTX_DOWNLOADS_IF_NEEDED
+                    and (
+                        ltx_free_bytes < ltx_required_bytes
+                        or LTX_DISABLE_XET_FOR_DISK_SAFETY
+                    )
                 ):
                     # Hugging Face checks for a shard's full target size even
                     # when a previous `.incomplete` reconstruction exists.
