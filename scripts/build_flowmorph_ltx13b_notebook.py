@@ -172,6 +172,8 @@ settings = settings[:finishing_start] + dedent(
     LTX_MAX_RESERVED_GIB_BEFORE_LOAD = 1.0
     LTX_CACHE_DIR = HF_CACHE_DIR
     DELETE_LOCAL_FLUX_CACHE_BEFORE_LTX = True
+    DELETE_LOCAL_FLOWMORPH_WORK_BEFORE_LTX = True
+    CLEAN_PIP_CACHE_BEFORE_LTX = True
     CLEAN_INTERRUPTED_LTX_DOWNLOADS_IF_NEEDED = True
     LTX_DISABLE_XET_FOR_DISK_SAFETY = True
     LTX_DOWNLOAD_HEADROOM_GIB = 5.0
@@ -336,6 +338,8 @@ notebook["cells"].extend(
             """
             import gc
             import shutil
+            import subprocess
+            import sys
             import torch
 
             sequence_runner_for_release = globals().get("SEQUENCE_RUNNER")
@@ -406,6 +410,44 @@ notebook["cells"].extend(
                 print(
                     "Removed the released local FLUX model cache to make room "
                     f"for LTX: {flux_cache_directory}"
+                )
+
+            local_flowmorph_work = (
+                Path(LOCAL_ASSET_ROOT)
+                / PROJECT_NAME
+                / "sequence_work"
+            )
+            if (
+                DELETE_LOCAL_FLOWMORPH_WORK_BEFORE_LTX
+                and local_flowmorph_work.is_dir()
+            ):
+                expected_work_parent = (
+                    Path(LOCAL_ASSET_ROOT) / PROJECT_NAME
+                ).resolve()
+                if local_flowmorph_work.resolve().parent != expected_work_parent:
+                    raise RuntimeError(
+                        "Refusing to delete an unexpected FlowMorph work path: "
+                        f"{local_flowmorph_work}"
+                    )
+                shutil.rmtree(local_flowmorph_work)
+                print(
+                    "Removed completed local FlowMorph scratch work: "
+                    f"{local_flowmorph_work}"
+                )
+
+            if CLEAN_PIP_CACHE_BEFORE_LTX:
+                pip_cleanup = subprocess.run(
+                    [sys.executable, "-m", "pip", "cache", "purge"],
+                    capture_output=True,
+                    text=True,
+                )
+                print(
+                    "pip cache cleanup:",
+                    (
+                        pip_cleanup.stdout.strip()
+                        or pip_cleanup.stderr.strip()
+                        or f"exit {pip_cleanup.returncode}"
+                    ),
                 )
 
             Path(LTX_CACHE_DIR).mkdir(parents=True, exist_ok=True)
