@@ -857,7 +857,7 @@ notebook["cells"].extend(
             if LTX_PENDING_JOBS:
                 import os
                 import huggingface_hub.constants as hf_hub_constants
-                from huggingface_hub import snapshot_download
+                from huggingface_hub import HfApi
                 from huggingface_hub.constants import HF_XET_CACHE
                 from diffusers import AutoModel, LTXConditionPipeline
                 from diffusers.hooks import apply_group_offloading
@@ -877,47 +877,124 @@ notebook["cells"].extend(
                     os.environ["HF_HUB_DISABLE_XET"] = "1"
                     hf_hub_constants.HF_HUB_DISABLE_XET = True
 
-                # Ask the Hub what is still missing before starting another
-                # multi-gigabyte Xet transfer. This accounts for completed files
-                # from a prior partial attempt and fails with an actionable disk
-                # message rather than an opaque reconstruction error.
-                ltx_download_plan = snapshot_download(
-                    repo_id=LTX_MODEL_ID,
-                    revision=LTX_MODEL_REVISION,
-                    cache_dir=LTX_CACHE_DIR,
-                    allow_patterns=[
-                        "model_index.json",
-                        "scheduler/*",
-                        "tokenizer/*",
-                        "text_encoder/*",
-                        "transformer/*",
-                        "vae/*",
+                # Match each pinned remote file to its content-addressed cache
+                # blob. `snapshot_download(..., dry_run=True)` can incorrectly
+                # count a completed blob as missing when only its snapshot
+                # symlink has not yet been created after an interrupted
+                # pipeline load.
+                hf_api = HfApi()
+
+                def repo_download_state(
+                    repo_id,
+                    revision,
+                    allowed_prefixes=None,
+                    allowed_names=None,
+                ):
+                    allowed_prefixes = tuple(allowed_prefixes or ())
+                    allowed_names = set(allowed_names or ())
+                    repo_cache = (
+                        Path(LTX_CACHE_DIR)
+                        / ("models--" + repo_id.replace("/", "--"))
+                    )
+                    blob_root = repo_cache / "blobs"
+                    remote_bytes = 0
+                    cached_bytes = 0
+                    remote_files = 0
+                    cached_files = 0
+                    for item in hf_api.list_repo_tree(
+                        repo_id=repo_id,
+                        revision=revision,
+                        repo_type="model",
+                        recursive=True,
+                        expand=True,
+                    ):
+                        item_path = getattr(item, "path", "")
+                        item_size = int(getattr(item, "size", 0) or 0)
+                        if not item_path or item_size < 0:
+                            continue
+                        if allowed_prefixes or allowed_names:
+                            relevant = (
+                                item_path in allowed_names
+                                or any(
+                                    item_path.startswith(prefix + "/")
+                                    for prefix in allowed_prefixes
+                                )
+                            )
+                            if not relevant:
+                                continue
+                        remote_files += 1
+                        remote_bytes += item_size
+                        lfs = getattr(item, "lfs", None)
+                        if isinstance(lfs, dict):
+                            blob_hash = (
+                                lfs.get("sha256")
+                                or lfs.get("oid")
+                            )
+                        else:
+                            blob_hash = getattr(lfs, "sha256", None)
+                        if not blob_hash:
+                            blob_hash = getattr(item, "blob_id", None)
+                        blob_path = (
+                            blob_root / blob_hash
+                            if blob_hash
+                            else None
+                        )
+                        if (
+                            blob_path is not None
+                            and blob_path.is_file()
+                            and blob_path.stat().st_size == item_size
+                        ):
+                            cached_files += 1
+                            cached_bytes += item_size
+                    return {
+                        "remote_files": remote_files,
+                        "cached_files": cached_files,
+                        "remote_bytes": remote_bytes,
+                        "cached_bytes": cached_bytes,
+                        "missing_bytes": max(
+                            0,
+                            remote_bytes - cached_bytes,
+                        ),
+                    }
+
+                ltx_model_download_state = repo_download_state(
+                    LTX_MODEL_ID,
+                    LTX_MODEL_REVISION,
+                    allowed_prefixes=[
+                        "scheduler",
+                        "tokenizer",
+                        "text_encoder",
+                        "transformer",
+                        "vae",
                     ],
-                    dry_run=True,
+                    allowed_names=["model_index.json"],
                 )
-                ltx_missing_bytes = sum(
-                    item.file_size
-                    for item in ltx_download_plan
-                    if item.will_download
-                )
+                ltx_missing_bytes = ltx_model_download_state[
+                    "missing_bytes"
+                ]
+                upsampler_download_state = None
                 if LTX_USE_TWO_STAGE_UPSCALING:
-                    upsampler_download_plan = snapshot_download(
-                        repo_id=LTX_UPSAMPLER_ID,
-                        revision=LTX_UPSAMPLER_REVISION,
-                        cache_dir=LTX_CACHE_DIR,
-                        dry_run=True,
+                    upsampler_download_state = repo_download_state(
+                        LTX_UPSAMPLER_ID,
+                        LTX_UPSAMPLER_REVISION,
                     )
-                    ltx_missing_bytes += sum(
-                        item.file_size
-                        for item in upsampler_download_plan
-                        if item.will_download
-                    )
+                    ltx_missing_bytes += upsampler_download_state[
+                        "missing_bytes"
+                    ]
                 ltx_free_bytes = shutil.disk_usage(LTX_CACHE_DIR).free
                 ltx_required_bytes = (
                     ltx_missing_bytes
                     + int(LTX_DOWNLOAD_HEADROOM_GIB * 1024**3)
                 )
                 print({
+                    "ltx_model_remote_gib": round(
+                        ltx_model_download_state["remote_bytes"] / 1024**3,
+                        3,
+                    ),
+                    "ltx_model_cached_gib": round(
+                        ltx_model_download_state["cached_bytes"] / 1024**3,
+                        3,
+                    ),
                     "ltx_download_remaining_gib": round(
                         ltx_missing_bytes / 1024**3, 3
                     ),

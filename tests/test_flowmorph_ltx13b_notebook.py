@@ -137,7 +137,12 @@ def test_ltx_download_has_disk_cleanup_preflight_and_rerun_safety() -> None:
     assert "shutil.rmtree(local_flowmorph_work)" in code
     assert '[sys.executable, "-m", "pip", "cache", "purge"]' in code
     assert "LTX_CACHE_DIR = HF_CACHE_DIR" in code
-    assert "dry_run=True" in code
+    assert "from huggingface_hub import HfApi" in code
+    assert "def repo_download_state(" in code
+    assert "hf_api.list_repo_tree(" in code
+    assert 'blob_root = repo_cache / "blobs"' in code
+    assert "blob_path.stat().st_size == item_size" in code
+    assert '"ltx_model_cached_gib"' in code
     assert '"ltx_download_remaining_gib"' in code
     assert '"required_including_headroom_gib"' in code
     assert 'repo_cache.rglob("*.incomplete")' in code
