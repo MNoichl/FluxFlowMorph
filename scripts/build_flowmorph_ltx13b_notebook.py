@@ -476,6 +476,225 @@ notebook["cells"].extend(
         ),
         markdown(
             """
+            ## 11a. Read-only local-disk investigation
+
+            This cell does not delete anything. It inventories Colab's local
+            filesystem while explicitly excluding the mounted Google Drive tree.
+            It reports the largest local directories/files, individual Hugging
+            Face repository caches, interrupted downloads, pip/Xet caches, and
+            FlowMorph scratch space, then saves the same JSON report to Drive.
+            """
+        ),
+        code(
+            """
+            import os
+            import shutil
+            from pathlib import Path
+
+            def local_tree_size_bytes(path):
+                path = Path(path)
+                if not path.exists() or path.is_symlink():
+                    return 0
+                if path.is_file():
+                    try:
+                        return path.stat().st_size
+                    except OSError:
+                        return 0
+                total = 0
+                for root, directory_names, file_names in os.walk(
+                    path,
+                    followlinks=False,
+                ):
+                    root_path = Path(root)
+                    directory_names[:] = [
+                        name
+                        for name in directory_names
+                        if not (root_path / name).is_symlink()
+                    ]
+                    for name in file_names:
+                        file_path = root_path / name
+                        if file_path.is_symlink():
+                            continue
+                        try:
+                            total += file_path.stat().st_size
+                        except OSError:
+                            pass
+                return total
+
+            def gibibytes(byte_count):
+                return round(byte_count / 1024**3, 3)
+
+            disk = shutil.disk_usage("/")
+            content_root = Path("/content")
+            local_entries = []
+            if content_root.is_dir():
+                for child in content_root.iterdir():
+                    # Drive is persistent remote storage and is deliberately
+                    # excluded from the local ephemeral-disk diagnosis.
+                    if child.name == "drive":
+                        continue
+                    local_entries.append({
+                        "path": str(child),
+                        "bytes": local_tree_size_bytes(child),
+                    })
+            for root in (Path("/root/.cache"), Path("/tmp")):
+                if root.is_dir():
+                    for child in root.iterdir():
+                        local_entries.append({
+                            "path": str(child),
+                            "bytes": local_tree_size_bytes(child),
+                        })
+            local_entries.sort(key=lambda item: item["bytes"], reverse=True)
+
+            cache_root = Path(LTX_CACHE_DIR)
+            huggingface_repositories = []
+            if cache_root.is_dir():
+                for child in cache_root.iterdir():
+                    if child.is_dir() and child.name.startswith("models--"):
+                        huggingface_repositories.append({
+                            "path": str(child),
+                            "bytes": local_tree_size_bytes(child),
+                        })
+            huggingface_repositories.sort(
+                key=lambda item: item["bytes"],
+                reverse=True,
+            )
+
+            incomplete_files = []
+            for search_root in {
+                Path(HF_CACHE_DIR),
+                Path(LTX_CACHE_DIR),
+                Path("/root/.cache/huggingface"),
+            }:
+                if not search_root.is_dir():
+                    continue
+                for path in search_root.rglob("*.incomplete"):
+                    if path.is_file() and not path.is_symlink():
+                        incomplete_files.append({
+                            "path": str(path),
+                            "bytes": path.stat().st_size,
+                        })
+            incomplete_files.sort(
+                key=lambda item: item["bytes"],
+                reverse=True,
+            )
+
+            largest_files = []
+            largest_file_roots = {
+                Path(HF_CACHE_DIR),
+                Path(LTX_CACHE_DIR),
+                Path(LOCAL_ASSET_ROOT),
+                Path("/root/.cache"),
+            }
+            for search_root in largest_file_roots:
+                if not search_root.is_dir():
+                    continue
+                for root, directory_names, file_names in os.walk(
+                    search_root,
+                    followlinks=False,
+                ):
+                    root_path = Path(root)
+                    directory_names[:] = [
+                        name
+                        for name in directory_names
+                        if not (root_path / name).is_symlink()
+                    ]
+                    for name in file_names:
+                        path = root_path / name
+                        if path.is_symlink():
+                            continue
+                        try:
+                            largest_files.append({
+                                "path": str(path),
+                                "bytes": path.stat().st_size,
+                            })
+                        except OSError:
+                            pass
+            largest_files.sort(
+                key=lambda item: item["bytes"],
+                reverse=True,
+            )
+
+            DISK_INVESTIGATION_REPORT = {
+                "read_only": True,
+                "google_drive_excluded": True,
+                "filesystem": {
+                    "total_gib": gibibytes(disk.total),
+                    "used_gib": gibibytes(disk.used),
+                    "free_gib": gibibytes(disk.free),
+                },
+                "configured_paths": {
+                    "hf_cache": HF_CACHE_DIR,
+                    "ltx_cache": LTX_CACHE_DIR,
+                    "local_asset_root": LOCAL_ASSET_ROOT,
+                },
+                "largest_local_entries": [
+                    {
+                        "path": item["path"],
+                        "gib": gibibytes(item["bytes"]),
+                    }
+                    for item in local_entries[:30]
+                ],
+                "huggingface_repository_caches": [
+                    {
+                        "path": item["path"],
+                        "gib": gibibytes(item["bytes"]),
+                    }
+                    for item in huggingface_repositories
+                ],
+                "incomplete_downloads": [
+                    {
+                        "path": item["path"],
+                        "gib": gibibytes(item["bytes"]),
+                    }
+                    for item in incomplete_files
+                ],
+                "largest_local_cache_files": [
+                    {
+                        "path": item["path"],
+                        "gib": gibibytes(item["bytes"]),
+                    }
+                    for item in largest_files[:30]
+                ],
+            }
+            DISK_INVESTIGATION_PATH = (
+                RUN_DIRECTORY
+                / "metadata"
+                / "disk_investigation.json"
+            )
+            DISK_INVESTIGATION_PATH.write_text(
+                json.dumps(
+                    DISK_INVESTIGATION_REPORT,
+                    indent=2,
+                    ensure_ascii=False,
+                ) + "\\n",
+                encoding="utf-8",
+            )
+
+            print("Filesystem:", DISK_INVESTIGATION_REPORT["filesystem"])
+            print("\\nLargest local entries:")
+            for item in DISK_INVESTIGATION_REPORT["largest_local_entries"]:
+                print(f"  {item['gib']:8.3f} GiB  {item['path']}")
+            print("\\nHugging Face repository caches:")
+            for item in DISK_INVESTIGATION_REPORT[
+                "huggingface_repository_caches"
+            ]:
+                print(f"  {item['gib']:8.3f} GiB  {item['path']}")
+            print("\\nIncomplete downloads:")
+            if not DISK_INVESTIGATION_REPORT["incomplete_downloads"]:
+                print("  none")
+            for item in DISK_INVESTIGATION_REPORT["incomplete_downloads"]:
+                print(f"  {item['gib']:8.3f} GiB  {item['path']}")
+            print("\\nLargest local cache files:")
+            for item in DISK_INVESTIGATION_REPORT[
+                "largest_local_cache_files"
+            ]:
+                print(f"  {item['gib']:8.3f} GiB  {item['path']}")
+            print("\\nSaved report:", DISK_INVESTIGATION_PATH)
+            """
+        ),
+        markdown(
+            """
             ## 12. Validate and fingerprint the LTX conditioning jobs
 
             Fourteen stills are assigned to frames `0, 8, …, 104`, so each clip

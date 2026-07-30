@@ -28,7 +28,7 @@ def code_source(notebook: dict) -> str:
 def test_notebook_is_clean_parseable_and_has_colab_badge() -> None:
     notebook = load_notebook()
     assert notebook["nbformat"] == 4
-    assert len(notebook["cells"]) == 32
+    assert len(notebook["cells"]) == 34
     assert "StillLife_FlowMorph_LTX13B_Conditioned_Video.ipynb" in "".join(
         notebook["cells"][0]["source"]
     )
@@ -151,6 +151,34 @@ def test_ltx_download_has_disk_cleanup_preflight_and_rerun_safety() -> None:
     assert '"ltx_transformer",' in code
     assert 'globals().pop(stale_name, None)' in code
     assert 'globals().get("SEQUENCE_RUNNER")' in code
+
+
+def test_disk_investigation_is_read_only_drive_safe_and_persisted() -> None:
+    notebook = load_notebook()
+    code = code_source(notebook)
+    markdown = "\n".join(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "markdown"
+    )
+    assert "## 11a. Read-only local-disk investigation" in markdown
+    assert "def local_tree_size_bytes(path):" in code
+    assert 'if child.name == "drive":' in code
+    assert '"google_drive_excluded": True' in code
+    assert '"huggingface_repository_caches"' in code
+    assert '"incomplete_downloads"' in code
+    assert '"largest_local_cache_files"' in code
+    assert 'rglob("*.incomplete")' in code
+    assert '"disk_investigation.json"' in code
+    diagnostic_start = code.index("def local_tree_size_bytes(path):")
+    diagnostic_end = code.index(
+        "from pathlib import Path\n\nLTX_ROOT",
+        diagnostic_start,
+    )
+    diagnostic_code = code[diagnostic_start:diagnostic_end]
+    assert "unlink(" not in diagnostic_code
+    assert "rmtree(" not in diagnostic_code
+    assert "remove(" not in diagnostic_code
 
 
 def test_clips_are_resumable_and_assembled_without_duplicate_endpoints() -> None:
