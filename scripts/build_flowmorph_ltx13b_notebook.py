@@ -172,6 +172,7 @@ settings = settings[:finishing_start] + dedent(
     LTX_MAX_RESERVED_GIB_BEFORE_LOAD = 1.0
     LTX_CACHE_DIR = HF_CACHE_DIR
     DELETE_LOCAL_FLUX_CACHE_BEFORE_LTX = True
+    CLEAN_INTERRUPTED_LTX_DOWNLOADS_IF_NEEDED = True
     LTX_DOWNLOAD_HEADROOM_GIB = 5.0
 
     # Resumable output and notebook display.
@@ -593,6 +594,7 @@ notebook["cells"].extend(
 
             if LTX_PENDING_JOBS:
                 from huggingface_hub import snapshot_download
+                from huggingface_hub.constants import HF_XET_CACHE
                 from diffusers import AutoModel, LTXConditionPipeline
                 from diffusers.hooks import apply_group_offloading
                 from diffusers.pipelines.ltx.modeling_latent_upsampler import (
@@ -652,6 +654,62 @@ notebook["cells"].extend(
                         ltx_required_bytes / 1024**3, 3
                     ),
                 })
+                if (
+                    ltx_free_bytes < ltx_required_bytes
+                    and CLEAN_INTERRUPTED_LTX_DOWNLOADS_IF_NEEDED
+                ):
+                    # Hugging Face checks for a shard's full target size even
+                    # when a previous `.incomplete` reconstruction exists.
+                    # Xet also retains a separate temporary chunk cache. Keep
+                    # every completed blob, but remove these reproducible
+                    # interrupted-transfer artifacts so the retry can proceed.
+                    incomplete_paths = []
+                    for repo_id in (
+                        LTX_MODEL_ID,
+                        LTX_UPSAMPLER_ID,
+                    ):
+                        repo_cache = (
+                            Path(LTX_CACHE_DIR)
+                            / ("models--" + repo_id.replace("/", "--"))
+                        )
+                        if repo_cache.is_dir():
+                            incomplete_paths.extend(
+                                path
+                                for path in repo_cache.rglob("*.incomplete")
+                                if path.is_file()
+                            )
+                    incomplete_bytes = sum(
+                        path.stat().st_size
+                        for path in incomplete_paths
+                    )
+                    for path in incomplete_paths:
+                        path.unlink()
+
+                    xet_cache_path = Path(HF_XET_CACHE)
+                    xet_cache_bytes = 0
+                    if xet_cache_path.is_dir():
+                        xet_cache_bytes = sum(
+                            path.stat().st_size
+                            for path in xet_cache_path.rglob("*")
+                            if path.is_file()
+                        )
+                        shutil.rmtree(xet_cache_path)
+
+                    ltx_free_bytes = shutil.disk_usage(LTX_CACHE_DIR).free
+                    print({
+                        "interrupted_ltx_files_removed": len(
+                            incomplete_paths
+                        ),
+                        "incomplete_ltx_gib_reclaimed": round(
+                            incomplete_bytes / 1024**3, 3
+                        ),
+                        "xet_temporary_gib_reclaimed": round(
+                            xet_cache_bytes / 1024**3, 3
+                        ),
+                        "disk_free_after_transfer_cleanup_gib": round(
+                            ltx_free_bytes / 1024**3, 3
+                        ),
+                    })
                 if ltx_free_bytes < ltx_required_bytes:
                     raise RuntimeError(
                         "Not enough local disk for the remaining LTX download. "

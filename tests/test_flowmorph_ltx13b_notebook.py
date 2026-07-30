@@ -128,12 +128,18 @@ def test_flux_is_released_before_one_offloaded_ltx_model_load() -> None:
 def test_ltx_download_has_disk_cleanup_preflight_and_rerun_safety() -> None:
     code = code_source(load_notebook())
     assert "DELETE_LOCAL_FLUX_CACHE_BEFORE_LTX = True" in code
+    assert "CLEAN_INTERRUPTED_LTX_DOWNLOADS_IF_NEEDED = True" in code
     assert '("models--" + MODEL_ID.replace("/", "--"))' in code
     assert "shutil.rmtree(flux_cache_directory)" in code
     assert "LTX_CACHE_DIR = HF_CACHE_DIR" in code
     assert "dry_run=True" in code
     assert '"ltx_download_remaining_gib"' in code
     assert '"required_including_headroom_gib"' in code
+    assert 'repo_cache.rglob("*.incomplete")' in code
+    assert "from huggingface_hub.constants import HF_XET_CACHE" in code
+    assert "shutil.rmtree(xet_cache_path)" in code
+    assert '"incomplete_ltx_gib_reclaimed"' in code
+    assert '"xet_temporary_gib_reclaimed"' in code
     assert "Not enough local disk for the remaining LTX download." in code
     assert '"ltx_transformer",' in code
     assert 'globals().pop(stale_name, None)' in code
