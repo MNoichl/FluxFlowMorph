@@ -170,6 +170,9 @@ settings = settings[:finishing_start] + dedent(
     LTX_GROUP_OFFLOAD_USE_STREAM = False
     LTX_GROUP_OFFLOAD_LOW_CPU_MEMORY = True
     LTX_MAX_RESERVED_GIB_BEFORE_LOAD = 1.0
+    LTX_CACHE_DIR = HF_CACHE_DIR
+    DELETE_LOCAL_FLUX_CACHE_BEFORE_LTX = True
+    LTX_DOWNLOAD_HEADROOM_GIB = 5.0
 
     # Resumable output and notebook display.
     REUSE_EXISTING_LTX_CLIPS = True
@@ -330,9 +333,15 @@ notebook["cells"].extend(
         code(
             """
             import gc
+            import shutil
             import torch
 
-            flowmorph_pipeline = getattr(SEQUENCE_RUNNER, "pipeline", None)
+            sequence_runner_for_release = globals().get("SEQUENCE_RUNNER")
+            flowmorph_pipeline = getattr(
+                sequence_runner_for_release,
+                "pipeline",
+                None,
+            )
             if flowmorph_pipeline is not None:
                 maybe_free = getattr(flowmorph_pipeline, "maybe_free_model_hooks", None)
                 if callable(maybe_free):
@@ -353,6 +362,7 @@ notebook["cells"].extend(
                 "session_template",
                 "FLUX_PROMPT_TOKENIZER",
                 "flowmorph_pipeline",
+                "sequence_runner_for_release",
             ):
                 value = globals().pop(variable_name, None)
                 if value is not None:
@@ -375,6 +385,31 @@ notebook["cells"].extend(
             else:
                 raise RuntimeError("LTX-Video 13B requires a CUDA runtime")
 
+            # The FLUX repository is about 32 GiB and the LTX 13B repository is
+            # about 45 GiB. They need not coexist after all FlowMorph PNGs and
+            # endpoint checkpoints have been saved. Remove only the exact,
+            # reproducible local FLUX model cache—not Drive outputs or LoRA files.
+            flux_cache_directory = (
+                Path(HF_CACHE_DIR)
+                / ("models--" + MODEL_ID.replace("/", "--"))
+            )
+            if DELETE_LOCAL_FLUX_CACHE_BEFORE_LTX and flux_cache_directory.is_dir():
+                expected_parent = Path(HF_CACHE_DIR).resolve()
+                if flux_cache_directory.resolve().parent != expected_parent:
+                    raise RuntimeError(
+                        "Refusing to delete an unexpected FLUX cache path: "
+                        f"{flux_cache_directory}"
+                    )
+                shutil.rmtree(flux_cache_directory)
+                print(
+                    "Removed the released local FLUX model cache to make room "
+                    f"for LTX: {flux_cache_directory}"
+                )
+
+            Path(LTX_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+            LTX_DISK_FREE_GIB = (
+                shutil.disk_usage(LTX_CACHE_DIR).free / 1024**3
+            )
             print({
                 "gpu": torch.cuda.get_device_name(0),
                 "total_gib": round(LTX_GPU_TOTAL_GIB, 3),
@@ -384,6 +419,8 @@ notebook["cells"].extend(
                 "reserved_gib_after_flux_release": round(
                     LTX_PRELOAD_RESERVED_GIB, 3
                 ),
+                "ltx_cache_directory": str(Path(LTX_CACHE_DIR)),
+                "local_disk_free_gib": round(LTX_DISK_FREE_GIB, 3),
             })
             if LTX_PRELOAD_RESERVED_GIB > LTX_MAX_RESERVED_GIB_BEFORE_LOAD:
                 print(
@@ -532,11 +569,30 @@ notebook["cells"].extend(
         ),
         code(
             """
+            # Make this cell safe to rerun after an interrupted download or a
+            # failed partial model construction.
+            for stale_name in (
+                "LTX_PIPE",
+                "LTX_UPSCALE_PIPE",
+                "LTX_UPSAMPLER",
+                "ltx_transformer",
+            ):
+                stale = globals().pop(stale_name, None)
+                if stale is not None:
+                    try:
+                        stale.to("cpu")
+                    except (AttributeError, RuntimeError, ValueError):
+                        pass
+                    del stale
+            gc.collect()
+            torch.cuda.empty_cache()
+
             LTX_PIPE = None
             LTX_UPSCALE_PIPE = None
             LTX_UPSAMPLER = None
 
             if LTX_PENDING_JOBS:
+                from huggingface_hub import snapshot_download
                 from diffusers import AutoModel, LTXConditionPipeline
                 from diffusers.hooks import apply_group_offloading
                 from diffusers.pipelines.ltx.modeling_latent_upsampler import (
@@ -547,11 +603,68 @@ notebook["cells"].extend(
                 )
                 from diffusers import LTXLatentUpsamplePipeline
 
+                # Ask the Hub what is still missing before starting another
+                # multi-gigabyte Xet transfer. This accounts for completed files
+                # from a prior partial attempt and fails with an actionable disk
+                # message rather than an opaque reconstruction error.
+                ltx_download_plan = snapshot_download(
+                    repo_id=LTX_MODEL_ID,
+                    revision=LTX_MODEL_REVISION,
+                    cache_dir=LTX_CACHE_DIR,
+                    allow_patterns=[
+                        "model_index.json",
+                        "scheduler/*",
+                        "tokenizer/*",
+                        "text_encoder/*",
+                        "transformer/*",
+                        "vae/*",
+                    ],
+                    dry_run=True,
+                )
+                ltx_missing_bytes = sum(
+                    item.file_size
+                    for item in ltx_download_plan
+                    if item.will_download
+                )
+                if LTX_USE_TWO_STAGE_UPSCALING:
+                    upsampler_download_plan = snapshot_download(
+                        repo_id=LTX_UPSAMPLER_ID,
+                        revision=LTX_UPSAMPLER_REVISION,
+                        cache_dir=LTX_CACHE_DIR,
+                        dry_run=True,
+                    )
+                    ltx_missing_bytes += sum(
+                        item.file_size
+                        for item in upsampler_download_plan
+                        if item.will_download
+                    )
+                ltx_free_bytes = shutil.disk_usage(LTX_CACHE_DIR).free
+                ltx_required_bytes = (
+                    ltx_missing_bytes
+                    + int(LTX_DOWNLOAD_HEADROOM_GIB * 1024**3)
+                )
+                print({
+                    "ltx_download_remaining_gib": round(
+                        ltx_missing_bytes / 1024**3, 3
+                    ),
+                    "disk_free_gib": round(ltx_free_bytes / 1024**3, 3),
+                    "required_including_headroom_gib": round(
+                        ltx_required_bytes / 1024**3, 3
+                    ),
+                })
+                if ltx_free_bytes < ltx_required_bytes:
+                    raise RuntimeError(
+                        "Not enough local disk for the remaining LTX download. "
+                        "Delete unused /content caches or set LTX_CACHE_DIR to "
+                        "a Google Drive directory with at least "
+                        f"{ltx_required_bytes / 1024**3:.1f} GiB free."
+                    )
+
                 ltx_transformer = AutoModel.from_pretrained(
                     LTX_MODEL_ID,
                     subfolder="transformer",
                     revision=LTX_MODEL_REVISION,
-                    cache_dir=HF_CACHE_DIR,
+                    cache_dir=LTX_CACHE_DIR,
                     torch_dtype=torch.bfloat16,
                     low_cpu_mem_usage=True,
                 )
@@ -564,7 +677,7 @@ notebook["cells"].extend(
                 LTX_PIPE = LTXConditionPipeline.from_pretrained(
                     LTX_MODEL_ID,
                     revision=LTX_MODEL_REVISION,
-                    cache_dir=HF_CACHE_DIR,
+                    cache_dir=LTX_CACHE_DIR,
                     transformer=ltx_transformer,
                     torch_dtype=torch.bfloat16,
                     low_cpu_mem_usage=True,
@@ -605,7 +718,7 @@ notebook["cells"].extend(
                     LTX_UPSAMPLER = LTXLatentUpsamplerModel.from_pretrained(
                         LTX_UPSAMPLER_ID,
                         revision=LTX_UPSAMPLER_REVISION,
-                        cache_dir=HF_CACHE_DIR,
+                        cache_dir=LTX_CACHE_DIR,
                         torch_dtype=torch.bfloat16,
                         low_cpu_mem_usage=True,
                     )
