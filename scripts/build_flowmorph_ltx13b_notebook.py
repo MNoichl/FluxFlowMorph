@@ -917,6 +917,9 @@ notebook["cells"].extend(
                                 item_path in allowed_names
                                 or any(
                                     item_path.startswith(prefix + "/")
+                                    and "/" not in item_path[
+                                        len(prefix) + 1:
+                                    ]
                                     for prefix in allowed_prefixes
                                 )
                             )

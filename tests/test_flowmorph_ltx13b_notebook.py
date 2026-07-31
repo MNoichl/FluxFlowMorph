@@ -140,6 +140,7 @@ def test_ltx_download_has_disk_cleanup_preflight_and_rerun_safety() -> None:
     assert "from huggingface_hub import HfApi" in code
     assert "def repo_download_state(" in code
     assert "hf_api.list_repo_tree(" in code
+    assert 'and "/" not in item_path[' in code
     assert 'blob_root = repo_cache / "blobs"' in code
     assert "blob_path.stat().st_size == item_size" in code
     assert '"ltx_model_cached_gib"' in code
