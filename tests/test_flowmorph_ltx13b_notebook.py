@@ -75,12 +75,19 @@ def test_ltx_uses_every_flowmorph_series_at_valid_temporal_indices() -> None:
         in code
     )
     assert "LTX_FRAMES_PER_CONDITION_INTERVAL = 8" in code
-    assert "LTX_CONDITIONING_STRENGTH = 1.0" in code
+    assert 'LTX_CONDITIONING_MODE = "dense_video"' in code
+    assert 'LTX_DENSE_GUIDE_INTERPOLATION = "linear"' in code
+    assert "LTX_CONDITIONING_STRENGTH = 0.85" in code
     assert "LTX_NUM_FRAMES = LTX_FRAME_INDICES[-1] + 1" in code
     assert "if LTX_NUM_FRAMES % 8 != 1:" in code
     assert "for index in range(14)" in code
     assert "LTXVideoCondition(" in code
+    assert "def build_dense_ltx_guide(condition_images):" in code
+    assert "video=dense_guide_frames" in code
+    assert "frame_index=0" in code
     assert "frame_index=frame_index" in code
+    assert "step / LTX_FRAMES_PER_CONDITION_INTERVAL" in code
+    assert '"conditioning_mode": LTX_CONDITIONING_MODE' in code
     assert 'condition_paths = [' in code
     assert 'str(ENDPOINT_RECONSTRUCTION_PATHS[job["left"]["uid"]])' in code
     assert 'str(ENDPOINT_RECONSTRUCTION_PATHS[job["right"]["uid"]])' in code
@@ -198,6 +205,10 @@ def test_clips_are_resumable_and_assembled_without_duplicate_endpoints() -> None
     assert '"-f",\n    "concat"' in code
     assert '"-c",\n    "copy"' in code
     assert "flowmorph_conditioned_ltx13b_cyclic.mp4" in code
+    assert 'Video(\n            str(job["clip_path"]),' in code
+    assert 'Video(\n    str(LTX_FINAL_VIDEO_PATH),' in code
+    assert 'filename=str(job["clip_path"])' not in code
+    assert "filename=str(LTX_FINAL_VIDEO_PATH)" not in code
 
 
 def test_anchor_generation_contract_remains_prompt_only_and_no_beige_canvas() -> None:

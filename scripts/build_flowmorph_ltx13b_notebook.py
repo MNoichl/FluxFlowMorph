@@ -136,7 +136,12 @@ settings = settings[:finishing_start] + dedent(
     LTX_FINAL_HEIGHT = 512
     LTX_FPS = 30
     LTX_FRAMES_PER_CONDITION_INTERVAL = 8
-    LTX_CONDITIONING_STRENGTH = 1.0
+    # Dense-video mode expands the 14 FlowMorph stills into one 105-frame
+    # linear guide. Unlike separate keyframe tokens, it constrains every LTX
+    # latent time slice and prevents a long hold followed by a sudden morph.
+    LTX_CONDITIONING_MODE = "dense_video"  # "dense_video" or "sparse_keyframes"
+    LTX_DENSE_GUIDE_INTERPOLATION = "linear"
+    LTX_CONDITIONING_STRENGTH = 0.85
     LTX_IMAGE_COND_NOISE_SCALE = 0.0
     LTX_DECODE_TIMESTEP = 0.05
     LTX_DECODE_NOISE_SCALE = 0.025
@@ -149,18 +154,23 @@ settings = settings[:finishing_start] + dedent(
     LTX_TONE_MAP_COMPRESSION_RATIO = 0.6
     LTX_MAX_PROMPT_WORDS = 200
     LTX_NEGATIVE_PROMPT = (
-        "cuts, scene changes, camera shake, rapid camera movement, text, symbols, "
-        "watermarks, worst quality, inconsistent motion, blurry, jittery, distorted"
+        "cuts, scene changes, long static hold, delayed transformation, sudden "
+        "morph burst, abrupt global change, camera shake, rapid camera movement, "
+        "text, symbols, watermarks, worst quality, inconsistent motion, blurry, "
+        "jittery, distorted"
     )
     LTX_MOTION_PROMPT_TEMPLATE = (
         "A locked camera observes a museum-quality Baroque oil still life. "
         "Across one continuous shot, the arrangement about {source_science} "
-        "slowly and physically transforms into the arrangement about "
+        "begins changing immediately and transforms at a uniform pace into "
+        "the arrangement about "
         "{target_science}. The interdisciplinary transition concerns "
-        "{science_connection}. Nearby forms bend, unfold, exchange materials, "
-        "and reorganize continuously; illumination, painted texture, scale, "
+        "{science_connection}. One small, spatially local detail at a time bends, "
+        "unfolds, exchanges material, or reorganizes, so every successive moment "
+        "differs slightly from the last; illumination, painted texture, scale, "
         "camera position, and the surrounding room remain coherent. "
-        "Slow deliberate motion, no cuts, no new scene, no camera movement."
+        "No static hold, delayed transformation, sudden morph burst, cuts, new "
+        "scene, or camera movement."
     )
 
     # Colab/L4-oriented memory controls. Group offload keeps only small model
@@ -222,6 +232,10 @@ validation = replace_once(
     '    raise ValueError("LTX condition intervals must be multiples of 8 frames")\n'
     'if not 0 < LTX_CONDITIONING_STRENGTH <= 1:\n'
     '    raise ValueError("LTX conditioning strength must lie in (0, 1]")\n'
+    'if LTX_CONDITIONING_MODE not in {"dense_video", "sparse_keyframes"}:\n'
+    '    raise ValueError("LTX conditioning mode must be dense_video or sparse_keyframes")\n'
+    'if LTX_DENSE_GUIDE_INTERPOLATION != "linear":\n'
+    '    raise ValueError("Only linear dense-guide pacing is currently supported")\n'
     'if LTX_GUIDANCE_SCALE != 1.0:\n'
     '    raise ValueError("The distilled LTX 13B model requires guidance 1.0")\n'
     'if not 0 <= LTX_TONE_MAP_COMPRESSION_RATIO <= 1:\n'
@@ -697,8 +711,11 @@ notebook["cells"].extend(
             """
             ## 12. Validate and fingerprint the LTX conditioning jobs
 
-            Fourteen stills are assigned to frames `0, 8, …, 104`, so each clip
-            has 105 frames. The terminal frame is conditioned on the next anchor.
+            Fourteen FlowMorph stills define frames `0, 8, …, 104`. In the
+            default dense mode, linear in-betweens expand them into one 105-frame
+            video condition, so all fourteen LTX latent time slices receive the
+            intended trajectory instead of fourteen independent keyframe tokens.
+            The terminal frame is conditioned on the next anchor.
             When clips are assembled, that one terminal frame is omitted from each
             segment; the next clip begins on the identical canonical endpoint, and
             the final segment approaches the first anchor before playback loops.
@@ -766,6 +783,10 @@ notebook["cells"].extend(
                         for path in record["condition_paths"]
                     ],
                     "condition_frame_indices": LTX_FRAME_INDICES,
+                    "conditioning_mode": LTX_CONDITIONING_MODE,
+                    "dense_guide_interpolation": (
+                        LTX_DENSE_GUIDE_INTERPOLATION
+                    ),
                     "conditioning_strength": LTX_CONDITIONING_STRENGTH,
                     "num_frames": LTX_NUM_FRAMES,
                     "fps": LTX_FPS,
@@ -809,7 +830,11 @@ notebook["cells"].extend(
             print({
                 "cyclic_gap_clips": len(LTX_JOBS),
                 "pending_clips": len(LTX_PENDING_JOBS),
-                "conditions_per_clip": 14,
+                "flowmorph_guide_stills_per_clip": 14,
+                "ltx_condition_objects_per_clip": (
+                    1 if LTX_CONDITIONING_MODE == "dense_video" else 14
+                ),
+                "conditioning_mode": LTX_CONDITIONING_MODE,
                 "condition_frame_indices": LTX_FRAME_INDICES,
                 "frames_per_clip": LTX_NUM_FRAMES,
                 "seconds_per_clip": round(LTX_NUM_FRAMES / LTX_FPS, 3),
@@ -1158,8 +1183,8 @@ notebook["cells"].extend(
             ## 14. Render and save each conditioned LTX gap
 
             Results are written immediately. The low-resolution distilled pass,
-            optional latent upscale, and short texture-refinement pass all reuse
-            the same 14 conditions. Each saved segment omits its final exact
+            optional latent upscale, and short texture-refinement pass reuse the
+            dense 105-frame FlowMorph guide. Each saved segment omits its final
             endpoint to avoid a duplicated frame when clips are concatenated.
             """
         ),
@@ -1177,25 +1202,61 @@ notebook["cells"].extend(
                     raise ValueError(f"Cannot round {value} to a positive LTX size")
                 return rounded
 
+            def build_dense_ltx_guide(condition_images):
+                if len(condition_images) != len(LTX_FRAME_INDICES):
+                    raise ValueError(
+                        "Dense LTX guide requires one image per FlowMorph index"
+                    )
+                guide_frames = []
+                for left, right in zip(
+                    condition_images[:-1],
+                    condition_images[1:],
+                    strict=True,
+                ):
+                    for step in range(LTX_FRAMES_PER_CONDITION_INTERVAL):
+                        alpha = step / LTX_FRAMES_PER_CONDITION_INTERVAL
+                        guide_frames.append(
+                            left.copy()
+                            if step == 0
+                            else Image.blend(left, right, alpha)
+                        )
+                guide_frames.append(condition_images[-1].copy())
+                if len(guide_frames) != LTX_NUM_FRAMES:
+                    raise RuntimeError(
+                        "Dense LTX guide frame count does not match the clip"
+                    )
+                return guide_frames
+
             def render_ltx_job(job):
                 record = job["record"]
                 condition_images = []
+                dense_guide_frames = []
                 try:
                     for path in record["condition_paths"]:
                         with Image.open(path) as opened:
                             condition_images.append(opened.convert("RGB"))
-                    conditions = [
-                        LTXVideoCondition(
-                            image=image,
-                            frame_index=frame_index,
+                    if LTX_CONDITIONING_MODE == "dense_video":
+                        dense_guide_frames = build_dense_ltx_guide(
+                            condition_images
+                        )
+                        conditions = [LTXVideoCondition(
+                            video=dense_guide_frames,
+                            frame_index=0,
                             strength=LTX_CONDITIONING_STRENGTH,
-                        )
-                        for image, frame_index in zip(
-                            condition_images,
-                            LTX_FRAME_INDICES,
-                            strict=True,
-                        )
-                    ]
+                        )]
+                    else:
+                        conditions = [
+                            LTXVideoCondition(
+                                image=image,
+                                frame_index=frame_index,
+                                strength=LTX_CONDITIONING_STRENGTH,
+                            )
+                            for image, frame_index in zip(
+                                condition_images,
+                                LTX_FRAME_INDICES,
+                                strict=True,
+                            )
+                        ]
                     generator = torch.Generator(device="cuda").manual_seed(
                         BASE_SEED + 100_000 + job["gap_index"]
                     )
@@ -1313,6 +1374,8 @@ notebook["cells"].extend(
                         frame.close()
                     return saved_frame_count
                 finally:
+                    for frame in dense_guide_frames:
+                        frame.close()
                     for image in condition_images:
                         image.close()
 
@@ -1329,7 +1392,7 @@ notebook["cells"].extend(
                 })
                 if LTX_DISPLAY_EACH_CLIP:
                     display(Video(
-                        filename=str(job["clip_path"]),
+                        str(job["clip_path"]),
                         embed=False,
                         width=LTX_DISPLAY_WIDTH,
                     ))
@@ -1469,7 +1532,7 @@ notebook["cells"].extend(
                 ),
             })
             display(Video(
-                filename=str(LTX_FINAL_VIDEO_PATH),
+                str(LTX_FINAL_VIDEO_PATH),
                 embed=False,
                 width=LTX_DISPLAY_WIDTH,
             ))
