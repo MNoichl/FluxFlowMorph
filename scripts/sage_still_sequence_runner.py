@@ -1,17 +1,14 @@
-"""Run one cyclic SAGE transition round between still anchor images.
+"""Prepare one cyclic round of SAGE structural guides for FLUX rendering.
 
 This is a small adapter around the authors' pinned SAGE runtime.  The paper
 expects short input clips and obtains endpoint motion from SEA-RAFT.  Our art
 workflow starts with still paintings, so there is no honest optical flow to
 extract.  We retain SAGE's GlueStick foreground-line matching, canonical
 normalization, Hungarian assignment, global cubic trajectory, local line
-interpolation, and FCVG frame-wise conditioning, but expose a deterministic
-"synthetic flow" bend for the otherwise underdetermined still-image case.
-
-The script is intentionally a subprocess entry point.  SAGE's reference code
-uses diffusers 0.27, while the FLUX.2 notebook uses a much newer diffusers
-commit.  Running this file in a dedicated venv prevents one stack from
-silently breaking the other.
+interpolation, and rasterized frame-wise conditions, but expose a deterministic
+"synthetic flow" bend for the otherwise underdetermined still-image case. The
+notebook consumes these guides with FLUX.2 Klein and its project LoRA; this
+helper deliberately contains no generative model backend.
 """
 
 from __future__ import annotations
@@ -21,7 +18,6 @@ import gc
 import hashlib
 import json
 import math
-import os
 import shutil
 import subprocess
 import sys
@@ -33,7 +29,6 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageOps
-from safetensors.torch import load_file
 from scipy.optimize import linear_sum_assignment
 
 
@@ -51,23 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--gluestick-checkpoint", type=Path, required=True)
-    parser.add_argument("--controlnext-checkpoint", type=Path, required=True)
-    parser.add_argument("--unet-checkpoint", type=Path, required=True)
-    parser.add_argument("--base-model-id", required=True)
-    parser.add_argument("--base-model-revision", required=True)
-    parser.add_argument("--hf-cache", type=Path, required=True)
-    parser.add_argument("--width", type=int, default=576)
-    parser.add_argument("--height", type=int, default=576)
+    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--generated-frames", type=int, default=13)
-    parser.add_argument("--inference-steps", type=int, default=25)
-    parser.add_argument("--control-weight", type=float, default=1.0)
-    parser.add_argument("--min-guidance", type=float, default=3.0)
-    parser.add_argument("--max-guidance", type=float, default=3.0)
-    parser.add_argument("--motion-bucket-id", type=float, default=127.0)
-    parser.add_argument("--noise-aug-strength", type=float, default=0.02)
-    parser.add_argument("--frames-per-batch", type=int, default=13)
-    parser.add_argument("--overlap", type=int, default=5)
-    parser.add_argument("--decode-chunk-size", type=int, default=2)
     parser.add_argument("--max-points", type=int, default=1000)
     parser.add_argument("--max-lines", type=int, default=200)
     parser.add_argument("--max-matched-lines", type=int, default=160)
@@ -75,38 +56,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--line-width", type=int, default=2)
     parser.add_argument("--trajectory-bend", type=float, default=0.04)
     parser.add_argument("--synthetic-flow-scale", type=float, default=0.16)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fps", type=float, default=12.0)
-    parser.add_argument("--crf", type=int, default=16)
     parser.add_argument("--reuse", action="store_true")
-    parser.add_argument(
-        "--phase",
-        choices=("prepare", "render", "all"),
-        default="all",
-        help="Prepare auditable SAGE guides, render prepared guides, or do both.",
-    )
     return parser.parse_args()
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if not (args.sage_repo / "pipeline" / "pipeline_FCVG.py").is_file():
+    if not (args.sage_repo / "models" / "gluestick").is_dir():
         raise FileNotFoundError(f"Not a SAGE checkout: {args.sage_repo}")
-    for path in (
-        args.manifest,
-        args.gluestick_checkpoint,
-        args.controlnext_checkpoint,
-        args.unet_checkpoint,
-    ):
+    for path in (args.manifest, args.gluestick_checkpoint):
         if not path.is_file():
             raise FileNotFoundError(path)
     if args.width % 64 or args.height % 64:
         raise ValueError("SAGE width and height must be divisible by 64")
     if args.generated_frames < 5:
         raise ValueError("At least five generated frames are required")
-    if args.frames_per_batch > args.generated_frames:
-        raise ValueError("frames-per-batch cannot exceed generated-frames")
-    if not 0 <= args.overlap < args.frames_per_batch:
-        raise ValueError("overlap must be smaller than frames-per-batch")
     if args.minimum_matched_lines < 1:
         raise ValueError("minimum-matched-lines must be positive")
 
@@ -254,7 +217,9 @@ def interpolate_structures(
     control_3 = center_b
 
     output: list[np.ndarray] = []
-    for t in np.linspace(0.0, 1.0, frame_count):
+    # The paper defines T *inbetween* structures. Exact endpoints are retained
+    # separately by the notebook, so neither endpoint is duplicated here.
+    for t in np.linspace(0.0, 1.0, frame_count + 2)[1:-1]:
         center = cubic_bezier(control_0, control_1, control_2, control_3, float(t))
         box_width = (1.0 - t) * box_a.width + t * box_b.width
         box_height = (1.0 - t) * box_a.height + t * box_b.height
@@ -778,5 +743,173 @@ def main() -> None:
     }, indent=2), flush=True)
 
 
+def prepare_structure_main() -> None:
+    """Generate SAGE conditions only; FLUX rendering stays in the notebook."""
+
+    args = parse_args()
+    validate_args(args)
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    anchors = manifest["anchors"]
+    if len(anchors) < 3:
+        raise ValueError("A cyclic SAGE sequence needs at least three anchors")
+
+    contract = {
+        "adapter": "sage_structure_for_flux2_klein_v1",
+        "renderer": "external_flux2_klein_with_project_lora",
+        "sage_repository_commit": subprocess.check_output(
+            ["git", "-C", str(args.sage_repo), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "gluestick_sha256": sha256_file(args.gluestick_checkpoint),
+        "settings": {
+            "width": args.width,
+            "height": args.height,
+            "generated_frames": args.generated_frames,
+            "max_points": args.max_points,
+            "max_lines": args.max_lines,
+            "max_matched_lines": args.max_matched_lines,
+            "minimum_matched_lines": args.minimum_matched_lines,
+            "line_width": args.line_width,
+            "trajectory_bend": args.trajectory_bend,
+            "synthetic_flow_scale": args.synthetic_flow_scale,
+        },
+    }
+    contract_hash = hashlib.sha256(
+        json.dumps(contract, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    print("Loading GlueStick once for every cyclic gap...", flush=True)
+    gluestick = load_gluestick(args)
+    prepared: list[dict[str, Any]] = []
+    for gap_index, left in enumerate(anchors):
+        right = anchors[(gap_index + 1) % len(anchors)]
+        gap_uid = f"gap_{gap_index:04d}_{left['uid']}_to_{right['uid']}"
+        gap_directory = args.output_root / gap_uid
+        metadata_path = gap_directory / "structure_metadata.json"
+        endpoint_hashes = {
+            "left_image": sha256_file(Path(left["path"])),
+            "right_image": sha256_file(Path(right["path"])),
+            "left_mask": sha256_file(Path(left["mask_path"])),
+            "right_mask": sha256_file(Path(right["mask_path"])),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "contract_hash": contract_hash,
+                    "gap_uid": gap_uid,
+                    "endpoint_hashes": endpoint_hashes,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if args.reuse and metadata_path.is_file():
+            saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+            condition_paths = [Path(path) for path in saved.get("condition_paths", [])]
+            if (
+                saved.get("fingerprint") == fingerprint
+                and len(condition_paths) == args.generated_frames
+                and all(path.is_file() for path in condition_paths)
+            ):
+                prepared.append(saved)
+                print(f"Reusing SAGE structures for {gap_uid}", flush=True)
+                continue
+
+        gap_directory.mkdir(parents=True, exist_ok=True)
+        conditions_directory = gap_directory / "conditions"
+        if conditions_directory.exists():
+            shutil.rmtree(conditions_directory)
+        conditions_directory.mkdir(parents=True, exist_ok=False)
+
+        source = fit_rgb(Path(left["path"]), args.width, args.height)
+        target = fit_rgb(Path(right["path"]), args.width, args.height)
+        mask_a = fit_mask(Path(left["mask_path"]), args.width, args.height)
+        mask_b = fit_mask(Path(right["mask_path"]), args.width, args.height)
+        lines_a, lines_b = detect_lines(gluestick, source, target)
+        box_a, box_b = mask_box(mask_a), mask_box(mask_b)
+        selected_a = lines_a[points_in_mask(lines_a, mask_a)]
+        selected_b = lines_b[points_in_mask(lines_b, mask_b)]
+        if min(len(selected_a), len(selected_b)) < args.minimum_matched_lines:
+            raise RuntimeError(
+                f"{gap_uid}: only {len(selected_a)} and {len(selected_b)} foreground "
+                f"lines survived. Improve the masks, lower --minimum-matched-lines, "
+                "or use full-frame masks."
+            )
+        matched_a, matched_b, norm_a, norm_b = choose_matches(
+            selected_a, selected_b, box_a, box_b, args.max_matched_lines
+        )
+        structures = interpolate_structures(
+            norm_a,
+            norm_b,
+            box_a,
+            box_b,
+            args.generated_frames,
+            args.synthetic_flow_scale,
+            args.trajectory_bend,
+            args.width,
+            args.height,
+        )
+        conditions = rasterize_conditions(
+            structures,
+            args.width,
+            args.height,
+            args.line_width,
+            conditions_directory,
+        )
+        source.save(gap_directory / "source.png")
+        target.save(gap_directory / "target.png")
+        Image.fromarray(mask_a.astype(np.uint8) * 255).save(gap_directory / "source_mask.png")
+        Image.fromarray(mask_b.astype(np.uint8) * 255).save(gap_directory / "target_mask.png")
+        diagnostic_overlay(source, matched_a, gap_directory / "source_matched_lines.png", args.line_width)
+        diagnostic_overlay(target, matched_b, gap_directory / "target_matched_lines.png", args.line_width)
+        item = {
+            "gap_index": gap_index,
+            "gap_uid": gap_uid,
+            "left": left,
+            "right": right,
+            "gap_directory": str(gap_directory),
+            "conditions_directory": str(conditions_directory),
+            "fingerprint": fingerprint,
+            "endpoint_hashes": endpoint_hashes,
+            "detected_lines": [int(len(lines_a)), int(len(lines_b))],
+            "foreground_lines": [int(len(selected_a)), int(len(selected_b))],
+            "matched_lines": int(len(matched_a)),
+            "boxes": [asdict(box_a), asdict(box_b)],
+            "condition_alphas": [
+                float(value)
+                for value in np.linspace(0.0, 1.0, args.generated_frames + 2)[1:-1]
+            ],
+            "condition_paths": [
+                str(conditions_directory / f"condition_{index:04d}.png")
+                for index in range(args.generated_frames)
+            ],
+        }
+        write_json(metadata_path, item)
+        prepared.append(item)
+        source.close()
+        target.close()
+        for condition in conditions:
+            condition.close()
+        print(f"Prepared {gap_uid}: {len(matched_a)} matched foreground lines", flush=True)
+
+    del gluestick
+    gc.collect()
+    torch.cuda.empty_cache()
+    preparation_manifest = {
+        "method": "SAGE structural guidance",
+        "phase": "prepared_for_flux2_klein",
+        "contract": contract,
+        "contract_hash": contract_hash,
+        "gaps": prepared,
+    }
+    output_path = args.output_root / "sage_preparation_manifest.json"
+    write_json(output_path, preparation_manifest)
+    print(json.dumps({
+        "prepared": True,
+        "gaps": len(prepared),
+        "preparation_manifest": str(output_path),
+        "generative_backend_loaded": False,
+    }, indent=2), flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    prepare_structure_main()
