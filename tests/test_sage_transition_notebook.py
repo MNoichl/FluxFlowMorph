@@ -90,6 +90,15 @@ def test_sage_structure_is_pinned_inspectable_and_precedes_flux_render() -> None
     )
 
 
+def test_pytlsd_is_installed_and_verified_in_the_active_interpreter() -> None:
+    source = code_source()
+    assert '"pytlsd==0.0.2"' in source
+    assert '"pybind11>=2.10"' in source
+    assert '"import omegaconf, pytlsd; from pytlsd import lsd"' in source
+    assert "sage_import_probe = subprocess.run(" in source
+    assert "Repairing missing SAGE line-detector dependencies" in source
+
+
 def test_flux_sage_round_is_cyclic_resumable_and_streamed() -> None:
     source = code_source()
     assert 'SAGE_GENERATED_FRAMES_PER_GAP = 13' in source

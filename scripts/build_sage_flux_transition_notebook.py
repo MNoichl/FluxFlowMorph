@@ -51,6 +51,28 @@ cells.extend([
         import shutil
         import urllib.request
 
+        sage_import_probe = subprocess.run(
+            [sys.executable, "-c", "import omegaconf, pytlsd; from pytlsd import lsd"],
+            capture_output=True,
+            text=True,
+        )
+        if sage_import_probe.returncode != 0:
+            print("Repairing missing SAGE line-detector dependencies...")
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "--upgrade",
+                "setuptools>=69", "wheel", "pybind11>=2.10",
+            ])
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                "omegaconf==2.3.0", "pytlsd==0.0.2",
+            ])
+            import importlib
+            importlib.invalidate_caches()
+            subprocess.check_call([
+                sys.executable, "-c",
+                "import omegaconf, pytlsd; from pytlsd import lsd; print(pytlsd.__file__)",
+            ])
+
         maybe_free = getattr(FLUX_PIPE, "maybe_free_model_hooks", None)
         if callable(maybe_free):
             maybe_free()
