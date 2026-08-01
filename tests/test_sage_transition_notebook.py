@@ -81,11 +81,14 @@ def test_sage_structure_is_pinned_inspectable_and_precedes_flux_render() -> None
     ) in source
     assert 'SAGE_MASK_MODE = "grabcut"' in source
     assert "cv2.grabCut(" in source
-    assert "subprocess.check_call(SAGE_COMMAND)" in source
+    assert "subprocess.Popen(" in source
+    assert 'sage_structure_preparation.log' in source
+    assert "stderr=subprocess.STDOUT" in source
+    assert "Last subprocess lines:" in source
     assert "sage_preparation_manifest.json" in source
     assert "source_matched_lines.png" in source
     assert "sage_middle_conditions.png" in source
-    assert source.index("subprocess.check_call(SAGE_COMMAND)") < source.index(
+    assert source.index("process = subprocess.Popen(") < source.index(
         "Encoding each unique endpoint prompt once"
     )
 

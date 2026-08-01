@@ -125,6 +125,8 @@ cells.extend([
     ),
     code(
         """
+        import os
+
         SAGE_OUTPUT_ROOT = RUN_DIRECTORY / "sage" / "one_round"
         SAGE_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
         SAGE_RUNNER = Path(PROJECT_ROOT) / "scripts" / "sage_still_sequence_runner.py"
@@ -156,7 +158,38 @@ cells.extend([
             maybe_free()
         gc.collect()
         torch.cuda.empty_cache()
-        subprocess.check_call(SAGE_COMMAND)
+        SAGE_PREPARATION_LOG_PATH = (
+            RUN_DIRECTORY / "metadata" / "sage_structure_preparation.log"
+        )
+        print("SAGE subprocess log:", SAGE_PREPARATION_LOG_PATH)
+        sage_environment = os.environ.copy()
+        sage_environment["PYTHONUNBUFFERED"] = "1"
+        with SAGE_PREPARATION_LOG_PATH.open("w", encoding="utf-8") as log_handle:
+            process = subprocess.Popen(
+                SAGE_COMMAND,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=sage_environment,
+            )
+            assert process.stdout is not None
+            captured_lines = []
+            for output_line in process.stdout:
+                print(output_line, end="")
+                log_handle.write(output_line)
+                log_handle.flush()
+                captured_lines.append(output_line)
+                if len(captured_lines) > 120:
+                    captured_lines.pop(0)
+            sage_return_code = process.wait()
+        if sage_return_code != 0:
+            failure_tail = "".join(captured_lines[-80:])
+            raise RuntimeError(
+                "SAGE structural preparation failed. The actual subprocess "
+                f"exception is preserved at {SAGE_PREPARATION_LOG_PATH}.\\n\\n"
+                "Last subprocess lines:\\n" + failure_tail
+            )
 
         SAGE_PREPARATION_MANIFEST_PATH = SAGE_OUTPUT_ROOT / "sage_preparation_manifest.json"
         SAGE_PREPARATION = json.loads(
