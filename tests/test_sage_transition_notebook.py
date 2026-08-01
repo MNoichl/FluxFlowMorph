@@ -97,6 +97,10 @@ def test_pytlsd_is_installed_and_verified_in_the_active_interpreter() -> None:
     assert '"import omegaconf, pytlsd; from pytlsd import lsd"' in source
     assert "sage_import_probe = subprocess.run(" in source
     assert "Repairing missing SAGE line-detector dependencies" in source
+    assert "os.kill(os.getpid(), signal.SIGKILL)" in source
+    assert "import numpy.char" in source
+    assert "import scipy.sparse" in source
+    assert "Do not reinstall again before restarting" in source
 
 
 def test_flux_sage_round_is_cyclic_resumable_and_streamed() -> None:
