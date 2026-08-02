@@ -31,8 +31,164 @@ def code(text: str) -> dict:
 
 
 notebook = json.loads(OUTPUT.read_text(encoding="utf-8"))
-# Cells 0..17 are the editable settings, prompts, FLUX anchor generation, and masks.
-cells = copy.deepcopy(notebook["cells"][:18])
+# Retain editable settings/prompts/FLUX anchor generation by heading rather than
+# a brittle numeric slice. The mask section below is canonical and explicit.
+cells = []
+for existing_cell in notebook["cells"]:
+    existing_source = "".join(existing_cell.get("source", []))
+    if existing_cell.get("cell_type") == "markdown" and existing_source.lstrip().startswith(
+        "## 8. Build or load foreground masks"
+    ):
+        break
+    if existing_cell.get("cell_type") == "code" and not existing_source.strip():
+        continue
+    cells.append(copy.deepcopy(existing_cell))
+
+cells.extend([
+    markdown(
+        """
+        ## 8. Build or load foreground masks and inspect them
+
+        SAGE deliberately suppresses background line clutter by matching only
+        lines intersecting the foreground mask. White means foreground. Automatic
+        GrabCut is a convenience, not ground truth: replace any bad mask PNG and
+        rerun from section 9 with `SAGE_MASK_REGENERATE=False`.
+        """
+    ),
+    code(
+        """
+        import cv2
+        import numpy as np
+        from PIL import ImageOps
+
+        SAGE_MASK_DIRECTORY = RUN_DIRECTORY / "sage" / "masks"
+        SAGE_MASK_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        SAGE_MASK_RECORDS = []
+
+        def automatic_grabcut_mask(image):
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            height, width = bgr.shape[:2]
+            margin_x = max(1, round(width * SAGE_GRABCUT_MARGIN_FRACTION))
+            margin_y = max(1, round(height * SAGE_GRABCUT_MARGIN_FRACTION))
+            rectangle = (
+                margin_x,
+                margin_y,
+                max(2, width - 2 * margin_x),
+                max(2, height - 2 * margin_y),
+            )
+            labels = np.zeros((height, width), dtype=np.uint8)
+            background_model = np.zeros((1, 65), dtype=np.float64)
+            foreground_model = np.zeros((1, 65), dtype=np.float64)
+            cv2.grabCut(
+                bgr,
+                labels,
+                rectangle,
+                background_model,
+                foreground_model,
+                5,
+                cv2.GC_INIT_WITH_RECT,
+            )
+            foreground = np.isin(
+                labels, [cv2.GC_FGD, cv2.GC_PR_FGD]
+            ).astype(np.uint8)
+            if SAGE_MASK_DILATION_PIXELS > 0:
+                size = int(SAGE_MASK_DILATION_PIXELS) * 2 + 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+                foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel)
+                foreground = cv2.dilate(foreground, kernel, iterations=1)
+            coverage = float(foreground.mean())
+            if not SAGE_MASK_MIN_COVERAGE <= coverage <= SAGE_MASK_MAX_COVERAGE:
+                print(
+                    f"GrabCut coverage {coverage:.3f} is outside the requested range; "
+                    "using full frame for this anchor."
+                )
+                foreground = np.ones((height, width), dtype=np.uint8)
+            return Image.fromarray(foreground * 255, mode="L")
+
+        for record in BASE_RECORDS:
+            output_path = SAGE_MASK_DIRECTORY / f"{record['uid']}.png"
+            if output_path.is_file() and not SAGE_MASK_REGENERATE:
+                mask = Image.open(output_path).convert("L")
+                source = "existing_run_mask"
+            elif SAGE_MASK_MODE == "directory":
+                input_path = (
+                    Path(SAGE_MASK_SOURCE_DIRECTORY).expanduser()
+                    / f"{record['uid']}.png"
+                )
+                if not input_path.is_file():
+                    raise FileNotFoundError(f"Missing SAGE mask: {input_path}")
+                with Image.open(input_path) as opened:
+                    mask = opened.convert("L")
+                source = str(input_path)
+            elif SAGE_MASK_MODE == "full_frame":
+                with Image.open(record["path"]) as opened:
+                    mask = Image.new("L", opened.size, 255)
+                source = "full_frame"
+            else:
+                with Image.open(record["path"]) as opened:
+                    mask = automatic_grabcut_mask(opened)
+                source = "automatic_grabcut"
+            mask.save(output_path)
+            coverage = float((np.asarray(mask, dtype=np.uint8) >= 128).mean())
+            mask.close()
+            SAGE_MASK_RECORDS.append({
+                "uid": record["uid"],
+                "mask_path": str(output_path),
+                "source": source,
+                "coverage": coverage,
+            })
+
+        mask_by_uid = {item["uid"]: item for item in SAGE_MASK_RECORDS}
+        SAGE_ANCHOR_MANIFEST_PATH = (
+            RUN_DIRECTORY / "metadata" / "sage_anchor_manifest.json"
+        )
+        SAGE_ANCHOR_MANIFEST = {
+            "cyclic": True,
+            "mask_mode": SAGE_MASK_MODE,
+            "anchors": [
+                {
+                    **record,
+                    "mask_path": mask_by_uid[record["uid"]]["mask_path"],
+                    "mask_coverage": mask_by_uid[record["uid"]]["coverage"],
+                }
+                for record in BASE_RECORDS
+            ],
+        }
+        SAGE_ANCHOR_MANIFEST_PATH.write_text(
+            json.dumps(SAGE_ANCHOR_MANIFEST, indent=2, ensure_ascii=False) + "\\n",
+            encoding="utf-8",
+        )
+
+        mask_contact_sheet_path = (
+            RUN_DIRECTORY / "previews" / "sage_foreground_masks.png"
+        )
+        mask_previews = []
+        for item in SAGE_MASK_RECORDS:
+            with Image.open(item["mask_path"]) as opened:
+                mask_previews.append(opened.convert("RGB"))
+        make_contact_sheet(
+            mask_previews,
+            mask_contact_sheet_path,
+            columns=min(CONTACT_SHEET_COLUMNS, len(mask_previews)),
+            labels=[
+                f"{item['uid']} ({item['coverage']:.0%})"
+                for item in SAGE_MASK_RECORDS
+            ],
+        )
+        for image in mask_previews:
+            image.close()
+        mask_preview = Image.open(mask_contact_sheet_path).convert("RGB")
+        mask_preview.thumbnail((CONTACT_SHEET_DISPLAY_MAX_WIDTH, 100000))
+        display(Markdown(
+            "### SAGE foreground masks — white structures will guide matching"
+        ))
+        display(mask_preview)
+        mask_preview.close()
+        print("Editable full-resolution masks:", SAGE_MASK_DIRECTORY)
+        """
+    ),
+])
 
 cells.extend([
     markdown(
@@ -48,6 +204,7 @@ cells.extend([
     code(
         """
         import gc
+        import hashlib
         import shutil
         import urllib.request
 
@@ -93,6 +250,39 @@ cells.extend([
         ).strip()
         if actual_sage_commit != SAGE_REPOSITORY_COMMIT:
             raise RuntimeError("SAGE checkout does not match the pinned paper implementation")
+
+        # SAGE vendors GlueStick's Python sources but omits the separate
+        # SuperPoint detector checkpoint expected by its hard-coded relative path.
+        SAGE_SUPERPOINT_CHECKPOINT = (
+            sage_repository / "models" / "resources" / "weights" / "superpoint_v1.pth"
+        )
+        SAGE_SUPERPOINT_CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
+
+        def local_sha256(path):
+            digest = hashlib.sha256()
+            with Path(path).open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            return digest.hexdigest()
+
+        superpoint_is_valid = (
+            SAGE_SUPERPOINT_CHECKPOINT.is_file()
+            and local_sha256(SAGE_SUPERPOINT_CHECKPOINT) == SAGE_SUPERPOINT_SHA256
+        )
+        if not superpoint_is_valid:
+            temporary_path = SAGE_SUPERPOINT_CHECKPOINT.with_suffix(".download")
+            urllib.request.urlretrieve(SAGE_SUPERPOINT_URL, temporary_path)
+            downloaded_sha256 = local_sha256(temporary_path)
+            if downloaded_sha256 != SAGE_SUPERPOINT_SHA256:
+                raise RuntimeError(
+                    "SuperPoint checkpoint checksum mismatch: "
+                    f"found {downloaded_sha256}, expected {SAGE_SUPERPOINT_SHA256}"
+                )
+            temporary_path.replace(SAGE_SUPERPOINT_CHECKPOINT)
+        print({
+            "superpoint_checkpoint": str(SAGE_SUPERPOINT_CHECKPOINT),
+            "superpoint_sha256": local_sha256(SAGE_SUPERPOINT_CHECKPOINT),
+        })
 
         checkpoint_root = Path(HF_CACHE_DIR) / "sage_gluestick"
         checkpoint_root.mkdir(parents=True, exist_ok=True)

@@ -63,6 +63,14 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if not (args.sage_repo / "models" / "gluestick").is_dir():
         raise FileNotFoundError(f"Not a SAGE checkout: {args.sage_repo}")
+    superpoint_checkpoint = (
+        args.sage_repo / "models" / "resources" / "weights" / "superpoint_v1.pth"
+    )
+    if not superpoint_checkpoint.is_file():
+        raise FileNotFoundError(
+            "SAGE's vendored GlueStick requires the separate SuperPoint weights at "
+            f"{superpoint_checkpoint}. Rerun notebook section 9 to download and verify them."
+        )
     for path in (args.manifest, args.gluestick_checkpoint):
         if not path.is_file():
             raise FileNotFoundError(path)

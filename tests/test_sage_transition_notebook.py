@@ -85,6 +85,10 @@ def test_sage_structure_is_pinned_inspectable_and_precedes_flux_render() -> None
     assert 'sage_structure_preparation.log' in source
     assert "stderr=subprocess.STDOUT" in source
     assert "Last subprocess lines:" in source
+    assert 'SAGE_SUPERPOINT_URL = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"' in source
+    assert 'SAGE_SUPERPOINT_SHA256 = "52b6708629640ca883673b5d5c097c4ddad37d8048b33f09c8ca0d69db12c40e"' in source
+    assert '"models" / "resources" / "weights" / "superpoint_v1.pth"' in source
+    assert "SuperPoint checkpoint checksum mismatch" in source
     assert "sage_preparation_manifest.json" in source
     assert "source_matched_lines.png" in source
     assert "sage_middle_conditions.png" in source
