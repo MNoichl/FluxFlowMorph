@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from PIL import Image
+from unittest.mock import patch
 
 from flowmorph_klein.sage_control import (
     make_canny_reference,
@@ -44,6 +45,43 @@ def test_dense_warp_retains_endpoint_detail() -> None:
     result.image.close()
     result.warped_left.close()
     result.warped_right.close()
+
+
+def test_dense_warp_supports_legacy_scikit_image_estimator() -> None:
+    skimage = pytest.importorskip("skimage.transform")
+    real_transform = skimage.PiecewiseAffineTransform
+
+    class LegacyTransform:
+        def __init__(self):
+            self._delegate = None
+
+        def estimate(self, source, destination):
+            self._delegate = real_transform.from_estimate(source, destination)
+            return True
+
+        @property
+        def inverse(self):
+            return self._delegate.inverse
+
+    image = Image.new("RGB", (32, 32), (80, 40, 20))
+    source = np.array([[[4, 4], [12, 12]], [[4, 12], [12, 4]]], dtype=float)
+    target = source + 8.0
+    with patch("skimage.transform.PiecewiseAffineTransform", LegacyTransform):
+        result = warp_sage_endpoints(
+            image,
+            image,
+            source,
+            target,
+            (source + target) / 2.0,
+            0.5,
+            maximum_control_lines=None,
+            border_samples_per_edge=3,
+        )
+    assert result.image.size == (32, 32)
+    result.image.close()
+    result.warped_left.close()
+    result.warped_right.close()
+    image.close()
 
 
 def test_control_images_are_not_colored_overlays() -> None:

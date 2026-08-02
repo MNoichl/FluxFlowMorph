@@ -108,9 +108,16 @@ def _warp_image(
         ) from error
     width, height = image.size
     try:
-        transform = PiecewiseAffineTransform.from_estimate(
-            source_points, destination_points
-        )
+        constructor = getattr(PiecewiseAffineTransform, "from_estimate", None)
+        if callable(constructor):
+            transform = constructor(source_points, destination_points)
+        else:
+            # scikit-image <=0.25 exposes only the mutable instance API. Some
+            # Colab images can retain that version until the kernel is fully
+            # restarted even after the pinned requirements cell has run.
+            transform = PiecewiseAffineTransform()
+            if not transform.estimate(source_points, destination_points):
+                raise RuntimeError("piecewise-affine estimator returned false")
     except (ValueError, RuntimeError) as error:
         raise RuntimeError("piecewise-affine SAGE warp estimation failed") from error
     source = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
