@@ -763,7 +763,7 @@ def prepare_structure_main() -> None:
         raise ValueError("A cyclic SAGE sequence needs at least three anchors")
 
     contract = {
-        "adapter": "sage_structure_for_flux2_klein_v1",
+        "adapter": "sage_structure_for_flux2_klein_v2_dense_warp",
         "renderer": "external_flux2_klein_with_project_lora",
         "sage_repository_commit": subprocess.check_output(
             ["git", "-C", str(args.sage_repo), "rev-parse", "HEAD"], text=True
@@ -813,10 +813,12 @@ def prepare_structure_main() -> None:
         if args.reuse and metadata_path.is_file():
             saved = json.loads(metadata_path.read_text(encoding="utf-8"))
             condition_paths = [Path(path) for path in saved.get("condition_paths", [])]
+            structure_data_path = Path(saved.get("structure_data_path", ""))
             if (
                 saved.get("fingerprint") == fingerprint
                 and len(condition_paths) == args.generated_frames
                 and all(path.is_file() for path in condition_paths)
+                and structure_data_path.is_file()
             ):
                 prepared.append(saved)
                 print(f"Reusing SAGE structures for {gap_uid}", flush=True)
@@ -863,6 +865,18 @@ def prepare_structure_main() -> None:
             args.line_width,
             conditions_directory,
         )
+        structure_data_path = gap_directory / "sage_structure_data.npz"
+        np.savez_compressed(
+            structure_data_path,
+            matched_source_lines=matched_a.astype(np.float32),
+            matched_target_lines=matched_b.astype(np.float32),
+            matched_source_normalized=norm_a.astype(np.float32),
+            matched_target_normalized=norm_b.astype(np.float32),
+            intermediate_lines=np.stack(structures).astype(np.float32),
+            condition_alphas=np.linspace(
+                0.0, 1.0, args.generated_frames + 2, dtype=np.float32
+            )[1:-1],
+        )
         source.save(gap_directory / "source.png")
         target.save(gap_directory / "target.png")
         Image.fromarray(mask_a.astype(np.uint8) * 255).save(gap_directory / "source_mask.png")
@@ -882,6 +896,8 @@ def prepare_structure_main() -> None:
             "foreground_lines": [int(len(selected_a)), int(len(selected_b))],
             "matched_lines": int(len(matched_a)),
             "boxes": [asdict(box_a), asdict(box_b)],
+            "structure_data_path": str(structure_data_path),
+            "structure_data_sha256": sha256_file(structure_data_path),
             "condition_alphas": [
                 float(value)
                 for value in np.linspace(0.0, 1.0, args.generated_frames + 2)[1:-1]

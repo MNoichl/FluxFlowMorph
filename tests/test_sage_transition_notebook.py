@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "StillLife_SAGE_Transition_Video.ipynb"
 RUNNER = ROOT / "scripts" / "sage_still_sequence_runner.py"
+RIFE_RUNNER = ROOT / "scripts" / "rife_pair_sequence_runner.py"
 
 
 def load_notebook() -> dict:
@@ -25,7 +26,7 @@ def code_source() -> str:
 def test_notebook_is_clean_parseable_and_linked_from_colab() -> None:
     notebook = load_notebook()
     assert notebook["nbformat"] == 4
-    assert len(notebook["cells"]) == 27
+    assert len(notebook["cells"]) == 29
     assert "StillLife_SAGE_Transition_Video.ipynb" in "".join(
         notebook["cells"][0]["source"]
     )
@@ -45,9 +46,11 @@ def test_all_visible_images_use_flux2_klein_and_rijksoil() -> None:
     assert "Flux2KleinPipeline.from_pretrained(" in source
     assert "load_flux2_lora(" in source
     assert "pipeline.fuse_lora(" in source
-    assert 'image=[left_image, right_image, init_image]' in source
+    assert 'call_kwargs["image"] = [canny_image, init_image]' in source
     assert "prompt_embeds=prompt_package.prompt_embeds" in source
-    assert "prepare_flux2_klein_img2img_inputs(" in source
+    assert "prepare_flux2_klein_spatial_lock_inputs(" in source
+    assert "warp_sage_endpoints(" in source
+    assert 'SAGE_REFCONTROL_TRIGGER = "refcontrol"' in source
     assert "interpolate_conditioning(" in source
 
 
@@ -112,16 +115,18 @@ def test_pytlsd_is_installed_and_verified_in_the_active_interpreter() -> None:
 
 def test_flux_sage_round_is_cyclic_resumable_and_streamed() -> None:
     source = code_source()
-    assert 'SAGE_GENERATED_FRAMES_PER_GAP = 13' in source
+    assert 'SAGE_GENERATED_FRAMES_PER_GAP = 5' in source
     assert 'SAGE_REUSE_COMPLETED_GAPS = True' in source
     assert 'SAGE_OUTPUT_FPS = 12.0' in source
-    assert 'SAGE_FLUX_IMG2IMG_STRENGTH = 0.72' in source
-    assert 'SAGE_PREVIOUS_FRAME_BLEND = 0.24' in source
-    assert 'SAGE_STRUCTURE_INIT_STRENGTH = 0.24' in source
+    assert 'SAGE_FLUX_IMG2IMG_STRENGTH = 0.48' in source
+    assert 'SAGE_STRUCTURE_LOCK_STRENGTH = 0.50' in source
+    assert "SAGE_ENDPOINT_PALETTE_BLUR" not in source
+    assert "SAGE_PREVIOUS_FRAME_BLEND" not in source
     assert "write_json_atomic(metadata_path, partial)" in source
-    assert "flux_sage_transition.mp4" in source
-    assert "sage_sequence_manifest.json" in source
-    assert "RUN_RIFE_POSTPROCESS" not in source
+    assert "flux_sage_transition_v2.mp4" in source
+    assert "sage_sequence_manifest_v2.json" in source
+    assert "RUN_RIFE_POSTPROCESS = True" in source
+    assert "rife_pair_sequence_runner.py" in source
     assert "FLOWMORPH_ROUND_SPECS" not in source
 
 
@@ -138,4 +143,15 @@ def test_runner_only_prepares_sage_structures_for_external_flux() -> None:
     assert '"renderer": "external_flux2_klein_with_project_lora"' in source
     assert 'anchors[(gap_index + 1) % len(anchors)]' in source
     assert '"condition_alphas"' in source
+    assert '"structure_data_path"' in source
+    assert "np.savez_compressed(" in source
     assert '"generative_backend_loaded": False' in source
+
+
+def test_rife_runner_is_dtype_safe_and_batch_resilient() -> None:
+    source = RIFE_RUNNER.read_text(encoding="utf-8")
+    ast.parse(source, filename=str(RIFE_RUNNER))
+    assert "dtype_safe_warp" in source
+    assert "tensor_flow.dtype" in source
+    assert "torch.cuda.OutOfMemoryError" in source
+    assert 'weights_only=True' in source

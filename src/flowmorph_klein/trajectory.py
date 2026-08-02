@@ -70,6 +70,18 @@ class Flux2KleinMaskedInpaintInputs:
     used_init_image: bool
 
 
+@dataclass(frozen=True)
+class Flux2KleinSpatialLockInputs:
+    """Img2img latents plus a callback that retains selected init structure."""
+
+    latents: torch.Tensor
+    sigmas: tuple[float, ...]
+    callback_on_step_end: Callable[[Any, int, torch.Tensor, dict[str, torch.Tensor]], dict[str, torch.Tensor]]
+    requested_strength: float
+    effective_start_sigma: float
+    denoising_steps: int
+
+
 def natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
     """Return a deterministic numeric-aware key for nested member names."""
 
@@ -521,7 +533,12 @@ def prepare_flux2_klein_masked_inpaint_inputs(
         device=background_latents.device,
         dtype=background_latents.dtype,
     )[None, None, :, :]
-    edit_mask_packed = edit_mask_latents.flatten(2).transpose(1, 2)
+    # FLUX.2 may pack 2x2 spatial neighborhoods into the channel dimension.
+    # Packing an expanded mask through the pipeline itself guarantees that the
+    # callback mask has exactly the same token/channel shape as its latents.
+    edit_mask_packed = pipeline._pack_latents(
+        edit_mask_latents.expand(-1, background_latents.shape[1], -1, -1)
+    )
 
     clean_latents = background_latents
     if init_image is not None:
@@ -612,6 +629,119 @@ def prepare_flux2_klein_masked_inpaint_inputs(
     )
 
 
+def prepare_flux2_klein_spatial_lock_inputs(
+    pipeline: Any,
+    init_image: Image.Image,
+    protect_mask: Image.Image,
+    *,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    strength: float,
+    generator: torch.Generator,
+) -> Flux2KleinSpatialLockInputs:
+    """Prepare FLUX img2img while retaining selected init-image structure.
+
+    White mask values keep the correctly noised initialization latent after
+    every denoising step; black values remain fully generative. Gray values
+    softly mix both. Unlike the background-mask helper, this function never
+    constructs or locks a flat-color canvas.
+    """
+
+    if width < 1 or height < 1:
+        raise ValueError("spatial-lock output dimensions must be positive")
+    if num_inference_steps < 2:
+        raise ValueError("spatial-lock num_inference_steps must be at least 2")
+    if not 0.0 < strength <= 1.0:
+        raise ValueError("spatial-lock strength must lie in (0, 1]")
+    scheduler_config = getattr(getattr(pipeline, "scheduler", None), "config", {})
+    use_flow_sigmas = (
+        scheduler_config.get("use_flow_sigmas", False)
+        if isinstance(scheduler_config, dict)
+        else getattr(scheduler_config, "use_flow_sigmas", False)
+    )
+    if use_flow_sigmas:
+        raise ValueError("spatial lock requires a scheduler that accepts custom sigmas")
+
+    device = pipeline._execution_device
+    multiple_of = int(pipeline.vae_scale_factor) * 2
+    normalized_width = max(multiple_of, (int(width) // multiple_of) * multiple_of)
+    normalized_height = max(multiple_of, (int(height) // multiple_of) * multiple_of)
+    processed = pipeline.image_processor.preprocess(
+        init_image.convert("RGB"),
+        height=normalized_height,
+        width=normalized_width,
+        resize_mode="crop",
+    ).to(device=device, dtype=pipeline.vae.dtype)
+    with torch.no_grad():
+        clean_latents = pipeline._encode_vae_image(image=processed, generator=generator)
+
+    latent_height, latent_width = clean_latents.shape[-2:]
+    resized_mask = protect_mask.convert("L").resize(
+        (latent_width, latent_height), Image.Resampling.LANCZOS
+    )
+    mask_array = np.asarray(resized_mask, dtype=np.float32) / 255.0
+    spatial_mask = torch.from_numpy(mask_array).to(
+        device=clean_latents.device,
+        dtype=clean_latents.dtype,
+    )[None, None, :, :]
+    packed_mask = pipeline._pack_latents(
+        spatial_mask.expand(-1, clean_latents.shape[1], -1, -1)
+    )
+
+    denoising_steps = max(2, min(num_inference_steps, math.ceil(num_inference_steps * strength)))
+    sigmas = klein_custom_sigmas(num_inference_steps)[-denoising_steps:]
+    image_seq_len = int(clean_latents.shape[-2] * clean_latents.shape[-1])
+    mu = compute_empirical_mu(image_seq_len, num_inference_steps)
+    pipeline.scheduler.set_timesteps(sigmas=list(sigmas), device=device, mu=mu)
+    effective_start_sigma = float(pipeline.scheduler.sigmas[0].item())
+    fixed_noise = torch.randn(
+        clean_latents.shape,
+        generator=generator,
+        device=clean_latents.device,
+        dtype=clean_latents.dtype,
+    )
+    latents = (
+        (1.0 - effective_start_sigma) * clean_latents
+        + effective_start_sigma * fixed_noise
+    )
+
+    def lock_structure_callback(
+        current_pipeline: Any,
+        step_index: int,
+        _timestep: torch.Tensor,
+        callback_kwargs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        current_latents = callback_kwargs["latents"]
+        scheduler_sigmas = current_pipeline.scheduler.sigmas
+        next_index = min(step_index + 1, len(scheduler_sigmas) - 1)
+        next_sigma = scheduler_sigmas[next_index].to(
+            device=clean_latents.device,
+            dtype=clean_latents.dtype,
+        )
+        protected = (1.0 - next_sigma) * clean_latents + next_sigma * fixed_noise
+        packed_protected = current_pipeline._pack_latents(protected).to(
+            device=current_latents.device,
+            dtype=current_latents.dtype,
+        )
+        current_mask = packed_mask.to(
+            device=current_latents.device,
+            dtype=current_latents.dtype,
+        )
+        return {
+            "latents": current_mask * packed_protected + (1.0 - current_mask) * current_latents
+        }
+
+    return Flux2KleinSpatialLockInputs(
+        latents=latents,
+        sigmas=tuple(float(value) for value in sigmas),
+        callback_on_step_end=lock_structure_callback,
+        requested_strength=float(strength),
+        effective_start_sigma=effective_start_sigma,
+        denoising_steps=denoising_steps,
+    )
+
+
 def prepare_flux2_klein_img2img_inputs(
     pipeline: Any,
     image: Image.Image,
@@ -699,6 +829,7 @@ __all__ = [
     "BackgroundEditMask",
     "Flux2KleinImg2ImgInputs",
     "Flux2KleinMaskedInpaintInputs",
+    "Flux2KleinSpatialLockInputs",
     "IMAGE_SUFFIXES",
     "TrajectoryActivityGuide",
     "TrajectoryArchiveError",
@@ -711,6 +842,7 @@ __all__ = [
     "natural_sort_key",
     "prepare_flux2_klein_img2img_inputs",
     "prepare_flux2_klein_masked_inpaint_inputs",
+    "prepare_flux2_klein_spatial_lock_inputs",
     "prepare_grayscale_edit_mask",
     "regular_sample_indices",
     "stage_regular_keyframes",

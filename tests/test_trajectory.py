@@ -19,6 +19,7 @@ from flowmorph_klein.trajectory import (
     make_trajectory_activity_guide,
     prepare_flux2_klein_img2img_inputs,
     prepare_flux2_klein_masked_inpaint_inputs,
+    prepare_flux2_klein_spatial_lock_inputs,
     prepare_grayscale_edit_mask,
     regular_sample_indices,
     stage_regular_keyframes,
@@ -343,6 +344,32 @@ def test_masked_inpaint_callback_locks_only_black_mask_regions() -> None:
         {"latents": generated},
     )["latents"]
 
+    assert torch.equal(callback_result[:, :2], torch.ones_like(callback_result[:, :2]))
+    assert torch.equal(callback_result[:, 2:3], torch.full_like(callback_result[:, 2:3], 9.0))
+    assert torch.equal(callback_result[:, 3:5], torch.ones_like(callback_result[:, 3:5]))
+    assert torch.equal(callback_result[:, 5:], torch.full_like(callback_result[:, 5:], 9.0))
+
+
+def test_spatial_lock_callback_retains_only_white_mask_regions() -> None:
+    pipeline = _FakePipeline()
+    mask_array = np.array([[255, 255, 0], [255, 255, 0]], dtype=np.uint8)
+    result = prepare_flux2_klein_spatial_lock_inputs(
+        pipeline,
+        Image.new("RGB", (32, 32), (20, 40, 80)),
+        Image.fromarray(mask_array, mode="L"),
+        width=32,
+        height=32,
+        num_inference_steps=20,
+        strength=0.5,
+        generator=torch.Generator(device="cpu").manual_seed(123),
+    )
+    generated = torch.full((1, 6, 4), 9.0)
+    callback_result = result.callback_on_step_end(
+        pipeline,
+        len(pipeline.scheduler.sigmas) - 1,
+        torch.tensor(0.0),
+        {"latents": generated},
+    )["latents"]
     assert torch.equal(callback_result[:, :2], torch.ones_like(callback_result[:, :2]))
     assert torch.equal(callback_result[:, 2:3], torch.full_like(callback_result[:, 2:3], 9.0))
     assert torch.equal(callback_result[:, 3:5], torch.ones_like(callback_result[:, 3:5]))
