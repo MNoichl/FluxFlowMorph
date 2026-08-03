@@ -78,6 +78,11 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_LTM_BANDS = 16" in text
     assert "CHIMERA_LTM_CALIBRATION_ANCHORS = 4" in text
     assert "REUSE_CHIMERA_LTM_CALIBRATION = True" in text
+    assert "CHIMERA_AUTO_RENDER_BATCH_SIZE = True" in text
+    assert "CHIMERA_RENDER_BATCH_MAX = 10" in text
+    assert "CHIMERA_BATCH_MEMORY_RESERVE_FRACTION = 0.10" in text
+    assert "CHIMERA_BATCH_MEMORY_RESERVE_GIB = 2.0" in text
+    assert "CHIMERA_DECODE_BATCH_SIZE = 10" in text
     assert 'CHIMERA_CACHE_STORAGE = "int8"' in text
     assert "CHIMERA_CACHE_STRIDE = 2" in text
     assert "measures their timestep correspondence" in text
@@ -109,7 +114,11 @@ def test_all_prompts_are_active_and_original_anchor_init_is_restored() -> None:
     )
     stages = ast.literal_eval(assignment.value)
     code = code_source(notebook)
-    assert len(stages) == 15
+    assert len(stages) == 12
+    assert stages[0]["id"] == "01_astronomy"
+    assert stages[-1]["id"] == "12_computation_math"
+    assert all("the candle the only light" in stage["prompt"] for stage in stages)
+    assert "nuclear_atomic_optical_physics" not in stages_source
     assert "BASE_REFERENCE_STRENGTH = 0.3" in code
     assert "REFERENCE_BACKGROUND = (116, 105, 91)" in code
     assert "reference_blend=BASE_REFERENCE_STRENGTH" in code
@@ -117,6 +126,25 @@ def test_all_prompts_are_active_and_original_anchor_init_is_restored() -> None:
     assert 'kwargs["image"] = reference' in code
     assert "prepare_flux2_klein_img2img_inputs" not in code
     assert "BASE_REFERENCE_DENOISE_STRENGTH" not in code
+
+
+def test_seed_is_random_per_new_run_and_persisted_for_resume() -> None:
+    code = code_source(load_notebook())
+    assert "BASE_SEED = None" in code
+    assert 'SEED_MANIFEST_PATH = RUN_DIRECTORY / "metadata" / "run_seed.json"' in code
+    assert "BASE_SEED = secrets.randbelow(2**63 - len(BASE_STAGES))" in code
+    assert 'seed_source = "os_entropy"' in code
+    assert 'existing_records[0]["seed"]' in code
+    assert '"base_seed": BASE_SEED' in code
+
+
+def test_render_batch_is_measured_grown_and_bounded_with_memory_reserve() -> None:
+    code = code_source(load_notebook())
+    assert "render_batch_max=CHIMERA_RENDER_BATCH_MAX" in code
+    assert "auto_render_batch_size=CHIMERA_AUTO_RENDER_BATCH_SIZE" in code
+    assert "batch_memory_reserve_fraction=CHIMERA_BATCH_MEMORY_RESERVE_FRACTION" in code
+    assert '"render_batch_report": CHIMERA_SESSION.render_batch_report' in code
+    assert "binary backoff" in all_source(load_notebook())
 
 
 def test_sap_triplet_is_image_aware_reliable_and_bounded() -> None:

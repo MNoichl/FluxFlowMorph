@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from flowmorph_klein.chimera import (
+    AdaptiveBatchSizer,
     ChimeraConfig,
     ChimeraEndpointCache,
     FluxFeatureController,
@@ -16,6 +17,7 @@ from flowmorph_klein.chimera import (
     append_anchor_conditioning,
     calibrate_flux_ltm,
     compute_glcs_from_similarities,
+    estimate_safe_cuda_batch_size,
     flux_depth_ltm,
     invert_endpoint,
     map_denoising_to_inversion_step,
@@ -122,8 +124,42 @@ def test_chimera_config_exposes_paper_defaults_and_memory_controls() -> None:
     assert config.anchor_reliability_threshold == pytest.approx(0.45)
     assert config.ltm_mode == "fft"
     assert config.ltm_bands == 16
+    assert config.auto_render_batch_size is True
+    assert config.render_batch_max == 10
     assert config.cache_storage == "int8"
     assert config.cache_stride == 2
+
+
+def test_cuda_batch_estimate_keeps_reserve_and_overhead_margin() -> None:
+    gib = 1024**3
+    estimate = estimate_safe_cuda_batch_size(
+        current_batch_size=2,
+        baseline_allocated_bytes=10 * gib,
+        peak_allocated_bytes=14 * gib,
+        free_before_bytes=20 * gib,
+        total_bytes=40 * gib,
+        maximum_batch_size=10,
+        reserve_fraction=0.10,
+        reserve_bytes=2 * gib,
+        overhead_factor=1.25,
+    )
+    assert estimate == 6
+
+
+def test_adaptive_batch_sizer_grows_then_binary_searches_after_oom() -> None:
+    sizer = AdaptiveBatchSizer(initial_batch_size=2, maximum_batch_size=10)
+    assert sizer.next_batch_size(10) == 2
+    assert sizer.record_success(2, safe_ceiling_hint=10) == 10
+    assert sizer.record_oom(10) == 6
+    assert sizer.record_oom(6) == 4
+    assert sizer.record_success(4, safe_ceiling_hint=10) == 5
+    assert sizer.record_success(5, safe_ceiling_hint=10) == 5
+    assert sizer.report() == {
+        "candidate": 5,
+        "largest_success": 5,
+        "smallest_failure": 6,
+        "maximum": 10,
+    }
 
 
 def test_flux_depth_groups_are_distinct_and_ordered() -> None:

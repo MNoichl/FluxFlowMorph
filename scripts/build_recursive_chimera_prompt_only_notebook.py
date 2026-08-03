@@ -20,6 +20,7 @@ from textwrap import dedent
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE_BUILDER = ROOT / "scripts" / "build_recursive_flowmorph_prompt_only_notebook.py"
+CHIMERA_STAGES_PATH = ROOT / "art_projects" / "prompts" / "chimera_science_stages.json"
 OUTPUT = Path(
     os.environ.get(
         "CHIMERA_PROMPT_ONLY_NOTEBOOK_OUTPUT",
@@ -73,6 +74,16 @@ with tempfile.TemporaryDirectory(prefix="chimera_prompt_notebook_") as temp:
     with temporary_environment({"FLOWMORPH_PROMPT_ONLY_NOTEBOOK_OUTPUT": str(base_path)}):
         runpy.run_path(str(BASE_BUILDER), run_name="__main__")
     notebook = json.loads(base_path.read_text(encoding="utf-8"))
+
+chimera_stages = json.loads(CHIMERA_STAGES_PATH.read_text(encoding="utf-8"))
+if not isinstance(chimera_stages, list) or len(chimera_stages) < 3:
+    raise RuntimeError("CHIMERA prompt asset must contain at least three stages")
+required_stage_keys = {"id", "science", "prompt"}
+if any(set(stage) != required_stage_keys for stage in chimera_stages):
+    raise RuntimeError("Every CHIMERA prompt stage must contain id, science, and prompt")
+notebook["cells"][4]["source"] = lines(
+    "BASE_STAGES = " + json.dumps(chimera_stages, indent=4, ensure_ascii=False)
+)
 
 
 notebook["cells"][0]["source"] = lines(
@@ -133,6 +144,10 @@ settings = settings.replace(
 settings = settings.replace("RUN_FLOWMORPH_ONE_GAP_TEST", "RUN_CHIMERA_ONE_GAP_TEST")
 settings = settings.replace("FLOWMORPH_ONE_GAP_TEST_INDEX", "CHIMERA_ONE_GAP_TEST_INDEX")
 settings = settings.replace("FLOWMORPH_ONE_GAP_TEST_ALPHAS", "CHIMERA_ONE_GAP_TEST_ALPHAS")
+settings = settings.replace(
+    "BASE_SEED = 42  # Change for a new deterministic run.",
+    "BASE_SEED = None  # Generated from OS entropy and persisted per run below.",
+)
 settings = replace_between(
     settings,
     "# Editable anchor selection and recursive insertion.\n",
@@ -165,8 +180,13 @@ settings = replace_between(
     CHIMERA_CACHE_STORAGE = "int8"  # int8, float16, bfloat16, or float32.
     CHIMERA_GUIDANCE_SCALE = 7.0
     CHIMERA_LORA_SCALE = 1.2
-    CHIMERA_RENDER_BATCH_SIZE = 2
-    CHIMERA_DECODE_BATCH_SIZE = 4
+    CHIMERA_RENDER_BATCH_SIZE = 2  # Conservative first probe.
+    CHIMERA_RENDER_BATCH_MAX = 10  # At most all interiors for one gap.
+    CHIMERA_AUTO_RENDER_BATCH_SIZE = True
+    CHIMERA_BATCH_MEMORY_RESERVE_FRACTION = 0.10
+    CHIMERA_BATCH_MEMORY_RESERVE_GIB = 2.0
+    CHIMERA_BATCH_ESTIMATE_OVERHEAD = 1.25
+    CHIMERA_DECODE_BATCH_SIZE = 10  # VAE-only phase; OOM backoff persists the safe size.
     CHIMERA_CFG_EXECUTION = "batched"
     CHIMERA_BATCH_OOM_BACKOFF = True
     CHIMERA_STREAM_PAIRS_PER_CHUNK = 1
@@ -191,6 +211,47 @@ settings = settings.replace(
     "REFERENCE_BACKGROUND = (116, 105, 91)\n",
 )
 notebook["cells"][2]["source"] = lines(settings)
+
+drive_setup = source(notebook["cells"][8])
+seed_setup = r'''
+import secrets
+
+SEED_MANIFEST_PATH = RUN_DIRECTORY / "metadata" / "run_seed.json"
+existing_base_manifest = RUN_DIRECTORY / "metadata" / "base_manifest.json"
+if SEED_MANIFEST_PATH.is_file():
+    seed_payload = json.loads(SEED_MANIFEST_PATH.read_text(encoding="utf-8"))
+    BASE_SEED = int(seed_payload["base_seed"])
+    seed_source = "persisted_run_seed"
+elif RESUME_RUN_DIRECTORY is not None and existing_base_manifest.is_file():
+    existing_base_payload = json.loads(existing_base_manifest.read_text(encoding="utf-8"))
+    existing_records = existing_base_payload.get("records", [])
+    if not existing_records:
+        raise RuntimeError("Cannot recover the seed from an empty resumed base manifest")
+    BASE_SEED = int(existing_records[0]["seed"])
+    seed_source = "recovered_from_base_manifest"
+else:
+    BASE_SEED = secrets.randbelow(2**63 - len(BASE_STAGES))
+    seed_source = "os_entropy"
+if not 0 <= BASE_SEED < 2**63:
+    raise ValueError("Persisted BASE_SEED is outside the supported range")
+SEED_MANIFEST_PATH.write_text(json.dumps({
+    "base_seed": BASE_SEED,
+    "source": seed_source,
+}, indent=2) + "\n", encoding="utf-8")
+'''
+drive_setup = drive_setup.replace(
+    "run_identity = {\n",
+    dedent(seed_setup).strip("\n") + "\n\nrun_identity = {\n",
+)
+drive_setup = drive_setup.replace(
+    '    "openai_model": OPENAI_MODEL,\n',
+    '    "openai_model": OPENAI_MODEL,\n    "base_seed": BASE_SEED,\n',
+)
+drive_setup = drive_setup.replace(
+    'print("Run directory:", RUN_DIRECTORY)\n',
+    'print("Run directory:", RUN_DIRECTORY)\nprint("Random run seed:", BASE_SEED, f"({seed_source})")\n',
+)
+notebook["cells"][8]["source"] = lines(drive_setup)
 
 notebook["cells"][9]["source"] = lines(
     """
@@ -242,6 +303,12 @@ notebook["cells"][10]["source"] = lines(
         raise ValueError("Unsupported CHIMERA_CACHE_STORAGE")
     if CHIMERA_CFG_EXECUTION not in {"sequential", "batched"}:
         raise ValueError("CHIMERA_CFG_EXECUTION must be sequential or batched")
+    if not CHIMERA_RENDER_BATCH_SIZE <= CHIMERA_RENDER_BATCH_MAX <= 10:
+        raise ValueError("CHIMERA render batch initial/max values are inconsistent")
+    if not 0 <= CHIMERA_BATCH_MEMORY_RESERVE_FRACTION < 1:
+        raise ValueError("CHIMERA_BATCH_MEMORY_RESERVE_FRACTION must lie in [0, 1)")
+    if CHIMERA_BATCH_MEMORY_RESERVE_GIB < 0 or CHIMERA_BATCH_ESTIMATE_OVERHEAD < 1:
+        raise ValueError("CHIMERA batch reserve/overhead settings are invalid")
     if CHIMERA_LORA_SCALE != IMAGE_LORA_SCALE:
         raise ValueError("CHIMERA and anchor-generation LoRA scales must match")
     if CHIMERA_GUIDANCE_SCALE != IMAGE_GUIDANCE_SCALE:
@@ -276,6 +343,8 @@ notebook["cells"][10]["source"] = lines(
         raise ValueError("OPENAI_IMAGE_DETAIL must be low, high, original, or auto")
     if VIDEO_SLOWDOWN_FACTOR < 1:
         raise ValueError("VIDEO_SLOWDOWN_FACTOR must be at least 1")
+    if not isinstance(BASE_SEED, int) or not 0 <= BASE_SEED + BASE_PROMPT_COUNT < 2**63:
+        raise ValueError("BASE_SEED was not initialized from the run seed manifest")
 
     ACTIVE_BASE_STAGES = BASE_STAGES[:BASE_PROMPT_COUNT]
     ids = [item["id"] for item in ACTIVE_BASE_STAGES]
@@ -291,9 +360,15 @@ notebook["cells"][10]["source"] = lines(
     for spec in CHIMERA_ROUND_SPECS:
         round_counts.append(round_counts[-1] * (int(spec["midpoint_count"]) + 1))
     pair_count = sum(round_counts[:-1])
-    denoise_batches = sum(
+    denoise_batches_initial = sum(
         round_counts[index] * math.ceil(
             int(CHIMERA_ROUND_SPECS[index]["midpoint_count"]) / CHIMERA_RENDER_BATCH_SIZE
+        )
+        for index in range(len(CHIMERA_ROUND_SPECS))
+    )
+    denoise_batches_best_case = sum(
+        round_counts[index] * math.ceil(
+            int(CHIMERA_ROUND_SPECS[index]["midpoint_count"]) / CHIMERA_RENDER_BATCH_MAX
         )
         for index in range(len(CHIMERA_ROUND_SPECS))
     )
@@ -306,12 +381,21 @@ notebook["cells"][10]["source"] = lines(
         "one_time_ltm_calibration_inversions": (
             CHIMERA_LTM_CALIBRATION_ANCHORS if CHIMERA_LTM_MODE == "fft" else 0
         ),
-        "denoising_batches": denoise_batches,
-        "denoising_transformer_calls_before_cfg": denoise_batches * CHIMERA_DENOISING_STEPS,
+        "denoising_batches_initial": denoise_batches_initial,
+        "denoising_batches_best_case": denoise_batches_best_case,
+        "denoising_transformer_calls_before_cfg_initial": (
+            denoise_batches_initial * CHIMERA_DENOISING_STEPS
+        ),
         "ltm_contract": (
             f"{CHIMERA_LTM_MODE}, bands={CHIMERA_LTM_BANDS}, "
             f"calibration_anchors={CHIMERA_LTM_CALIBRATION_ANCHORS}"
         ),
+        "adaptive_render_batch": {
+            "initial": CHIMERA_RENDER_BATCH_SIZE,
+            "maximum": CHIMERA_RENDER_BATCH_MAX,
+            "memory_reserve_fraction": CHIMERA_BATCH_MEMORY_RESERVE_FRACTION,
+            "memory_reserve_gib": CHIMERA_BATCH_MEMORY_RESERVE_GIB,
+        },
         "cache_contract": f"{CHIMERA_CACHE_STORAGE}, stride={CHIMERA_CACHE_STRIDE}",
         "final_generated_sequence_images": round_counts[-1],
         "rife_multiplier": RIFE_MULTIPLIER,
@@ -348,6 +432,9 @@ notebook["cells"][13]["source"] = lines(
     a warm neutral field, adds faint deterministic monochrome grain, and passes
     that PIL image directly to FLUX through `image=`.  This keeps broad continuity
     without manually replacing the pipeline's native noise or sigma initialization.
+    Anchors are necessarily generated one at a time because each uses the preceding
+    painting; automatic batch learning is therefore performed on the first actual
+    CHIMERA midpoint render and retained across subsequent gaps.
     """
 )
 notebook["cells"][14]["source"] = lines(
@@ -860,6 +947,11 @@ notebook["cells"][19]["source"] = lines(
         cache_stride=CHIMERA_CACHE_STRIDE,
         cache_storage=CHIMERA_CACHE_STORAGE,
         render_batch_size=CHIMERA_RENDER_BATCH_SIZE,
+        render_batch_max=CHIMERA_RENDER_BATCH_MAX,
+        auto_render_batch_size=CHIMERA_AUTO_RENDER_BATCH_SIZE,
+        batch_memory_reserve_fraction=CHIMERA_BATCH_MEMORY_RESERVE_FRACTION,
+        batch_memory_reserve_gib=CHIMERA_BATCH_MEMORY_RESERVE_GIB,
+        batch_estimate_overhead=CHIMERA_BATCH_ESTIMATE_OVERHEAD,
         decode_batch_size=CHIMERA_DECODE_BATCH_SIZE,
         guidance_scale=CHIMERA_GUIDANCE_SCALE,
         lora_scale=CHIMERA_LORA_SCALE,
@@ -999,6 +1091,7 @@ notebook["cells"][19]["source"] = lines(
         "cache_storage": CHIMERA_CACHE_STORAGE,
         "cache_stride": CHIMERA_CACHE_STRIDE,
         "ltm": CHIMERA_LTM_REPORT,
+        "adaptive_render_batch": CHIMERA_SESSION.render_batch_report,
     })
 
     def encode_prompt_values(prompts):
@@ -1070,6 +1163,8 @@ notebook["cells"][19]["source"] = lines(
                 else "fixed early/middle/late thirds"
             ),
             "ltm_fingerprint": CHIMERA_LTM_FINGERPRINT,
+            "render_batch": CHIMERA_SESSION.render_batch_report,
+            "decode_batch_size": CHIMERA_SESSION.last_decode_batch_size,
         }
         del source_cache, target_cache, frames
         gc.collect()
@@ -1117,7 +1212,9 @@ notebook["cells"][20]["source"] = lines(
     Run this only after accepting the one-gap sheet.  Each pair is independently
     resumable.  Endpoint feature caches are held only for the active pair and
     immediately released after its ten PNGs are decoded, bounding host memory
-    across the complete fifteen-gap pass.
+    across the complete cyclic pass.  The render begins conservatively, estimates
+    a guarded GPU batch ceiling from measured peak allocation, and uses bounded
+    binary backoff if a larger probe encounters OOM.
     """
 )
 notebook["cells"][21]["source"] = lines(
@@ -1208,6 +1305,12 @@ notebook["cells"][21]["source"] = lines(
                     "ltm_fingerprint": CHIMERA_LTM_FINGERPRINT,
                     "cache_stride": CHIMERA_CACHE_STRIDE,
                     "cache_storage": CHIMERA_CACHE_STORAGE,
+                    "render_batch_initial": CHIMERA_RENDER_BATCH_SIZE,
+                    "render_batch_max": CHIMERA_RENDER_BATCH_MAX,
+                    "auto_render_batch_size": CHIMERA_AUTO_RENDER_BATCH_SIZE,
+                    "batch_memory_reserve_fraction": CHIMERA_BATCH_MEMORY_RESERVE_FRACTION,
+                    "batch_memory_reserve_gib": CHIMERA_BATCH_MEMORY_RESERVE_GIB,
+                    "batch_estimate_overhead": CHIMERA_BATCH_ESTIMATE_OVERHEAD,
                     "guidance_scale": CHIMERA_GUIDANCE_SCALE,
                     "lora_scale": CHIMERA_LORA_SCALE,
                 },
@@ -1243,6 +1346,7 @@ notebook["cells"][21]["source"] = lines(
                     "pair_contract": job["pair_contract"],
                     "cache_report": cache_report,
                     "render_batch_size": CHIMERA_SESSION.last_render_batch_size,
+                    "render_batch_report": CHIMERA_SESSION.render_batch_report,
                     "decode_batch_size": CHIMERA_SESSION.last_decode_batch_size,
                     "inserted": [
                         {"alpha": record["alpha"], "image": str(record["output_path"])}

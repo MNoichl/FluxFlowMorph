@@ -77,6 +77,11 @@ class ChimeraConfig:
     cache_stride: int = 2
     cache_storage: CacheStorage = "int8"
     render_batch_size: int = 2
+    render_batch_max: int = 10
+    auto_render_batch_size: bool = True
+    batch_memory_reserve_fraction: float = 0.10
+    batch_memory_reserve_gib: float = 2.0
+    batch_estimate_overhead: float = 1.25
     decode_batch_size: int = 4
     guidance_scale: float = 7.0
     lora_scale: float = 1.2
@@ -106,10 +111,133 @@ class ChimeraConfig:
             raise ValueError(f"unsupported cache storage {self.cache_storage!r}")
         if self.render_batch_size < 1 or self.decode_batch_size < 1:
             raise ValueError("CHIMERA batch sizes must be positive")
+        if self.render_batch_max < self.render_batch_size:
+            raise ValueError("render_batch_max must be at least render_batch_size")
+        if not 0.0 <= self.batch_memory_reserve_fraction < 1.0:
+            raise ValueError("batch_memory_reserve_fraction must lie in [0, 1)")
+        if not math.isfinite(self.batch_memory_reserve_gib) or self.batch_memory_reserve_gib < 0:
+            raise ValueError("batch_memory_reserve_gib must be finite and non-negative")
+        if not math.isfinite(self.batch_estimate_overhead) or self.batch_estimate_overhead < 1:
+            raise ValueError("batch_estimate_overhead must be finite and at least one")
         if not math.isfinite(self.guidance_scale) or self.guidance_scale < 0:
             raise ValueError("guidance_scale must be finite and non-negative")
         if not math.isfinite(self.lora_scale) or self.lora_scale <= 0:
             raise ValueError("lora_scale must be finite and positive")
+
+
+def estimate_safe_cuda_batch_size(
+    *,
+    current_batch_size: int,
+    baseline_allocated_bytes: int,
+    peak_allocated_bytes: int,
+    free_before_bytes: int,
+    total_bytes: int,
+    maximum_batch_size: int,
+    reserve_fraction: float = 0.10,
+    reserve_bytes: int = 2 * 1024**3,
+    overhead_factor: float = 1.25,
+) -> int:
+    """Estimate a guarded batch ceiling from one successful CUDA render.
+
+    The estimate preserves both a fractional and absolute free-memory reserve
+    and pads the observed per-item working set for allocator/nonlinear effects.
+    It never recommends less than the already successful batch.
+    """
+
+    if current_batch_size < 1 or maximum_batch_size < current_batch_size:
+        raise ValueError("invalid current/maximum batch sizes")
+    if min(baseline_allocated_bytes, peak_allocated_bytes, free_before_bytes, total_bytes) < 0:
+        raise ValueError("CUDA memory measurements must be non-negative")
+    if peak_allocated_bytes < baseline_allocated_bytes:
+        raise ValueError("peak CUDA allocation cannot be below the baseline")
+    if not 0.0 <= reserve_fraction < 1.0:
+        raise ValueError("reserve_fraction must lie in [0, 1)")
+    if reserve_bytes < 0:
+        raise ValueError("reserve_bytes must be non-negative")
+    if not math.isfinite(overhead_factor) or overhead_factor < 1:
+        raise ValueError("overhead_factor must be finite and at least one")
+
+    working_bytes = peak_allocated_bytes - baseline_allocated_bytes
+    if working_bytes <= 0:
+        return current_batch_size
+    per_item_bytes = working_bytes / current_batch_size
+    reserve = max(int(total_bytes * reserve_fraction), int(reserve_bytes))
+    usable_free = max(0, int(free_before_bytes) - reserve)
+    estimated = int(usable_free // (per_item_bytes * overhead_factor))
+    return min(maximum_batch_size, max(current_batch_size, estimated))
+
+
+@dataclass(slots=True)
+class AdaptiveBatchSizer:
+    """Learn the largest guarded render batch with bounded binary backoff."""
+
+    initial_batch_size: int
+    maximum_batch_size: int
+    candidate: int = field(init=False)
+    largest_success: int = field(default=0, init=False)
+    smallest_failure: int | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.initial_batch_size < 1:
+            raise ValueError("initial_batch_size must be positive")
+        if self.maximum_batch_size < self.initial_batch_size:
+            raise ValueError("maximum_batch_size must be at least initial_batch_size")
+        self.candidate = self.initial_batch_size
+
+    @property
+    def tuned_batch_size(self) -> int:
+        return max(1, self.largest_success or self.candidate)
+
+    def next_batch_size(self, remaining: int) -> int:
+        if remaining < 1:
+            raise ValueError("remaining must be positive")
+        return min(self.candidate, remaining)
+
+    def record_oom(self, attempted_batch_size: int) -> int:
+        if attempted_batch_size < 1:
+            raise ValueError("attempted_batch_size must be positive")
+        self.smallest_failure = (
+            attempted_batch_size
+            if self.smallest_failure is None
+            else min(self.smallest_failure, attempted_batch_size)
+        )
+        high = self.smallest_failure - 1
+        if self.largest_success:
+            if high <= self.largest_success:
+                self.candidate = self.largest_success
+            else:
+                self.candidate = (self.largest_success + high + 1) // 2
+        else:
+            self.candidate = max(1, (attempted_batch_size + 1) // 2)
+        return self.candidate
+
+    def record_success(
+        self,
+        successful_batch_size: int,
+        *,
+        safe_ceiling_hint: int,
+    ) -> int:
+        if successful_batch_size < 1:
+            raise ValueError("successful_batch_size must be positive")
+        self.largest_success = max(self.largest_success, successful_batch_size)
+        high = min(self.maximum_batch_size, max(self.largest_success, safe_ceiling_hint))
+        if self.smallest_failure is not None:
+            high = min(high, self.smallest_failure - 1)
+            if high > self.largest_success:
+                self.candidate = (self.largest_success + high + 1) // 2
+            else:
+                self.candidate = self.largest_success
+        else:
+            self.candidate = high
+        return self.candidate
+
+    def report(self) -> dict[str, int | None]:
+        return {
+            "candidate": self.candidate,
+            "largest_success": self.largest_success,
+            "smallest_failure": self.smallest_failure,
+            "maximum": self.maximum_batch_size,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1143,6 +1271,10 @@ class ChimeraFlux2Session:
             oom_backoff=config.oom_backoff,
         )
         self.ltm_calibration: LTMCalibration | None = None
+        self.render_batch_sizer = AdaptiveBatchSizer(
+            config.render_batch_size,
+            config.render_batch_max,
+        )
         self.last_render_batch_size = 1
 
     @property
@@ -1152,6 +1284,10 @@ class ChimeraFlux2Session:
     @property
     def last_decode_batch_size(self) -> int:
         return self.assets.last_decode_batch_size
+
+    @property
+    def render_batch_report(self) -> dict[str, int | None]:
+        return self.render_batch_sizer.report()
 
     def seed_prepared_assets(self, source_key: str, target_key: str):
         return self.assets.seed_prepared_assets(source_key, target_key)
@@ -1282,6 +1418,8 @@ class ChimeraFlux2Session:
         alphas: Sequence[float],
     ) -> tuple[RenderedLatentFrame, ...]:
         runner = self.runner
+        if not alphas:
+            raise ValueError("CHIMERA render_pair requires at least one alpha")
         if (
             runner.schedule is None
             or runner.pipeline is None
@@ -1292,10 +1430,27 @@ class ChimeraFlux2Session:
         runner._set_lora_scale(self.config.lora_scale)
         transformer = runner.pipeline.transformer
         output: list[RenderedLatentFrame] = []
-        active_batch = min(self.config.render_batch_size, len(alphas))
         position = 0
+        largest_used = 0
         while position < len(alphas):
+            remaining = len(alphas) - position
+            active_batch = self.render_batch_sizer.next_batch_size(remaining)
             chunk = tuple(alphas[position : position + active_batch])
+            tune_cuda = (
+                self.config.auto_render_batch_size
+                and torch.cuda.is_available()
+                and self.device.type == "cuda"
+            )
+            baseline_allocated = 0
+            free_before = 0
+            total_memory = 0
+            if tune_cuda:
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(self.device)
+                baseline_allocated = int(torch.cuda.memory_allocated(self.device))
+                free_before, total_memory = (
+                    int(value) for value in torch.cuda.mem_get_info(self.device)
+                )
             try:
                 frames = render_chimera_morph(
                     source_cache,
@@ -1315,11 +1470,32 @@ class ChimeraFlux2Session:
                 is_oom = isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error).lower()
                 if not (self.config.oom_backoff and is_oom and active_batch > 1):
                     raise
-                active_batch = max(1, (active_batch + 1) // 2)
+                retry_batch = self.render_batch_sizer.record_oom(active_batch)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                print(f"CHIMERA render OOM; retrying with batch_size={active_batch}")
+                print(
+                    "CHIMERA render OOM; bounded backoff selected "
+                    f"batch_size={retry_batch}"
+                )
                 continue
+            safe_hint = active_batch
+            if tune_cuda:
+                safe_hint = estimate_safe_cuda_batch_size(
+                    current_batch_size=active_batch,
+                    baseline_allocated_bytes=baseline_allocated,
+                    peak_allocated_bytes=int(torch.cuda.max_memory_allocated(self.device)),
+                    free_before_bytes=free_before,
+                    total_bytes=total_memory,
+                    maximum_batch_size=self.config.render_batch_max,
+                    reserve_fraction=self.config.batch_memory_reserve_fraction,
+                    reserve_bytes=int(self.config.batch_memory_reserve_gib * 1024**3),
+                    overhead_factor=self.config.batch_estimate_overhead,
+                )
+            next_batch = self.render_batch_sizer.record_success(
+                active_batch,
+                safe_ceiling_hint=safe_hint,
+            )
+            largest_used = max(largest_used, active_batch)
             for frame in frames:
                 output.append(
                     RenderedLatentFrame(
@@ -1331,7 +1507,13 @@ class ChimeraFlux2Session:
                     )
                 )
             position += len(chunk)
-        self.last_render_batch_size = active_batch
+            if position < len(alphas) and next_batch != active_batch:
+                print(
+                    "CHIMERA adaptive batching: "
+                    f"successful={active_batch}, next={next_batch}, "
+                    f"safe_hint={safe_hint}"
+                )
+        self.last_render_batch_size = largest_used
         return tuple(output)
 
 
@@ -1460,6 +1642,7 @@ def compute_glcs_from_similarities(
 
 __all__ = [
     "CHIMERA_GROUPS",
+    "AdaptiveBatchSizer",
     "ChimeraConfig",
     "ChimeraEndpointCache",
     "ChimeraFlux2Session",
@@ -1471,6 +1654,7 @@ __all__ = [
     "append_anchor_conditioning",
     "calibrate_flux_ltm",
     "compute_glcs_from_similarities",
+    "estimate_safe_cuda_batch_size",
     "flux_depth_ltm",
     "invert_endpoint",
     "map_denoising_to_inversion_step",

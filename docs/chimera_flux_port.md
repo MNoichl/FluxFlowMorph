@@ -33,6 +33,12 @@ revision pinning, image encoding/decoding, Google Drive manifests, flat
 cyclic assembly, flicker diagnostics, and RIFE finishing reuse the existing
 repository infrastructure.
 
+The production stage list is builder-owned in
+`art_projects/prompts/chimera_science_stages.json`. This prevents regenerating
+the notebook from reverting notebook-only prompt edits. A new run seed is drawn
+from OS entropy, saved as `metadata/run_seed.json`, and reused when that run is
+resumed; rerunning into a new run directory therefore produces new anchors.
+
 ## FLUX architecture mapping
 
 The main CHIMERA derivation describes U-Net down, mid, and up features. FLUX.2
@@ -67,6 +73,15 @@ notebook also exposes two consequential settings:
   CPU and dequantizes only the active feature to the transformer's dtype.
 - `CHIMERA_CACHE_STRIDE=2` captures every other inversion step and uses
   deterministic nearest-step retrieval.
+
+Base anchors cannot be batched because each painting conditions the next one.
+Midpoint rendering instead begins with batch 2 and measures the first successful
+CUDA peak. It preserves the larger of 10% or 2 GiB as free memory, pads the
+observed per-item requirement by 25%, and probes upward only to that guarded
+ceiling. OOM results establish an upper bound and subsequent attempts use binary
+backoff; the learned successful batch is retained across gaps. The VAE-only
+decode phase starts with all ten interiors and persists its existing OOM
+backoff result.
 
 Set stride `1` and storage `float32` for the closest published-algorithm
 contract. Pair caches are never retained for the whole flat sequence:
