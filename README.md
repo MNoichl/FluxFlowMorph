@@ -145,6 +145,7 @@ only when model revision, LoRA fingerprint/scale, and precision profile match.
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [CHIMERA port for FLUX.2 Klein](docs/chimera_flux_port.md)
 - [Colab workflow](docs/colab_workflow.md)
 - [Memory profiles](docs/memory_profiles.md)
 - [LoRA compatibility](docs/lora_compatibility.md)

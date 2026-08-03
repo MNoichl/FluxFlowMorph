@@ -1,0 +1,309 @@
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+from torch import nn
+
+from flowmorph_klein.chimera import (
+    ChimeraConfig,
+    ChimeraEndpointCache,
+    FluxFeatureController,
+    StoredFeature,
+    append_anchor_conditioning,
+    compute_glcs_from_similarities,
+    flux_depth_ltm,
+    invert_endpoint,
+    map_denoising_to_inversion_step,
+    nearest_cached_step,
+    prompt_anchor_reliability,
+    radial_frequency_descriptor,
+    render_chimera_morph,
+    select_flux_feature_groups,
+)
+from flowmorph_klein.conditioning import ConditioningPackage
+from flowmorph_klein.flow_schedule import FlowSchedule
+
+
+class FakeDoubleBlock(nn.Module):
+    def __init__(self, offset: float) -> None:
+        super().__init__()
+        self.offset = float(offset)
+
+    def forward(self, image: torch.Tensor):
+        context = image.new_zeros(image.shape[0], 2, image.shape[-1])
+        return context, image + self.offset
+
+
+class FakeSingleBlock(nn.Module):
+    def __init__(self, offset: float) -> None:
+        super().__init__()
+        self.offset = float(offset)
+
+    def forward(self, hidden: torch.Tensor):
+        return hidden + self.offset
+
+
+class FakeFluxTransformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer_blocks = nn.ModuleList(
+            [FakeDoubleBlock(index + 1) for index in range(3)]
+        )
+        self.single_transformer_blocks = nn.ModuleList(
+            [FakeSingleBlock(index + 4) for index in range(3)]
+        )
+
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        guidance=None,
+        joint_attention_kwargs=None,
+        return_dict=False,
+    ):
+        del timestep, img_ids, txt_ids, guidance, joint_attention_kwargs, return_dict
+        image = hidden_states
+        for block in self.transformer_blocks:
+            _, image = block(image)
+        text = image.new_zeros(
+            image.shape[0], encoder_hidden_states.shape[1], image.shape[-1]
+        )
+        joint = torch.cat((text, image), dim=1)
+        for block in self.single_transformer_blocks:
+            joint = block(joint)
+        return (joint[:, -image.shape[1] :, :] * 0.001,)
+
+
+def conditioning(value: float, *, tokens: int = 3) -> ConditioningPackage:
+    return ConditioningPackage(
+        prompt=f"prompt-{value}",
+        prompt_embeds=torch.full((1, tokens, 4), value),
+        text_ids=torch.arange(tokens * 4).reshape(1, tokens, 4),
+    )
+
+
+def endpoint_cache(
+    key: str,
+    group: str,
+    value: float,
+    *,
+    tokens: int = 4,
+) -> ChimeraEndpointCache:
+    stored = StoredFeature.from_tensor(
+        torch.full((1, tokens, 3), value),
+        "float32",
+    )
+    return ChimeraEndpointCache(
+        key=key,
+        inverted_latent=torch.zeros(1, tokens, 3),
+        features={group: {0: stored}},
+        inversion_steps=1,
+        image_token_count=tokens,
+        group_modules={group: "fake"},
+    )
+
+
+def test_chimera_config_exposes_paper_defaults_and_memory_controls() -> None:
+    config = ChimeraConfig()
+    assert config.inversion_steps == 50
+    assert config.denoising_steps == 50
+    assert config.aci_weight == pytest.approx(0.4)
+    assert config.sap_active_ratio == pytest.approx(0.2)
+    assert config.anchor_reliability_threshold == pytest.approx(0.45)
+    assert config.cache_storage == "int8"
+    assert config.cache_stride == 2
+
+
+def test_flux_depth_groups_are_distinct_and_ordered() -> None:
+    transformer = FakeFluxTransformer()
+    groups = select_flux_feature_groups(transformer)
+
+    assert [group.name for group in groups] == ["early", "middle", "late"]
+    assert [group.combined_depth for group in groups] == sorted(
+        group.combined_depth for group in groups
+    )
+    assert len({id(group.module) for group in groups}) == 3
+    assert groups[-1].stream == "single"
+
+
+def test_ltm_and_idm_cover_endpoints_and_stride_gaps() -> None:
+    assert flux_depth_ltm(0, 9) == "early"
+    assert flux_depth_ltm(4, 9) == "middle"
+    assert flux_depth_ltm(8, 9) == "late"
+    assert map_denoising_to_inversion_step(
+        0, denoising_steps=5, inversion_steps=9
+    ) == 0
+    assert map_denoising_to_inversion_step(
+        2, denoising_steps=5, inversion_steps=9
+    ) == 4
+    assert map_denoising_to_inversion_step(
+        4, denoising_steps=5, inversion_steps=9
+    ) == 8
+    assert nearest_cached_step(5, [0, 4, 6, 8]) == 4
+
+
+def test_int8_feature_storage_roundtrips_with_bounded_error() -> None:
+    tensor = torch.linspace(-3.0, 3.0, 97).reshape(1, 97, 1)
+    stored = StoredFeature.from_tensor(tensor, "int8")
+    restored = stored.materialize(device="cpu", dtype=torch.float32)
+
+    assert stored.values.dtype is torch.int8
+    assert torch.max(torch.abs(restored - tensor)).item() <= float(stored.scale) / 2 + 1e-6
+    assert stored.storage_bytes < tensor.numel() * tensor.element_size()
+
+
+def test_feature_controller_captures_and_injects_only_image_tokens() -> None:
+    transformer = FakeFluxTransformer()
+    image_tokens = 4
+    controller = FluxFeatureController(
+        transformer,
+        image_token_count=image_tokens,
+        storage="float32",
+    )
+    early = select_flux_feature_groups(transformer)[0]
+    image = torch.zeros(1, image_tokens, 3)
+
+    with controller:
+        with controller.capture(key="captured", step=0, group="early"):
+            _, captured_output = early.module(image)
+        captured = controller.endpoint_cache(
+            key="captured",
+            inverted_latent=torch.zeros_like(image),
+            inversion_steps=1,
+        )
+        stored = captured.feature("early", 0).materialize(
+            device="cpu", dtype=torch.float32
+        )
+        assert torch.equal(stored, captured_output)
+
+        source = endpoint_cache("source", "early", 2.0)
+        target = endpoint_cache("target", "early", 4.0)
+        batch = torch.zeros(2, image_tokens, 3)
+        with controller.inject(
+            source=source,
+            target=target,
+            inversion_step=0,
+            group="early",
+            alphas=torch.tensor([0.0, 1.0]),
+            weight=0.5,
+        ):
+            _, injected = early.module(batch)
+
+    baseline = early.module.offset
+    assert torch.allclose(injected[0], torch.full_like(injected[0], baseline + 1.0))
+    assert torch.allclose(injected[1], torch.full_like(injected[1], baseline + 2.0))
+
+
+def test_sap_appends_anchor_tokens_and_reliability_uses_both_endpoints() -> None:
+    base = conditioning(1.0, tokens=3)
+    anchor = conditioning(1.0, tokens=2)
+    combined = append_anchor_conditioning(base, anchor, max_anchor_tokens=1)
+
+    assert combined.prompt_embeds.shape == (1, 4, 4)
+    assert combined.text_ids.shape == (1, 4, 4)
+    similarity_a, similarity_b, reliability = prompt_anchor_reliability(
+        anchor,
+        conditioning(2.0),
+        conditioning(-1.0),
+    )
+    assert similarity_a == pytest.approx(1.0)
+    assert similarity_b == pytest.approx(-1.0)
+    assert reliability == pytest.approx(-1.0)
+
+
+def test_radial_frequency_descriptor_is_normalized() -> None:
+    yy, xx = torch.meshgrid(torch.arange(8), torch.arange(8), indexing="ij")
+    checkerboard = ((xx + yy) % 2).float().reshape(64, 1).repeat(1, 3)
+    descriptor = radial_frequency_descriptor(checkerboard, bands=8)
+
+    assert descriptor.shape == (8,)
+    assert bool(torch.isfinite(descriptor).all())
+    assert float(descriptor.sum()) == pytest.approx(1.0)
+    assert descriptor[-1] > descriptor[0]
+
+
+def test_glcs_returns_geometric_mean_of_global_and_local_terms() -> None:
+    result = compute_glcs_from_similarities(
+        [0.75, 0.50, 0.25],
+        [0.25, 0.50, 0.75],
+        endpoint_similarity_matrix=[[1.0, 0.0], [0.0, 1.0]],
+        gamma=2.0,
+    )
+
+    assert result["gcs"] == pytest.approx(1.0)
+    assert 0.0 < result["lcs"] <= 1.0
+    assert result["glcs"] == pytest.approx(
+        math.sqrt(result["gcs"] * result["lcs"])
+    )
+
+
+def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
+    transformer = FakeFluxTransformer()
+    schedule = FlowSchedule(
+        timesteps=torch.tensor([1000.0, 500.0]),
+        sigmas=torch.tensor([1.0, 0.5, 0.0]),
+    )
+    image_ids = torch.zeros(1, 4, 4)
+    controller = FluxFeatureController(
+        transformer,
+        image_token_count=4,
+        storage="float32",
+    )
+    source_prompt = conditioning(1.0)
+    target_prompt = conditioning(2.0)
+    anchor_prompt = conditioning(1.5, tokens=2)
+    with controller:
+        source = invert_endpoint(
+            key="source",
+            clean_latent=torch.zeros(1, 4, 3),
+            schedule=schedule,
+            transformer=transformer,
+            conditioning=source_prompt,
+            image_ids=image_ids,
+            controller=controller,
+        )
+        target = invert_endpoint(
+            key="target",
+            clean_latent=torch.ones(1, 4, 3),
+            schedule=schedule,
+            transformer=transformer,
+            conditioning=target_prompt,
+            image_ids=image_ids,
+            controller=controller,
+        )
+
+    frames = render_chimera_morph(
+        source,
+        target,
+        schedule=schedule,
+        transformer=transformer,
+        image_ids=image_ids,
+        source_conditioning=source_prompt,
+        target_conditioning=target_prompt,
+        anchor_conditioning=anchor_prompt,
+        unconditional_conditioning=conditioning(0.0),
+        alphas=[0.25, 0.75],
+        config=ChimeraConfig(
+            inversion_steps=2,
+            denoising_steps=2,
+            aci_weight=0.1,
+            sap_active_ratio=0.5,
+            anchor_max_tokens=2,
+            cache_stride=1,
+            cache_storage="float32",
+            render_batch_size=2,
+            decode_batch_size=2,
+            guidance_scale=1.0,
+        ),
+    )
+
+    assert [frame.alpha for frame in frames] == [0.25, 0.75]
+    assert all(frame.final_latent.shape == (1, 4, 3) for frame in frames)
+    assert all(bool(torch.isfinite(frame.final_latent).all()) for frame in frames)
+    assert not torch.equal(frames[0].final_latent, frames[1].final_latent)
