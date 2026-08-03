@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK_PATH = ROOT / "notebooks" / "StillLife_Recursive_CHIMERA_Prompt_Only.ipynb"
+BUILDER_PATH = ROOT / "scripts" / "build_recursive_chimera_prompt_only_notebook.py"
 
 
 def load_notebook() -> dict:
@@ -99,7 +103,7 @@ def test_fft_ltm_is_calibrated_persisted_and_part_of_pair_identity() -> None:
     assert '"ltm_fingerprint": CHIMERA_LTM_FINGERPRINT' in code
 
 
-def test_all_prompts_are_active_and_original_anchor_init_is_restored() -> None:
+def test_authored_prompts_are_valid_and_original_anchor_init_is_restored() -> None:
     notebook = load_notebook()
     stages_source = "".join(notebook["cells"][4]["source"])
     stages_tree = ast.parse(stages_source)
@@ -114,11 +118,10 @@ def test_all_prompts_are_active_and_original_anchor_init_is_restored() -> None:
     )
     stages = ast.literal_eval(assignment.value)
     code = code_source(notebook)
-    assert len(stages) == 12
-    assert stages[0]["id"] == "01_astronomy"
-    assert stages[-1]["id"] == "12_computation_math"
-    assert all("the candle the only light" in stage["prompt"] for stage in stages)
-    assert "nuclear_atomic_optical_physics" not in stages_source
+    assert len(stages) >= 3
+    assert all(set(stage) == {"id", "science", "prompt"} for stage in stages)
+    assert len({stage["id"] for stage in stages}) == len(stages)
+    assert all(stage["science"].strip() and stage["prompt"].strip() for stage in stages)
     assert "BASE_REFERENCE_STRENGTH = 0.3" in code
     assert "REFERENCE_BACKGROUND = (116, 105, 91)" in code
     assert "reference_blend=BASE_REFERENCE_STRENGTH" in code
@@ -126,6 +129,49 @@ def test_all_prompts_are_active_and_original_anchor_init_is_restored() -> None:
     assert 'kwargs["image"] = reference' in code
     assert "prepare_flux2_klein_img2img_inputs" not in code
     assert "BASE_REFERENCE_DENOISE_STRENGTH" not in code
+
+
+def test_builder_validates_without_modifying_the_authored_notebook() -> None:
+    before = NOTEBOOK_PATH.read_bytes()
+    completed = subprocess.run(
+        [sys.executable, str(BUILDER_PATH)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "without modifying it" in completed.stdout
+    assert NOTEBOOK_PATH.read_bytes() == before
+
+
+def test_builder_exports_only_to_a_new_path_and_never_overwrites(tmp_path: Path) -> None:
+    exported = tmp_path / "exported.ipynb"
+    environment = dict(os.environ)
+    environment["CHIMERA_PROMPT_ONLY_NOTEBOOK_OUTPUT"] = str(exported)
+
+    subprocess.run(
+        [sys.executable, str(BUILDER_PATH)],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert exported.read_bytes() == NOTEBOOK_PATH.read_bytes()
+
+    sentinel = b"user-authored notebook edit\n"
+    exported.write_bytes(sentinel)
+    environment["FLOWMORPH_ALLOW_NOTEBOOK_OVERWRITE"] = "1"
+    refused = subprocess.run(
+        [sys.executable, str(BUILDER_PATH)],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert refused.returncode != 0
+    assert exported.read_bytes() == sentinel
 
 
 def test_seed_is_random_per_new_run_and_persisted_for_resume() -> None:

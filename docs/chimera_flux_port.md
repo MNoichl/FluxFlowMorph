@@ -33,11 +33,17 @@ revision pinning, image encoding/decoding, Google Drive manifests, flat
 cyclic assembly, flicker diagnostics, and RIFE finishing reuse the existing
 repository infrastructure.
 
-The production stage list is builder-owned in
-`art_projects/prompts/chimera_science_stages.json`. This prevents regenerating
-the notebook from reverting notebook-only prompt edits. A new run seed is drawn
-from OS entropy, saved as `metadata/run_seed.json`, and reused when that run is
-resumed; rerunning into a new run directory therefore produces new anchors.
+The checked-in CHIMERA notebook is the source of truth for its prompts,
+settings, markdown, outputs, and experimental cells. Its companion builder no
+longer composes it from another notebook or a parallel prompt file: by default
+the command only validates the authored notebook, and it can export an exact
+copy only to a path that does not already exist. There is no force-overwrite
+escape hatch. Future repository changes should use explicit marker-based
+migrations that edit only their declared cells.
+
+A new run seed is drawn from OS entropy, saved as `metadata/run_seed.json`, and
+reused when that run is resumed; rerunning into a new run directory therefore
+produces new anchors.
 
 ## FLUX architecture mapping
 
@@ -134,7 +140,7 @@ not across the whole multi-anchor cycle.
 
 - Notebook:
   `notebooks/StillLife_Recursive_CHIMERA_Prompt_Only.ipynb`
-- Notebook builder:
+- Non-mutating notebook validator/safe exporter (legacy builder entry point):
   `scripts/build_recursive_chimera_prompt_only_notebook.py`
 - Core implementation: `src/flowmorph_klein/chimera.py`
 - CPU contract tests: `tests/test_chimera.py` and
