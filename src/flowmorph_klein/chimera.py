@@ -5,6 +5,7 @@ repository's native FLUX.2 Euler flow-matching stack:
 
 * reverse Euler inversion of both endpoint latents;
 * representative early/middle/late transformer feature caches;
+* FFT-calibrated Layer- and Timestep-wise Frequency Matching (LTM);
 * depth/timestep-aware Adaptive Cache Injection (ACI);
 * linear Inversion-Denoising Timestep Mapping (IDM);
 * early-step Semantic Anchor Prompting (SAP); and
@@ -13,15 +14,19 @@ repository's native FLUX.2 Euler flow-matching stack:
 The paper's released algorithm is U-Net-centric and its public repository did
 not contain implementation code when this port was written.  FLUX has no
 down/mid/up blocks, so the three feature groups are mapped to representative
-early/middle/late transformer depths.  This follows the FLUX analysis in the
-paper's appendix.  The default cache is int8-quantized on CPU and sampled every
-second inversion step so a 9B, 1024px Colab run remains practical.  Both
-choices are explicit, configurable approximations rather than silent claims
-of bit-for-bit parity with the unpublished reference implementation.
+early/middle/late transformer depths.  A resumable calibration pass computes
+the paper's radial FFT descriptors for every group and timestep and derives the
+frequency-nearest lookup used by inversion and denoising.  The default cache is
+int8-quantized on CPU and sampled every second inversion step so a 9B, 1024px
+Colab run remains practical.  Both cache choices are explicit, configurable
+approximations rather than silent claims of bit-for-bit parity with the
+unpublished reference implementation.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, nullcontext
@@ -48,6 +53,7 @@ Tensor = torch.Tensor
 CHIMERA_GROUPS = ("early", "middle", "late")
 CacheStorage = Literal["int8", "float16", "bfloat16", "float32"]
 GroupName = Literal["early", "middle", "late"]
+LTMMode = Literal["fft", "linear"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +71,9 @@ class ChimeraConfig:
     sap_active_ratio: float = 0.2
     anchor_max_tokens: int = 64
     anchor_reliability_threshold: float = 0.45
+    ltm_mode: LTMMode = "fft"
+    ltm_bands: int = 16
+    ltm_channel_chunk_size: int = 128
     cache_stride: int = 2
     cache_storage: CacheStorage = "int8"
     render_batch_size: int = 2
@@ -85,6 +94,12 @@ class ChimeraConfig:
             raise ValueError("anchor_max_tokens must be positive")
         if not -1.0 <= self.anchor_reliability_threshold <= 1.0:
             raise ValueError("anchor_reliability_threshold must lie in [-1, 1]")
+        if self.ltm_mode not in {"fft", "linear"}:
+            raise ValueError("ltm_mode must be 'fft' or 'linear'")
+        if self.ltm_bands < 2:
+            raise ValueError("ltm_bands must be at least two")
+        if self.ltm_channel_chunk_size < 1:
+            raise ValueError("ltm_channel_chunk_size must be positive")
         if self.cache_stride < 1:
             raise ValueError("cache_stride must be positive")
         if self.cache_storage not in {"int8", "float16", "bfloat16", "float32"}:
@@ -152,7 +167,7 @@ def select_flux_feature_groups(transformer: Any) -> tuple[FluxFeatureGroup, ...]
 
 
 def flux_depth_ltm(step_index: int, step_count: int) -> GroupName:
-    """Paper-backed coarse-to-fine LTM prior for a FLUX denoising schedule."""
+    """Return the legacy fixed-third coarse-to-fine LTM approximation."""
 
     if step_count < 1:
         raise ValueError("step_count must be positive")
@@ -164,6 +179,268 @@ def flux_depth_ltm(step_index: int, step_count: int) -> GroupName:
     if progress < 2.0 / 3.0:
         return "middle"
     return "late"
+
+
+def _finite_descriptor(values: Sequence[float] | Tensor, *, bands: int) -> Tensor:
+    descriptor = torch.as_tensor(values, dtype=torch.float64).reshape(-1)
+    if descriptor.numel() != bands:
+        raise ValueError(f"frequency descriptor must contain exactly {bands} bands")
+    if not bool(torch.isfinite(descriptor).all().item()):
+        raise ValueError("frequency descriptors must be finite")
+    if bool((descriptor < 0).any().item()):
+        raise ValueError("frequency descriptors must be non-negative")
+    return descriptor
+
+
+def match_ltm_prototypes(
+    layer_prototypes: Mapping[GroupName, Sequence[float] | Tensor],
+    timestep_prototypes: Sequence[Sequence[float] | Tensor],
+    *,
+    bands: int,
+) -> tuple[GroupName, ...]:
+    """Apply CHIMERA's per-timestep L1 frequency-prototype argmin."""
+
+    if bands < 2:
+        raise ValueError("bands must be at least two")
+    if set(layer_prototypes) != set(CHIMERA_GROUPS):
+        raise ValueError("layer prototypes must contain early, middle, and late")
+    layers = {
+        group: _finite_descriptor(layer_prototypes[group], bands=bands)
+        for group in CHIMERA_GROUPS
+    }
+    if not timestep_prototypes:
+        raise ValueError("at least one timestep prototype is required")
+    mapping: list[GroupName] = []
+    for values in timestep_prototypes:
+        timestep = _finite_descriptor(values, bands=bands)
+        distances = {
+            group: float(torch.sum(torch.abs(layers[group] - timestep)).item())
+            for group in CHIMERA_GROUPS
+        }
+        # Tuple ordering makes exact ties deterministic and preserves the
+        # declared early -> middle -> late group order.
+        mapping.append(
+            min(CHIMERA_GROUPS, key=lambda group: (distances[group], CHIMERA_GROUPS.index(group)))
+        )
+    return tuple(mapping)
+
+
+@dataclass(frozen=True, slots=True)
+class LTMCalibration:
+    """Immutable FFT prototypes and the resulting FLUX layer lookup."""
+
+    bands: int
+    sample_count: int
+    group_modules: tuple[str, str, str]
+    layer_prototypes: tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]
+    timestep_prototypes: tuple[tuple[float, ...], ...]
+    mapping: tuple[GroupName, ...]
+    descriptor_normalized: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "group_modules",
+            tuple(str(value) for value in self.group_modules),
+        )
+        object.__setattr__(
+            self,
+            "layer_prototypes",
+            tuple(
+                tuple(float(value) for value in descriptor)
+                for descriptor in self.layer_prototypes
+            ),
+        )
+        object.__setattr__(
+            self,
+            "timestep_prototypes",
+            tuple(
+                tuple(float(value) for value in descriptor)
+                for descriptor in self.timestep_prototypes
+            ),
+        )
+        object.__setattr__(self, "mapping", tuple(self.mapping))
+        if self.bands < 2:
+            raise ValueError("LTM calibration bands must be at least two")
+        if self.sample_count < 1:
+            raise ValueError("LTM calibration requires at least one sample")
+        if len(self.group_modules) != len(CHIMERA_GROUPS):
+            raise ValueError("LTM calibration must identify all feature-group modules")
+        if len(self.layer_prototypes) != len(CHIMERA_GROUPS):
+            raise ValueError("LTM calibration must contain three layer prototypes")
+        layers = {
+            group: _finite_descriptor(values, bands=self.bands)
+            for group, values in zip(CHIMERA_GROUPS, self.layer_prototypes, strict=True)
+        }
+        if not self.timestep_prototypes:
+            raise ValueError("LTM calibration must contain timestep prototypes")
+        for values in self.timestep_prototypes:
+            _finite_descriptor(values, bands=self.bands)
+        expected = match_ltm_prototypes(
+            layers,
+            self.timestep_prototypes,
+            bands=self.bands,
+        )
+        if tuple(self.mapping) != expected:
+            raise ValueError("LTM mapping does not match its stored FFT prototypes")
+
+    @property
+    def step_count(self) -> int:
+        return len(self.mapping)
+
+    @property
+    def group_module_map(self) -> dict[GroupName, str]:
+        return dict(zip(CHIMERA_GROUPS, self.group_modules, strict=True))
+
+    @property
+    def layer_prototype_map(self) -> dict[GroupName, tuple[float, ...]]:
+        return dict(zip(CHIMERA_GROUPS, self.layer_prototypes, strict=True))
+
+    @property
+    def fingerprint(self) -> str:
+        payload = json.dumps(
+            self.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def group_for_step(self, step_index: int) -> GroupName:
+        if not 0 <= step_index < self.step_count:
+            raise IndexError("step_index is outside the calibrated LTM schedule")
+        return self.mapping[step_index]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "bands": self.bands,
+            "sample_count": self.sample_count,
+            "descriptor_normalized": self.descriptor_normalized,
+            "group_modules": self.group_module_map,
+            "layer_prototypes": {
+                group: list(values)
+                for group, values in self.layer_prototype_map.items()
+            },
+            "timestep_prototypes": [list(values) for values in self.timestep_prototypes],
+            "mapping": list(self.mapping),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "LTMCalibration":
+        if int(payload.get("version", 0)) != 1:
+            raise ValueError("unsupported LTM calibration version")
+        bands = int(payload["bands"])
+        modules = payload["group_modules"]
+        layers = payload["layer_prototypes"]
+        return cls(
+            bands=bands,
+            sample_count=int(payload["sample_count"]),
+            descriptor_normalized=bool(payload.get("descriptor_normalized", False)),
+            group_modules=tuple(str(modules[group]) for group in CHIMERA_GROUPS),
+            layer_prototypes=tuple(
+                tuple(float(value) for value in layers[group])
+                for group in CHIMERA_GROUPS
+            ),
+            timestep_prototypes=tuple(
+                tuple(float(value) for value in values)
+                for values in payload["timestep_prototypes"]
+            ),
+            mapping=tuple(str(group) for group in payload["mapping"]),
+        )
+
+
+class LTMPrototypeAccumulator:
+    """Accumulate pair-independent group/timestep FFT prototype statistics."""
+
+    def __init__(
+        self,
+        *,
+        step_count: int,
+        group_modules: Mapping[GroupName, str],
+        bands: int = 16,
+    ) -> None:
+        if step_count < 1:
+            raise ValueError("step_count must be positive")
+        if bands < 2:
+            raise ValueError("bands must be at least two")
+        if set(group_modules) != set(CHIMERA_GROUPS):
+            raise ValueError("group_modules must identify all CHIMERA groups")
+        self.step_count = int(step_count)
+        self.bands = int(bands)
+        self.group_modules = {group: str(group_modules[group]) for group in CHIMERA_GROUPS}
+        self._sums = torch.zeros(
+            len(CHIMERA_GROUPS),
+            self.step_count,
+            self.bands,
+            dtype=torch.float64,
+        )
+        self._counts = torch.zeros(
+            len(CHIMERA_GROUPS),
+            self.step_count,
+            dtype=torch.int64,
+        )
+
+    def add(self, group: GroupName, step_index: int, descriptor: Tensor) -> None:
+        if group not in CHIMERA_GROUPS:
+            raise ValueError(f"unknown CHIMERA group {group!r}")
+        if not 0 <= step_index < self.step_count:
+            raise IndexError("step_index is outside the calibration schedule")
+        values = _finite_descriptor(descriptor.detach().to("cpu"), bands=self.bands)
+        group_index = CHIMERA_GROUPS.index(group)
+        self._sums[group_index, step_index] += values
+        self._counts[group_index, step_index] += 1
+
+    def finalize(self) -> LTMCalibration:
+        if bool((self._counts == 0).any().item()):
+            missing = int((self._counts == 0).sum().item())
+            raise RuntimeError(f"LTM calibration is incomplete ({missing} group/timestep cells missing)")
+        unique_counts = torch.unique(self._counts)
+        if unique_counts.numel() != 1:
+            raise RuntimeError("LTM calibration samples are imbalanced across groups or timesteps")
+        sample_count = int(unique_counts.item())
+        cell_means = self._sums / self._counts.unsqueeze(-1)
+        layer_values = cell_means.mean(dim=1)
+        timestep_values = cell_means.mean(dim=0)
+        layer_map = {
+            group: layer_values[index]
+            for index, group in enumerate(CHIMERA_GROUPS)
+        }
+        mapping = match_ltm_prototypes(
+            layer_map,
+            tuple(timestep_values[index] for index in range(self.step_count)),
+            bands=self.bands,
+        )
+        return LTMCalibration(
+            bands=self.bands,
+            sample_count=sample_count,
+            group_modules=tuple(self.group_modules[group] for group in CHIMERA_GROUPS),
+            layer_prototypes=tuple(
+                tuple(float(value) for value in layer_values[index].tolist())
+                for index in range(len(CHIMERA_GROUPS))
+            ),
+            timestep_prototypes=tuple(
+                tuple(float(value) for value in timestep_values[index].tolist())
+                for index in range(self.step_count)
+            ),
+            mapping=mapping,
+            descriptor_normalized=False,
+        )
+
+
+def resolve_ltm_group(
+    step_index: int,
+    step_count: int,
+    calibration: LTMCalibration | None,
+) -> GroupName:
+    """Resolve a calibrated LTM group or explicitly use the linear fallback."""
+
+    if calibration is None:
+        return flux_depth_ltm(step_index, step_count)
+    if calibration.step_count != step_count:
+        raise ValueError(
+            "LTM calibration schedule length does not match the active diffusion schedule"
+        )
+    return calibration.group_for_step(step_index)
 
 
 def map_denoising_to_inversion_step(
@@ -320,7 +597,10 @@ class FluxFeatureController:
         self.image_token_count = int(image_token_count)
         self.storage = storage
         self._handles: list[Any] = []
-        self._mode: Literal["idle", "capture", "inject"] = "idle"
+        self._mode: Literal["idle", "calibrate", "capture", "inject"] = "idle"
+        self._calibration_accumulator: LTMPrototypeAccumulator | None = None
+        self._calibration_step: int | None = None
+        self._calibration_channel_chunk_size = 128
         self._capture_key: str | None = None
         self._capture_step: int | None = None
         self._capture_group: GroupName | None = None
@@ -349,6 +629,24 @@ class FluxFeatureController:
     def _make_hook(self, group: GroupName):
         def hook(module, inputs, output):
             del module, inputs
+            if self._mode == "calibrate":
+                assert self._calibration_accumulator is not None
+                assert self._calibration_step is not None
+                feature = _output_image_tensor(output, self.image_token_count)
+                if feature.shape[0] != 1:
+                    raise ValueError("LTM calibration requires feature batch size one")
+                descriptor = radial_frequency_descriptor(
+                    feature,
+                    bands=self._calibration_accumulator.bands,
+                    channel_chunk_size=self._calibration_channel_chunk_size,
+                    normalize=False,
+                )
+                self._calibration_accumulator.add(
+                    group,
+                    self._calibration_step,
+                    descriptor,
+                )
+                return output
             if self._mode == "capture" and self._capture_group == group:
                 assert self._capture_key is not None and self._capture_step is not None
                 feature = _output_image_tensor(output, self.image_token_count)
@@ -391,6 +689,30 @@ class FluxFeatureController:
             return _replace_image_tensor(output, updated)
 
         return hook
+
+    @contextmanager
+    def calibrate(
+        self,
+        *,
+        step: int,
+        accumulator: LTMPrototypeAccumulator,
+        channel_chunk_size: int = 128,
+    ):
+        if self._mode != "idle":
+            raise RuntimeError("nested CHIMERA feature-controller modes are not allowed")
+        if channel_chunk_size < 1:
+            raise ValueError("channel_chunk_size must be positive")
+        self._mode = "calibrate"
+        self._calibration_accumulator = accumulator
+        self._calibration_step = int(step)
+        self._calibration_channel_chunk_size = int(channel_chunk_size)
+        try:
+            yield
+        finally:
+            self._mode = "idle"
+            self._calibration_accumulator = None
+            self._calibration_step = None
+            self._calibration_channel_chunk_size = 128
 
     @contextmanager
     def capture(self, *, key: str, step: int, group: GroupName):
@@ -462,6 +784,84 @@ class FluxFeatureController:
         )
 
 
+def calibrate_flux_ltm(
+    *,
+    endpoint_samples: Sequence[tuple[Tensor, ConditioningPackage]],
+    schedule: FlowSchedule,
+    transformer: Any,
+    image_ids: Tensor,
+    bands: int = 16,
+    channel_chunk_size: int = 128,
+    joint_attention_kwargs: dict[str, Any] | None = None,
+) -> LTMCalibration:
+    """Derive CHIMERA's FFT layer/timestep lookup from calibration endpoints.
+
+    Only radial descriptors are retained.  Full transformer features are never
+    stored during calibration, keeping host memory independent of sample count.
+    """
+
+    if not endpoint_samples:
+        raise ValueError("LTM calibration requires at least one endpoint sample")
+    if schedule.num_inference_steps < 2:
+        raise ValueError("LTM calibration requires at least two scheduler points")
+    if bands < 2:
+        raise ValueError("bands must be at least two")
+    if channel_chunk_size < 1:
+        raise ValueError("channel_chunk_size must be positive")
+    first_latent = endpoint_samples[0][0]
+    if first_latent.ndim != 3 or first_latent.shape[0] != 1:
+        raise ValueError(
+            "LTM calibration samples must have latent shape (1, image_tokens, channels)"
+        )
+    image_token_count = int(first_latent.shape[1])
+    controller = FluxFeatureController(
+        transformer,
+        image_token_count=image_token_count,
+        storage="float32",
+    )
+    accumulator = LTMPrototypeAccumulator(
+        step_count=schedule.num_inference_steps,
+        group_modules={group.name: group.label for group in controller.groups},
+        bands=bands,
+    )
+    with controller, torch.inference_mode():
+        for sample_index, (clean_latent, conditioning) in enumerate(endpoint_samples):
+            if clean_latent.ndim != 3 or clean_latent.shape[0] != 1:
+                raise ValueError(
+                    f"LTM calibration sample {sample_index} must have latent shape "
+                    "(1, image_tokens, channels)"
+                )
+            if clean_latent.shape[1] != image_token_count:
+                raise ValueError("all LTM calibration samples must use the same image geometry")
+            state = clean_latent.detach().clone()
+            for schedule_index in reversed(range(schedule.num_inference_steps)):
+                with controller.calibrate(
+                    step=schedule_index,
+                    accumulator=accumulator,
+                    channel_chunk_size=channel_chunk_size,
+                ):
+                    velocity = predict_conditional_velocity(
+                        transformer,
+                        state,
+                        schedule.timesteps[schedule_index].to(device=state.device),
+                        conditioning,
+                        image_ids,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
+                current_sigma = float(schedule.sigmas[schedule_index + 1].item())
+                next_sigma = float(schedule.sigmas[schedule_index].item())
+                state = (
+                    state.to(torch.float32)
+                    + (next_sigma - current_sigma) * velocity.to(torch.float32)
+                ).to(dtype=velocity.dtype)
+                if not bool(torch.isfinite(state).all().item()):
+                    raise FloatingPointError(
+                        "LTM calibration inversion produced non-finite values at "
+                        f"sample {sample_index}, scheduler index {schedule_index}"
+                    )
+    return accumulator.finalize()
+
+
 def invert_endpoint(
     *,
     key: str,
@@ -471,6 +871,7 @@ def invert_endpoint(
     conditioning: ConditioningPackage,
     image_ids: Tensor,
     controller: FluxFeatureController,
+    ltm_calibration: LTMCalibration | None = None,
     cache_stride: int = 1,
     joint_attention_kwargs: dict[str, Any] | None = None,
 ) -> ChimeraEndpointCache:
@@ -487,10 +888,19 @@ def invert_endpoint(
 
     state = clean_latent.detach().clone()
     step_count = schedule.num_inference_steps
+    previous_group: GroupName | None = None
     with torch.inference_mode():
         for schedule_index in reversed(range(step_count)):
-            group = flux_depth_ltm(schedule_index, step_count)
-            capture = schedule_index % cache_stride == 0 or schedule_index in {0, step_count - 1}
+            group = resolve_ltm_group(schedule_index, step_count, ltm_calibration)
+            # A calibrated mapping can switch groups at arbitrary steps.  Cache
+            # every transition as well as the configured stride so even a
+            # one-step group run always has a retrievable feature.
+            group_transition = previous_group is not None and group != previous_group
+            capture = (
+                schedule_index % cache_stride == 0
+                or schedule_index in {0, step_count - 1}
+                or group_transition
+            )
             if capture:
                 context = controller.capture(key=key, step=schedule_index, group=group)
             else:
@@ -515,6 +925,7 @@ def invert_endpoint(
                 raise FloatingPointError(
                     f"CHIMERA inversion produced non-finite values at scheduler index {schedule_index}"
                 )
+            previous_group = group
     return controller.endpoint_cache(
         key=key,
         inverted_latent=state,
@@ -603,6 +1014,7 @@ def render_chimera_morph(
     unconditional_conditioning: ConditioningPackage,
     alphas: Sequence[float],
     config: ChimeraConfig,
+    ltm_calibration: LTMCalibration | None = None,
     joint_attention_kwargs: dict[str, Any] | None = None,
 ) -> tuple[RenderedLatentFrame, ...]:
     """Denoise slerped endpoint latents with IDM, ACI, and early-step SAP."""
@@ -614,6 +1026,14 @@ def render_chimera_morph(
         raise ValueError("CHIMERA render alphas must be non-empty and strictly interior")
     if source.image_token_count != target.image_token_count:
         raise ValueError("endpoint caches use different image token counts")
+    if config.ltm_mode == "fft":
+        if ltm_calibration is None:
+            raise ValueError("FFT LTM rendering requires a completed LTM calibration")
+        if ltm_calibration.bands != config.ltm_bands:
+            raise ValueError("LTM calibration band count disagrees with ChimeraConfig")
+        active_ltm = ltm_calibration
+    else:
+        active_ltm = None
 
     initial = torch.cat(
         [slerp(source.inverted_latent, target.inverted_latent, alpha) for alpha in amounts],
@@ -642,7 +1062,11 @@ def render_chimera_morph(
                 denoising_steps=schedule.num_inference_steps,
                 inversion_steps=source.inversion_steps,
             )
-            group = flux_depth_ltm(denoising_index, schedule.num_inference_steps)
+            group = resolve_ltm_group(
+                inversion_index,
+                source.inversion_steps,
+                active_ltm,
+            )
             sap_active = denoising_index < sap_steps
             conditional = (
                 append_anchor_conditioning(
@@ -718,6 +1142,7 @@ class ChimeraFlux2Session:
             cfg_execution=config.cfg_execution,
             oom_backoff=config.oom_backoff,
         )
+        self.ltm_calibration: LTMCalibration | None = None
         self.last_render_batch_size = 1
 
     @property
@@ -736,6 +1161,65 @@ class ChimeraFlux2Session:
 
     def decode_frames_to_paths(self, frames, output_paths, **kwargs):
         return self.assets.decode_frames_to_paths(frames, output_paths, **kwargs)
+
+    def set_ltm_calibration(self, calibration: LTMCalibration) -> None:
+        """Validate and install a persisted FFT LTM calibration."""
+
+        runner = self.runner
+        if runner.schedule is None or runner.pipeline is None:
+            raise PipelineError("prepared runner lacks CHIMERA model state")
+        if calibration.step_count != runner.schedule.num_inference_steps:
+            raise PipelineError("LTM calibration schedule length disagrees with the runner")
+        if calibration.bands != self.config.ltm_bands:
+            raise PipelineError("LTM calibration band count disagrees with ChimeraConfig")
+        expected_modules = {
+            group.name: group.label
+            for group in select_flux_feature_groups(runner.pipeline.transformer)
+        }
+        if calibration.group_module_map != expected_modules:
+            raise PipelineError(
+                "LTM calibration feature-group modules disagree with the loaded FLUX model"
+            )
+        self.ltm_calibration = calibration
+
+    def calibrate_ltm(
+        self,
+        samples: Sequence[tuple[EncodedSequenceImage, ConditioningPackage]],
+    ) -> LTMCalibration:
+        """Calibrate FFT LTM from encoded anchor images and their prompts."""
+
+        if not samples:
+            raise ValueError("at least one encoded anchor is required for LTM calibration")
+        runner = self.runner
+        if runner.schedule is None or runner.pipeline is None or runner.image_ids is None:
+            raise PipelineError("prepared runner lacks CHIMERA model state")
+        runner._set_lora_scale(self.config.lora_scale)
+        calibration = calibrate_flux_ltm(
+            endpoint_samples=tuple(
+                (
+                    asset.latent.to(self.device, dtype=torch.float32),
+                    conditioning.to(self.device),
+                )
+                for asset, conditioning in samples
+            ),
+            schedule=runner.schedule,
+            transformer=runner.pipeline.transformer,
+            image_ids=runner.image_ids.to(self.device),
+            bands=self.config.ltm_bands,
+            channel_chunk_size=self.config.ltm_channel_chunk_size,
+        )
+        self.set_ltm_calibration(calibration)
+        return calibration
+
+    def _active_ltm_calibration(self) -> LTMCalibration | None:
+        if self.config.ltm_mode == "linear":
+            return None
+        if self.ltm_calibration is None:
+            raise PipelineError(
+                "FFT LTM is enabled but no calibration is installed; call "
+                "calibrate_ltm() or set_ltm_calibration() first"
+            )
+        return self.ltm_calibration
 
     def invert_pair(
         self,
@@ -761,6 +1245,7 @@ class ChimeraFlux2Session:
             image_token_count=source_asset.latent.shape[1],
             storage=self.config.cache_storage,
         )
+        active_ltm = self._active_ltm_calibration()
         with controller:
             source = invert_endpoint(
                 key=f"{pair_key}:A",
@@ -770,6 +1255,7 @@ class ChimeraFlux2Session:
                 conditioning=source_conditioning.to(self.device),
                 image_ids=image_ids,
                 controller=controller,
+                ltm_calibration=active_ltm,
                 cache_stride=self.config.cache_stride,
             )
             target = invert_endpoint(
@@ -780,6 +1266,7 @@ class ChimeraFlux2Session:
                 conditioning=target_conditioning.to(self.device),
                 image_ids=image_ids,
                 controller=controller,
+                ltm_calibration=active_ltm,
                 cache_stride=self.config.cache_stride,
             )
         return source, target
@@ -822,6 +1309,7 @@ class ChimeraFlux2Session:
                     unconditional_conditioning=runner.conditioning_cache.unconditional,
                     alphas=chunk,
                     config=self.config,
+                    ltm_calibration=self._active_ltm_calibration(),
                 )
             except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
                 is_oom = isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error).lower()
@@ -847,11 +1335,21 @@ class ChimeraFlux2Session:
         return tuple(output)
 
 
-def radial_frequency_descriptor(feature: Tensor, *, bands: int = 16) -> Tensor:
+def radial_frequency_descriptor(
+    feature: Tensor,
+    *,
+    bands: int = 16,
+    channel_chunk_size: int = 128,
+    normalize: bool = True,
+) -> Tensor:
     """Return CHIMERA's channel-mean radial FFT-magnitude descriptor.
 
     FLUX features are token grids.  Square token counts use their natural
     square layout; non-square counts are factored into the closest rectangle.
+    Channel chunks bound the transient complex FFT allocation without changing
+    the descriptor.  ``normalize=False`` follows the paper's published
+    magnitude equation and is used for LTM calibration; normalization remains
+    available for scale-independent diagnostics.
     """
 
     if feature.ndim == 3:
@@ -862,13 +1360,29 @@ def radial_frequency_descriptor(feature: Tensor, *, bands: int = 16) -> Tensor:
         raise ValueError("feature must have shape (tokens, channels) or (1, tokens, channels)")
     if bands < 2:
         raise ValueError("bands must be at least two")
+    if channel_chunk_size < 1:
+        raise ValueError("channel_chunk_size must be positive")
     tokens, channels = feature.shape
+    if tokens < 1 or channels < 1:
+        raise ValueError("feature token and channel dimensions must be non-empty")
     height = int(math.isqrt(tokens))
     while height > 1 and tokens % height:
         height -= 1
     width = tokens // height
     spatial = feature.float().transpose(0, 1).reshape(channels, height, width)
-    magnitude = torch.fft.fftshift(torch.fft.fft2(spatial), dim=(-2, -1)).abs().mean(dim=0)
+    magnitude_sum = torch.zeros(
+        height,
+        width,
+        device=feature.device,
+        dtype=torch.float32,
+    )
+    for start in range(0, channels, channel_chunk_size):
+        chunk = spatial[start : start + channel_chunk_size]
+        magnitude_sum += torch.fft.fftshift(
+            torch.fft.fft2(chunk),
+            dim=(-2, -1),
+        ).abs().sum(dim=0)
+    magnitude = magnitude_sum / channels
     yy = torch.arange(height, device=magnitude.device, dtype=torch.float32) - (height - 1) / 2
     xx = torch.arange(width, device=magnitude.device, dtype=torch.float32) - (width - 1) / 2
     radius = torch.sqrt(yy[:, None] ** 2 + xx[None, :] ** 2)
@@ -879,7 +1393,12 @@ def radial_frequency_descriptor(feature: Tensor, *, bands: int = 16) -> Tensor:
     sums.scatter_add_(0, indices.reshape(-1), magnitude.reshape(-1))
     counts.scatter_add_(0, indices.reshape(-1), torch.ones_like(magnitude).reshape(-1))
     descriptor = sums / torch.clamp(counts, min=1)
-    return descriptor / torch.clamp(descriptor.sum(), min=torch.finfo(torch.float32).eps)
+    if normalize:
+        descriptor = descriptor / torch.clamp(
+            descriptor.sum(),
+            min=torch.finfo(torch.float32).eps,
+        )
+    return descriptor
 
 
 def compute_glcs_from_similarities(
@@ -946,15 +1465,20 @@ __all__ = [
     "ChimeraFlux2Session",
     "FluxFeatureController",
     "FluxFeatureGroup",
+    "LTMCalibration",
+    "LTMPrototypeAccumulator",
     "StoredFeature",
     "append_anchor_conditioning",
+    "calibrate_flux_ltm",
     "compute_glcs_from_similarities",
     "flux_depth_ltm",
     "invert_endpoint",
     "map_denoising_to_inversion_step",
+    "match_ltm_prototypes",
     "nearest_cached_step",
     "prompt_anchor_reliability",
     "radial_frequency_descriptor",
     "render_chimera_morph",
+    "resolve_ltm_group",
     "select_flux_feature_groups",
 ]

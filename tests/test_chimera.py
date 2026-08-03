@@ -10,12 +10,16 @@ from flowmorph_klein.chimera import (
     ChimeraConfig,
     ChimeraEndpointCache,
     FluxFeatureController,
+    LTMCalibration,
+    LTMPrototypeAccumulator,
     StoredFeature,
     append_anchor_conditioning,
+    calibrate_flux_ltm,
     compute_glcs_from_similarities,
     flux_depth_ltm,
     invert_endpoint,
     map_denoising_to_inversion_step,
+    match_ltm_prototypes,
     nearest_cached_step,
     prompt_anchor_reliability,
     radial_frequency_descriptor,
@@ -116,6 +120,8 @@ def test_chimera_config_exposes_paper_defaults_and_memory_controls() -> None:
     assert config.aci_weight == pytest.approx(0.4)
     assert config.sap_active_ratio == pytest.approx(0.2)
     assert config.anchor_reliability_threshold == pytest.approx(0.45)
+    assert config.ltm_mode == "fft"
+    assert config.ltm_bands == 16
     assert config.cache_storage == "int8"
     assert config.cache_stride == 2
 
@@ -146,6 +152,90 @@ def test_ltm_and_idm_cover_endpoints_and_stride_gaps() -> None:
         4, denoising_steps=5, inversion_steps=9
     ) == 8
     assert nearest_cached_step(5, [0, 4, 6, 8]) == 4
+
+
+def test_fft_ltm_prototype_matching_and_roundtrip_are_deterministic() -> None:
+    layers = {
+        "early": [3.0, 0.0, 0.0],
+        "middle": [0.0, 3.0, 0.0],
+        "late": [0.0, 0.0, 3.0],
+    }
+    timesteps = ([2.5, 0.1, 0.0], [0.0, 0.2, 2.8], [0.1, 2.7, 0.0])
+    mapping = match_ltm_prototypes(layers, timesteps, bands=3)
+    assert mapping == ("early", "late", "middle")
+
+    calibration = LTMCalibration(
+        bands=3,
+        sample_count=4,
+        group_modules=("block.early", "block.middle", "block.late"),
+        layer_prototypes=tuple(tuple(layers[group]) for group in ("early", "middle", "late")),
+        timestep_prototypes=timesteps,
+        mapping=mapping,
+    )
+    restored = LTMCalibration.from_dict(calibration.to_dict())
+    assert restored == calibration
+    assert restored.fingerprint == calibration.fingerprint
+
+
+def test_ltm_accumulator_builds_dataset_level_layer_and_timestep_means() -> None:
+    accumulator = LTMPrototypeAccumulator(
+        step_count=2,
+        group_modules={"early": "e", "middle": "m", "late": "l"},
+        bands=3,
+    )
+    for sample_offset in (0.0, 0.2):
+        for step in range(2):
+            for group_index, group in enumerate(("early", "middle", "late")):
+                descriptor = torch.tensor(
+                    [1.0 + group_index, 1.0 + step, 1.0 + sample_offset]
+                )
+                accumulator.add(group, step, descriptor)
+    calibration = accumulator.finalize()
+
+    assert calibration.sample_count == 2
+    assert calibration.step_count == 2
+    assert calibration.group_module_map == {"early": "e", "middle": "m", "late": "l"}
+    assert len(calibration.mapping) == 2
+
+
+def test_sparse_cache_always_captures_calibrated_group_transitions() -> None:
+    transformer = FakeFluxTransformer()
+    schedule = FlowSchedule(
+        timesteps=torch.tensor([1000.0, 666.0, 333.0]),
+        sigmas=torch.tensor([1.0, 2 / 3, 1 / 3, 0.0]),
+    )
+    calibration = LTMCalibration(
+        bands=3,
+        sample_count=1,
+        group_modules=(
+            "transformer_blocks.1",
+            "transformer_blocks.2",
+            "single_transformer_blocks.1",
+        ),
+        layer_prototypes=((3.0, 0.0, 0.0), (0.0, 3.0, 0.0), (0.0, 0.0, 3.0)),
+        timestep_prototypes=((3.0, 0.0, 0.0), (0.0, 3.0, 0.0), (0.0, 0.0, 3.0)),
+        mapping=("early", "middle", "late"),
+    )
+    controller = FluxFeatureController(
+        transformer,
+        image_token_count=4,
+        storage="float32",
+    )
+    with controller:
+        cache = invert_endpoint(
+            key="transitions",
+            clean_latent=torch.zeros(1, 4, 3),
+            schedule=schedule,
+            transformer=transformer,
+            conditioning=conditioning(1.0),
+            image_ids=torch.zeros(1, 4, 4),
+            controller=controller,
+            ltm_calibration=calibration,
+            cache_stride=99,
+        )
+
+    assert set(cache.features) == {"early", "middle", "late"}
+    assert all(cache.features[group] for group in ("early", "middle", "late"))
 
 
 def test_int8_feature_storage_roundtrips_with_bounded_error() -> None:
@@ -227,6 +317,11 @@ def test_radial_frequency_descriptor_is_normalized() -> None:
     assert float(descriptor.sum()) == pytest.approx(1.0)
     assert descriptor[-1] > descriptor[0]
 
+    chunked = radial_frequency_descriptor(checkerboard, bands=8, channel_chunk_size=1)
+    raw = radial_frequency_descriptor(checkerboard, bands=8, normalize=False)
+    assert torch.allclose(chunked, descriptor)
+    assert float(raw.sum()) > 1.0
+
 
 def test_glcs_returns_geometric_mean_of_global_and_local_terms() -> None:
     result = compute_glcs_from_similarities(
@@ -258,6 +353,17 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
     source_prompt = conditioning(1.0)
     target_prompt = conditioning(2.0)
     anchor_prompt = conditioning(1.5, tokens=2)
+    calibration = calibrate_flux_ltm(
+        endpoint_samples=(
+            (torch.zeros(1, 4, 3), source_prompt),
+            (torch.ones(1, 4, 3), target_prompt),
+        ),
+        schedule=schedule,
+        transformer=transformer,
+        image_ids=image_ids,
+        bands=4,
+        channel_chunk_size=2,
+    )
     with controller:
         source = invert_endpoint(
             key="source",
@@ -265,18 +371,20 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
             schedule=schedule,
             transformer=transformer,
             conditioning=source_prompt,
-            image_ids=image_ids,
-            controller=controller,
-        )
+                image_ids=image_ids,
+                controller=controller,
+                ltm_calibration=calibration,
+            )
         target = invert_endpoint(
             key="target",
             clean_latent=torch.ones(1, 4, 3),
             schedule=schedule,
             transformer=transformer,
             conditioning=target_prompt,
-            image_ids=image_ids,
-            controller=controller,
-        )
+                image_ids=image_ids,
+                controller=controller,
+                ltm_calibration=calibration,
+            )
 
     frames = render_chimera_morph(
         source,
@@ -300,7 +408,9 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
             render_batch_size=2,
             decode_batch_size=2,
             guidance_scale=1.0,
+            ltm_bands=4,
         ),
+        ltm_calibration=calibration,
     )
 
     assert [frame.alpha for frame in frames] == [0.25, 0.75]

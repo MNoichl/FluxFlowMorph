@@ -74,9 +74,24 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_ACI_WEIGHT = 0.4" in text
     assert "CHIMERA_SAP_ACTIVE_RATIO = 0.2" in text
     assert "CHIMERA_ANCHOR_RELIABILITY_THRESHOLD = 0.45" in text
+    assert 'CHIMERA_LTM_MODE = "fft"' in text
+    assert "CHIMERA_LTM_BANDS = 16" in text
+    assert "CHIMERA_LTM_CALIBRATION_ANCHORS = 4" in text
+    assert "REUSE_CHIMERA_LTM_CALIBRATION = True" in text
     assert 'CHIMERA_CACHE_STORAGE = "int8"' in text
     assert "CHIMERA_CACHE_STRIDE = 2" in text
-    assert "maps them to transformer depth thirds" in text
+    assert "measures their timestep correspondence" in text
+
+
+def test_fft_ltm_is_calibrated_persisted_and_part_of_pair_identity() -> None:
+    code = code_source(load_notebook())
+    assert "LTMCalibration," in code
+    assert 'RUN_DIRECTORY / "metadata" / "chimera_ltm_calibration.json"' in code
+    assert "CHIMERA_SESSION.calibrate_ltm(" in code
+    assert "CHIMERA_SESSION.set_ltm_calibration(candidate)" in code
+    assert '"descriptor_normalized": False' in code
+    assert '"calibration_fingerprint": CHIMERA_LTM_CALIBRATION.fingerprint' in code
+    assert '"ltm_fingerprint": CHIMERA_LTM_FINGERPRINT' in code
 
 
 def test_all_prompts_are_active_and_original_anchor_init_is_restored() -> None:

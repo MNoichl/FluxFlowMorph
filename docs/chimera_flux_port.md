@@ -11,17 +11,19 @@ a claim of code-level reproduction.
 
 ## What is preserved
 
-The implementation follows the paper's six-stage algorithm:
+The implementation follows the paper's algorithm:
 
 1. Encode each endpoint image and reverse the native deterministic sampler to
    obtain an inverted endpoint latent.
-2. Cache multi-depth diffusion features during inversion.
-3. Spherically interpolate both endpoint latents and endpoint caches.
-4. Use a linear inversion-denoising timestep mapping (IDM) when retrieving a
+2. Calibrate radial FFT prototypes for the representative FLUX layer groups
+   and every inversion timestep, then select the minimum-L1 group per step.
+3. Cache the frequency-matched diffusion feature during pair inversion.
+4. Spherically interpolate both endpoint latents and endpoint caches.
+5. Use a linear inversion-denoising timestep mapping (IDM) when retrieving a
    cache during forward denoising.
-5. Add the interpolated feature as an ACI residual with the published default
+6. Add the interpolated feature as an ACI residual with the published default
    weight `0.4`.
-6. Construct an anchor-correlated prompt triplet with a VLM, require a minimum
+7. Construct an anchor-correlated prompt triplet with a VLM, require a minimum
    endpoint-anchor cosine similarity of `0.45`, and append the shared anchor
    tokens during the first `20%` of denoising steps only.
 
@@ -41,21 +43,25 @@ steps exhibit the same coarse-to-fine progression.
 
 `select_flux_feature_groups()` maps the centers of the first, middle, and last
 transformer-depth thirds to `early`, `middle`, and `late` representatives.
-`flux_depth_ltm()` matches the corresponding denoising thirds. Hooks cache and
-inject image tokens only; SAP may change the number of text tokens without
-invalidating the image-feature boundary.
+`radial_frequency_descriptor()` computes the channel-mean, radially pooled FFT
+magnitude in exact channel chunks. `calibrate_flux_ltm()` averages descriptors
+over a calibration anchor set to form layer and timestep prototypes, then uses
+the paper's per-timestep minimum-L1 rule. Hooks cache and inject image tokens
+only; SAP may change the number of text tokens without invalidating the
+image-feature boundary.
 
-This depth prior is the port's Layer- and Timestep-wise Frequency Matching
-(LTM) approximation. The paper's reference LTM uses offline, dataset-averaged
-radial FFT prototypes, but those prototypes and the code used to produce them
-were not released. `radial_frequency_descriptor()` implements the paper's
-descriptor for calibration experiments without presenting pair-specific
-statistics as the missing dataset-level reference calibration.
+The production notebook calibrates on four evenly spaced anchors from the
+active cycle. This is model-, LoRA-, resolution-, prompt-, and image-specific,
+is saved to Google Drive, and is reused across every pair. Only the small FFT
+statistics and final 50-step mapping are persisted. Setting
+`CHIMERA_LTM_MODE="linear"` explicitly restores the old fixed-third fallback.
 
 ## Memory contract
 
-Uncompressed 1024px features from a 9B transformer are very large. The notebook
-therefore exposes two consequential settings:
+Uncompressed 1024px features from a 9B transformer are very large. Calibration
+therefore stores descriptors rather than full features from all three groups.
+After calibration, only the selected group is cached for each timestep. The
+notebook also exposes two consequential settings:
 
 - `CHIMERA_CACHE_STORAGE="int8"` stores symmetric per-feature int8 caches on
   CPU and dequantizes only the active feature to the transformer's dtype.
@@ -93,8 +99,11 @@ not across the whole multi-anchor cycle.
 
 ## Known limitations
 
-- This port cannot reproduce unpublished feature-layer choices, offline FFT
-  prototypes, VLM instruction details, or reference-code numerical behavior.
+- The paper's dataset-level FFT prototypes were not released. This port derives
+  run-level prototypes from four evenly spaced cyclic anchors; increase
+  `CHIMERA_LTM_CALIBRATION_ANCHORS` for a broader but slower calibration set.
+- This port cannot reproduce unpublished feature-layer choices, VLM instruction
+  details, or reference-code numerical behavior.
 - Representative depth hooks are less comprehensive than caching every FLUX
   block. Caching all 32 9B blocks at all 50 steps is not a practical Colab
   default.

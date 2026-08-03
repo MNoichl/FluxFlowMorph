@@ -86,21 +86,24 @@ notebook["cells"][0]["source"] = lines(
 
     1. Generate the editable cyclic `BASE_STAGES` as RIJKSOIL anchors.
     2. Ask a vision-language model for one anchor-correlated prompt triplet per gap.
-    3. Reverse the native 50-step FLUX Euler ODE for both endpoint images while
-       caching representative early/middle/late transformer features.
-    4. Slerp the inverted latents and caches, map inversion to denoising steps
+    3. Calibrate Layer- and Timestep-wise Frequency Matching (LTM) once from a
+       representative anchor subset using the paper's radial FFT descriptors.
+    4. Reverse the native 50-step FLUX Euler ODE for both endpoint images while
+       caching the frequency-matched transformer feature at each timestep.
+    5. Slerp the inverted latents and caches, map inversion to denoising steps
        with IDM, and inject the matched cache through ACI (default weight 0.4).
-    5. Append the shared semantic-anchor tokens only during the first 20% of
+    6. Append the shared semantic-anchor tokens only during the first 20% of
        denoising, then release that constraint for fine-detail formation.
-    6. Render one flat ten-interior pass, save every image directly to Google
+    7. Render one flat ten-interior pass, save every image directly to Google
        Drive, optionally score completed pairs with DINO-backed GLCS, and finish
        the exact cyclic PNG sequence with the existing RIFE/SSIM video stack.
 
     The official CHIMERA code was not public when this port was written.  FLUX
     has no U-Net down/mid/up blocks, so this implementation follows the paper's
-    FLUX appendix and maps them to transformer depth thirds.  Int8 CPU caches
-    and cache stride 2 are exposed memory controls; use float32/stride 1 for the
-    closest (and much larger) cache contract.
+    FLUX appendix and maps them to representative transformer depths, then
+    measures their timestep correspondence instead of assuming fixed thirds.
+    Int8 CPU caches and cache stride 2 are exposed memory controls; use
+    float32/stride 1 for the closest (and much larger) cache contract.
     """
 )
 notebook["cells"][1]["source"] = lines(
@@ -153,6 +156,11 @@ settings = replace_between(
     CHIMERA_ANCHOR_RELIABILITY_THRESHOLD = 0.45
     CHIMERA_SAP_MAX_REQUERIES = 3
     CHIMERA_ANCHOR_MAX_TOKENS = 64
+    CHIMERA_LTM_MODE = "fft"  # "fft" (paper method) or explicit "linear" fallback.
+    CHIMERA_LTM_BANDS = 16
+    CHIMERA_LTM_CHANNEL_CHUNK_SIZE = 128  # Exact chunked FFT; affects memory, not results.
+    CHIMERA_LTM_CALIBRATION_ANCHORS = 4  # Evenly sampled from the active cyclic anchors.
+    REUSE_CHIMERA_LTM_CALIBRATION = True
     CHIMERA_CACHE_STRIDE = 2  # 1 caches every inversion step.
     CHIMERA_CACHE_STORAGE = "int8"  # int8, float16, bfloat16, or float32.
     CHIMERA_GUIDANCE_SCALE = 7.0
@@ -224,6 +232,12 @@ notebook["cells"][10]["source"] = lines(
         raise ValueError("CHIMERA_ANCHOR_RELIABILITY_THRESHOLD must lie in [-1, 1]")
     if CHIMERA_SAP_MAX_REQUERIES < 0 or CHIMERA_CACHE_STRIDE < 1:
         raise ValueError("CHIMERA requery count and cache stride are invalid")
+    if CHIMERA_LTM_MODE not in {"fft", "linear"}:
+        raise ValueError("CHIMERA_LTM_MODE must be fft or linear")
+    if CHIMERA_LTM_BANDS < 2 or CHIMERA_LTM_CHANNEL_CHUNK_SIZE < 1:
+        raise ValueError("CHIMERA LTM bands/chunk size are invalid")
+    if not 1 <= CHIMERA_LTM_CALIBRATION_ANCHORS <= BASE_PROMPT_COUNT:
+        raise ValueError("CHIMERA_LTM_CALIBRATION_ANCHORS is outside the active anchor range")
     if CHIMERA_CACHE_STORAGE not in {"int8", "float16", "bfloat16", "float32"}:
         raise ValueError("Unsupported CHIMERA_CACHE_STORAGE")
     if CHIMERA_CFG_EXECUTION not in {"sequential", "batched"}:
@@ -289,8 +303,15 @@ notebook["cells"][10]["source"] = lines(
         "openai_anchor_triplets": pair_count,
         "endpoint_inversions": pair_count * 2,
         "inversion_transformer_calls": pair_count * 2 * CHIMERA_INVERSION_STEPS,
+        "one_time_ltm_calibration_inversions": (
+            CHIMERA_LTM_CALIBRATION_ANCHORS if CHIMERA_LTM_MODE == "fft" else 0
+        ),
         "denoising_batches": denoise_batches,
         "denoising_transformer_calls_before_cfg": denoise_batches * CHIMERA_DENOISING_STEPS,
+        "ltm_contract": (
+            f"{CHIMERA_LTM_MODE}, bands={CHIMERA_LTM_BANDS}, "
+            f"calibration_anchors={CHIMERA_LTM_CALIBRATION_ANCHORS}"
+        ),
         "cache_contract": f"{CHIMERA_CACHE_STORAGE}, stride={CHIMERA_CACHE_STRIDE}",
         "final_generated_sequence_images": round_counts[-1],
         "rife_multiplier": RIFE_MULTIPLIER,
@@ -675,6 +696,7 @@ notebook["cells"][19]["source"] = lines(
     from flowmorph_klein.chimera import (
         ChimeraConfig,
         ChimeraFlux2Session,
+        LTMCalibration,
         prompt_anchor_reliability,
         select_flux_feature_groups,
     )
@@ -832,6 +854,9 @@ notebook["cells"][19]["source"] = lines(
         sap_active_ratio=CHIMERA_SAP_ACTIVE_RATIO,
         anchor_max_tokens=CHIMERA_ANCHOR_MAX_TOKENS,
         anchor_reliability_threshold=CHIMERA_ANCHOR_RELIABILITY_THRESHOLD,
+        ltm_mode=CHIMERA_LTM_MODE,
+        ltm_bands=CHIMERA_LTM_BANDS,
+        ltm_channel_chunk_size=CHIMERA_LTM_CHANNEL_CHUNK_SIZE,
         cache_stride=CHIMERA_CACHE_STRIDE,
         cache_storage=CHIMERA_CACHE_STORAGE,
         render_batch_size=CHIMERA_RENDER_BATCH_SIZE,
@@ -845,6 +870,127 @@ notebook["cells"][19]["source"] = lines(
     IMAGE_ASSET_CACHE, PROMPT_CONDITIONING_CACHE = CHIMERA_SESSION.seed_prepared_assets(
         bootstrap_left["uid"], bootstrap_right["uid"]
     )
+
+    # The paper's LTM prototypes are dataset-level, not pair-specific.  We
+    # approximate that contract with an evenly spaced subset of this run's
+    # independently generated anchors, persist it on Drive, and reuse it for
+    # every pair.  Calibration retains only 16-value spectra, never full caches.
+    CHIMERA_LTM_CALIBRATION_PATH = (
+        RUN_DIRECTORY / "metadata" / "chimera_ltm_calibration.json"
+    )
+    CHIMERA_LTM_CALIBRATION = None
+    if CHIMERA_LTM_MODE == "fft":
+        calibration_indices = [
+            (index * len(BASE_RECORDS)) // CHIMERA_LTM_CALIBRATION_ANCHORS
+            for index in range(CHIMERA_LTM_CALIBRATION_ANCHORS)
+        ]
+        calibration_records = [BASE_RECORDS[index] for index in calibration_indices]
+        calibration_images = {
+            record["uid"]: (
+                record["path"],
+                CHIMERA_ASSET_ROOT / f"{record['uid']}.png",
+            )
+            for record in calibration_records
+            if record["uid"] not in IMAGE_ASSET_CACHE
+        }
+        calibration_prompts = [
+            record["prompt"]
+            for record in calibration_records
+            if record["prompt"] not in PROMPT_CONDITIONING_CACHE
+        ]
+        if calibration_images or calibration_prompts:
+            encoded_prompts, encoded_images = CHIMERA_SESSION.encode_missing_assets(
+                prompts=list(dict.fromkeys(calibration_prompts)),
+                images=calibration_images,
+            )
+            PROMPT_CONDITIONING_CACHE.update(encoded_prompts)
+            IMAGE_ASSET_CACHE.update(encoded_images)
+
+        calibration_contract = {
+            "method": "CHIMERA FFT LTM radial magnitude prototypes v1",
+            "model_id": MODEL_ID,
+            "model_revision": MODEL_REVISION,
+            "lora_sha256": file_sha256(LOCAL_LORA_PATH),
+            "lora_scale": CHIMERA_LORA_SCALE,
+            "width": IMAGE_WIDTH,
+            "height": IMAGE_HEIGHT,
+            "steps": CHIMERA_DENOISING_STEPS,
+            "bands": CHIMERA_LTM_BANDS,
+            "descriptor_normalized": False,
+            "feature_groups": [
+                group.label
+                for group in select_flux_feature_groups(
+                    CHIMERA_RUNNER.pipeline.transformer
+                )
+            ],
+            "anchors": [
+                {
+                    "uid": record["uid"],
+                    "image_sha256": file_sha256(record["path"]),
+                    "prompt": record["prompt"],
+                }
+                for record in calibration_records
+            ],
+        }
+        calibration_contract_fingerprint = stable_fingerprint(calibration_contract)
+        calibration_reused = False
+        if REUSE_CHIMERA_LTM_CALIBRATION and CHIMERA_LTM_CALIBRATION_PATH.is_file():
+            saved_calibration = json.loads(
+                CHIMERA_LTM_CALIBRATION_PATH.read_text(encoding="utf-8")
+            )
+            if saved_calibration.get("contract_fingerprint") == calibration_contract_fingerprint:
+                candidate = LTMCalibration.from_dict(saved_calibration["calibration"])
+                if saved_calibration.get("calibration_fingerprint") != candidate.fingerprint:
+                    raise RuntimeError("Saved LTM calibration fingerprint is corrupt")
+                CHIMERA_SESSION.set_ltm_calibration(candidate)
+                CHIMERA_LTM_CALIBRATION = candidate
+                calibration_reused = True
+
+        if CHIMERA_LTM_CALIBRATION is None:
+            print({
+                "ltm_calibration": "running",
+                "anchor_uids": [record["uid"] for record in calibration_records],
+                "inversions": len(calibration_records),
+                "bands": CHIMERA_LTM_BANDS,
+            })
+            CHIMERA_LTM_CALIBRATION = CHIMERA_SESSION.calibrate_ltm(tuple(
+                (
+                    IMAGE_ASSET_CACHE[record["uid"]],
+                    PROMPT_CONDITIONING_CACHE[record["prompt"]],
+                )
+                for record in calibration_records
+            ))
+            CHIMERA_LTM_CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CHIMERA_LTM_CALIBRATION_PATH.write_text(json.dumps({
+                "contract_fingerprint": calibration_contract_fingerprint,
+                "calibration_fingerprint": CHIMERA_LTM_CALIBRATION.fingerprint,
+                "contract": calibration_contract,
+                "calibration": CHIMERA_LTM_CALIBRATION.to_dict(),
+            }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        CHIMERA_LTM_FINGERPRINT = stable_fingerprint({
+            "contract": calibration_contract_fingerprint,
+            "calibration": CHIMERA_LTM_CALIBRATION.fingerprint,
+        })
+        CHIMERA_LTM_REPORT = {
+            "mode": "fft",
+            "reused": calibration_reused,
+            "path": str(CHIMERA_LTM_CALIBRATION_PATH),
+            "sample_count": CHIMERA_LTM_CALIBRATION.sample_count,
+            "mapping": list(CHIMERA_LTM_CALIBRATION.mapping),
+            "fingerprint": CHIMERA_LTM_FINGERPRINT,
+        }
+    else:
+        CHIMERA_LTM_FINGERPRINT = stable_fingerprint({
+            "mode": "linear",
+            "steps": CHIMERA_DENOISING_STEPS,
+        })
+        CHIMERA_LTM_REPORT = {
+            "mode": "linear",
+            "mapping": "fixed early/middle/late thirds",
+            "fingerprint": CHIMERA_LTM_FINGERPRINT,
+        }
+
     print({
         "model_loads": 1,
         "backward_probes": 0,
@@ -852,6 +998,7 @@ notebook["cells"][19]["source"] = lines(
         "feature_groups": [group.label for group in select_flux_feature_groups(CHIMERA_RUNNER.pipeline.transformer)],
         "cache_storage": CHIMERA_CACHE_STORAGE,
         "cache_stride": CHIMERA_CACHE_STRIDE,
+        "ltm": CHIMERA_LTM_REPORT,
     })
 
     def encode_prompt_values(prompts):
@@ -916,6 +1063,13 @@ notebook["cells"][19]["source"] = lines(
             "source_cache_mib": source_cache.storage_bytes / (1024 ** 2),
             "target_cache_mib": target_cache.storage_bytes / (1024 ** 2),
             "feature_groups": dict(source_cache.group_modules),
+            "ltm_mode": CHIMERA_LTM_MODE,
+            "ltm_mapping": (
+                list(CHIMERA_LTM_CALIBRATION.mapping)
+                if CHIMERA_LTM_CALIBRATION is not None
+                else "fixed early/middle/late thirds"
+            ),
+            "ltm_fingerprint": CHIMERA_LTM_FINGERPRINT,
         }
         del source_cache, target_cache, frames
         gc.collect()
@@ -1030,7 +1184,7 @@ notebook["cells"][21]["source"] = lines(
             ]
             proposal = job["proposal"]
             pair_contract = {
-                "method": "CHIMERA FLUX.2 port: Euler inversion + depth LTM + IDM + ACI + SAP",
+                "method": "CHIMERA FLUX.2 port: Euler inversion + FFT LTM + IDM + ACI + SAP",
                 "round": round_number,
                 "gap_index": gap_index,
                 "left_uid": job["left"]["uid"],
@@ -1049,6 +1203,9 @@ notebook["cells"][21]["source"] = lines(
                     "steps": CHIMERA_DENOISING_STEPS,
                     "aci_weight": CHIMERA_ACI_WEIGHT,
                     "sap_active_ratio": CHIMERA_SAP_ACTIVE_RATIO,
+                    "ltm_mode": CHIMERA_LTM_MODE,
+                    "ltm_bands": CHIMERA_LTM_BANDS,
+                    "ltm_fingerprint": CHIMERA_LTM_FINGERPRINT,
                     "cache_stride": CHIMERA_CACHE_STRIDE,
                     "cache_storage": CHIMERA_CACHE_STORAGE,
                     "guidance_scale": CHIMERA_GUIDANCE_SCALE,
@@ -1153,7 +1310,7 @@ notebook["cells"][21]["source"] = lines(
         round_manifest_path.write_text(json.dumps({
             "round": round_number,
             "cyclic": True,
-            "interpolation_method": "CHIMERA FLUX.2 port with Euler inversion, ACI, IDM, and SAP",
+            "interpolation_method": "CHIMERA FLUX.2 port with Euler inversion, FFT LTM, ACI, IDM, and SAP",
             "input_count": len(incoming),
             "midpoints_per_gap": midpoint_count,
             "alphas": fractions,
