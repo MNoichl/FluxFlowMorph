@@ -279,7 +279,13 @@ def test_sap_uses_one_image_aware_intermediate_prompt_per_pair() -> None:
     assert 'CHIMERA_INTERMEDIATE_PROMPT_MODE = "openai_per_pair"' in code
     assert "class ChimeraIntermediateProposal(BaseModel):" in code
     assert "intermediate_prompt:" in code
-    assert '"type": "input_image"' in code
+    assert sap_source.count('{"type": "input_image"') == 2
+    assert "Painting A authored FLUX prompt (verbatim):" in sap_source
+    assert "Painting B authored FLUX prompt (verbatim):" in sap_source
+    assert "{left['prompt']}" in sap_source
+    assert "{right['prompt']}" in sap_source
+    assert 'image_data_url(left["path"])' in sap_source
+    assert 'image_data_url(right["path"])' in sap_source
     assert "propose_chimera_intermediate(" in code
     assert "OPENAI_INTERMEDIATE_PROMPT_COUNT += len(pair_jobs)" in code
     assert "proposal.prompt_a" not in code
@@ -292,6 +298,12 @@ def test_sap_uses_one_image_aware_intermediate_prompt_per_pair() -> None:
     assert "seventeenth-century Dutch Baroque" not in sap_source
     assert "Keep sparse scenes sparse" in sap_source
     assert "The authored endpoint prompts are immutable" in sap_source
+    assert "def print_pair_prompt_plan(job, label):" in code
+    assert "SOURCE AUTHORED PROMPT:" in code
+    assert "OPENAI INTERMEDIATE / SAP PROMPT:" in code
+    assert "TARGET AUTHORED PROMPT:" in code
+    assert 'print_pair_prompt_plan(test_job, "QUALITY-GATE PROMPT PLAN")' in code
+    assert "ROUND {round_number} GAP {job['gap_index']} PROMPT PLAN" in code
     assert "prompt_anchor_reliability(" in code
     assert "CHIMERA_SAP_MAX_REQUERIES" in code
     assert "reliability >= CHIMERA_ANCHOR_RELIABILITY_THRESHOLD" in code
