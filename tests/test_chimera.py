@@ -161,6 +161,24 @@ def test_velocity_smoothing_is_alpha_aware_endpoint_fixed_and_reversible() -> No
     assert torch.allclose(smoothed, reversed_smoothed)
 
 
+def test_velocity_smoothing_preserves_low_precision_corrections_in_float32() -> None:
+    velocity = torch.tensor(
+        [1.0, 1.046875, 0.953125, 1.0],
+        dtype=torch.bfloat16,
+    ).reshape(4, 1, 1)
+
+    smoothed = smooth_velocity_along_alpha(
+        velocity,
+        (0.1, 0.3, 0.7, 0.9),
+        strength=0.1,
+    )
+
+    assert smoothed.dtype is torch.float32
+    assert smoothed[0] == velocity[0].float()
+    assert smoothed[-1] == velocity[-1].float()
+    assert not torch.equal(smoothed[1:-1], velocity[1:-1].float())
+
+
 def test_velocity_smoothing_rejects_invalid_strength_and_alpha_order() -> None:
     velocity = torch.zeros(3, 1, 1)
     with pytest.raises(ValueError, match="strength"):
@@ -471,7 +489,7 @@ def test_int8_feature_storage_roundtrips_with_bounded_error() -> None:
     assert stored.storage_bytes < tensor.numel() * tensor.element_size()
 
 
-def test_feature_controller_captures_and_injects_only_image_tokens() -> None:
+def test_feature_controller_injects_selected_cache_at_all_representative_depths() -> None:
     transformer = FakeFluxTransformer()
     image_tokens = 4
     controller = FluxFeatureController(
@@ -498,6 +516,8 @@ def test_feature_controller_captures_and_injects_only_image_tokens() -> None:
         source = endpoint_cache("source", "early", 2.0)
         target = endpoint_cache("target", "early", 4.0)
         batch = torch.zeros(2, image_tokens, 3)
+        injected_outputs = []
+        groups = select_flux_feature_groups(transformer)
         with controller.inject(
             source=source,
             target=target,
@@ -506,28 +526,71 @@ def test_feature_controller_captures_and_injects_only_image_tokens() -> None:
             alphas=torch.tensor([0.0, 1.0]),
             weight=0.5,
         ):
-            _, injected = early.module(batch)
+            for feature_group in groups:
+                output = feature_group.module(batch)
+                injected_outputs.append(
+                    output[-1] if isinstance(output, (tuple, list)) else output
+                )
 
-    baseline = early.module.offset
-    assert torch.allclose(injected[0], torch.full_like(injected[0], baseline + 1.0))
-    assert torch.allclose(injected[1], torch.full_like(injected[1], baseline + 2.0))
+    for feature_group, injected in zip(groups, injected_outputs, strict=True):
+        baseline = feature_group.module.offset
+        assert torch.allclose(
+            injected[0, -image_tokens:],
+            torch.full_like(injected[0, -image_tokens:], baseline + 1.0),
+        )
+        assert torch.allclose(
+            injected[1, -image_tokens:],
+            torch.full_like(injected[1, -image_tokens:], baseline + 2.0),
+        )
 
 
-def test_sap_appends_anchor_tokens_and_reliability_uses_both_endpoints() -> None:
+def test_sap_appends_coverage_sampled_valid_anchor_tokens() -> None:
     base = conditioning(1.0, tokens=3)
-    anchor = conditioning(1.0, tokens=2)
-    combined = append_anchor_conditioning(base, anchor, max_anchor_tokens=1)
+    anchor = ConditioningPackage(
+        "anchor",
+        torch.arange(6, dtype=torch.float32).reshape(1, 6, 1).expand(-1, -1, 4),
+        torch.arange(24).reshape(1, 6, 4),
+        torch.tensor([[1, 1, 1, 1, 1, 0]], dtype=torch.bool),
+    )
+    combined = append_anchor_conditioning(base, anchor, max_anchor_tokens=3)
 
-    assert combined.prompt_embeds.shape == (1, 4, 4)
-    assert combined.text_ids.shape == (1, 4, 4)
+    assert combined.prompt_embeds.shape == (1, 6, 4)
+    assert combined.text_ids.shape == (1, 6, 4)
+    assert combined.attention_mask is not None
+    assert bool(combined.attention_mask.all())
+    assert combined.prompt_embeds[0, 3:, 0].tolist() == [0.0, 2.0, 4.0]
+
+
+def test_sap_reliability_masks_padding_and_normalizes_to_endpoint_gap() -> None:
+    text_ids = torch.zeros(1, 3, 4, dtype=torch.long)
+    mask = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    endpoint_a = ConditioningPackage(
+        "a",
+        torch.tensor([[[1.0, 0.0], [100.0, 100.0], [100.0, 100.0]]]),
+        text_ids,
+        mask,
+    )
+    endpoint_b = ConditioningPackage(
+        "b",
+        torch.tensor([[[0.0, 1.0], [100.0, 100.0], [100.0, 100.0]]]),
+        text_ids,
+        mask,
+    )
+    anchor = ConditioningPackage(
+        "anchor",
+        torch.tensor([[[1.0, 1.0], [-100.0, -100.0], [-100.0, -100.0]]]),
+        text_ids,
+        mask,
+    )
     similarity_a, similarity_b, reliability = prompt_anchor_reliability(
         anchor,
-        conditioning(2.0),
-        conditioning(-1.0),
+        endpoint_a,
+        endpoint_b,
     )
-    assert similarity_a == pytest.approx(1.0)
-    assert similarity_b == pytest.approx(-1.0)
-    assert reliability == pytest.approx(-1.0)
+    expected = 1.0 / math.sqrt(2.0)
+    assert similarity_a == pytest.approx(expected)
+    assert similarity_b == pytest.approx(expected)
+    assert reliability == pytest.approx(expected)
 
 
 def test_radial_frequency_descriptor_is_normalized() -> None:

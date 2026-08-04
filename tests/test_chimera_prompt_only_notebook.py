@@ -89,7 +89,7 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_BATCH_MEMORY_RESERVE_GIB = 2.0" in text
     assert "CHIMERA_DECODE_BATCH_SIZE = 10" in text
     assert 'CHIMERA_CONDITIONING_INTERPOLATION = "slerp"' in text
-    assert "CHIMERA_ALPHA_WARP_STRENGTH = 0.35" in text
+    assert "CHIMERA_ALPHA_WARP_STRENGTH = 0.0" in text
     assert "center_weighted_alpha_schedule(" in text
     assert '"alpha_warp_strength": CHIMERA_ALPHA_WARP_STRENGTH' in text
     assert "conditioning_interpolation=CHIMERA_CONDITIONING_INTERPOLATION" in text

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from flowmorph_klein.conditioning import build_conditioning_cache
+from flowmorph_klein.conditioning import (
+    build_conditioning_cache,
+    encode_prompt_conditioning,
+)
 
 
 def test_conditioning_cache_encodes_and_deduplicates_prompt_schedule() -> None:
@@ -32,3 +35,30 @@ def test_conditioning_cache_encodes_and_deduplicates_prompt_schedule() -> None:
     assert cache.prompt_schedule[-1] is cache.target
     assert pipeline.prompts == ["source", "target", "", "middle"]
     assert set(cache.prompt_hashes) >= {"source", "target", "schedule_000", "schedule_003"}
+
+
+def test_prompt_encoding_retains_klein_chat_attention_mask() -> None:
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert messages == [{"role": "user", "content": "masked prompt"}]
+            assert kwargs["add_generation_prompt"] is True
+            assert kwargs["enable_thinking"] is False
+            return "templated prompt"
+
+        def __call__(self, text, **kwargs):
+            assert text == "templated prompt"
+            assert kwargs["max_length"] == 4
+            return {"attention_mask": torch.tensor([[1, 1, 1, 0]])}
+
+    class FakePipeline:
+        tokenizer = FakeTokenizer()
+
+        def encode_prompt(self, **kwargs):
+            assert kwargs["prompt"] == "masked prompt"
+            return torch.ones(1, 4, 3), torch.zeros(1, 4, 4)
+
+    package = encode_prompt_conditioning(FakePipeline(), "masked prompt")
+
+    assert package.attention_mask is not None
+    assert package.attention_mask.dtype is torch.bool
+    assert package.attention_mask.tolist() == [[True, True, True, False]]

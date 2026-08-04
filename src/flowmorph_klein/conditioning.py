@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,7 @@ class ConditioningPackage:
     prompt: str | tuple[str, ...]
     prompt_embeds: torch.Tensor
     text_ids: torch.Tensor
+    attention_mask: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.prompt_embeds.ndim != 3:
@@ -35,6 +37,15 @@ class ConditioningPackage:
             raise ValueError("text_ids must have shape (batch, sequence, 4)")
         if self.prompt_embeds.shape[:2] != self.text_ids.shape[:2]:
             raise ValueError("prompt_embeds and text_ids batch/sequence dimensions must match")
+        if self.attention_mask is not None:
+            if self.attention_mask.ndim != 2:
+                raise ValueError("attention_mask must have shape (batch, sequence)")
+            if self.attention_mask.shape != self.prompt_embeds.shape[:2]:
+                raise ValueError(
+                    "attention_mask batch/sequence dimensions must match prompt_embeds"
+                )
+            if self.attention_mask.requires_grad:
+                raise ValueError("attention_mask must not require gradients")
         if self.prompt_embeds.requires_grad:
             raise ValueError("cached prompt embeddings must not require gradients")
 
@@ -86,16 +97,44 @@ class ConditioningPackage:
             non_blocking=non_blocking,
         )
         ids = self.text_ids.to(device=device, non_blocking=non_blocking)
-        return ConditioningPackage(self.prompt, embeds.detach(), ids.detach())
+        mask = (
+            self.attention_mask.to(device=device, non_blocking=non_blocking)
+            if self.attention_mask is not None
+            else None
+        )
+        return ConditioningPackage(
+            self.prompt,
+            embeds.detach(),
+            ids.detach(),
+            mask.detach() if mask is not None else None,
+        )
 
     def cpu(self) -> "ConditioningPackage":
         return self.to("cpu")
 
     def as_tensor_dict(self) -> dict[str, torch.Tensor]:
-        return {
+        tensors = {
             "prompt_embeds": self.prompt_embeds,
             "text_ids": self.text_ids,
         }
+        if self.attention_mask is not None:
+            tensors["attention_mask"] = self.attention_mask
+        return tensors
+
+
+def _full_attention_mask(package: ConditioningPackage) -> torch.Tensor:
+    """Return an explicit boolean mask, treating legacy packages as unpadded."""
+
+    if package.attention_mask is not None:
+        return package.attention_mask.to(
+            device=package.prompt_embeds.device,
+            dtype=torch.bool,
+        )
+    return torch.ones(
+        package.prompt_embeds.shape[:2],
+        device=package.prompt_embeds.device,
+        dtype=torch.bool,
+    )
 
 
 def stack_conditioning_packages(
@@ -118,10 +157,17 @@ def stack_conditioning_packages(
             prompts.extend(package.prompt)
         else:
             prompts.append(package.prompt)
+    attention_mask = None
+    if any(package.attention_mask is not None for package in packages):
+        attention_mask = torch.cat(
+            [_full_attention_mask(package) for package in packages],
+            dim=0,
+        ).detach()
     return ConditioningPackage(
         prompt=tuple(prompts),
         prompt_embeds=torch.cat([package.prompt_embeds for package in packages], dim=0).detach(),
         text_ids=torch.cat([package.text_ids for package in packages], dim=0).detach(),
+        attention_mask=attention_mask,
     )
 
 
@@ -253,7 +299,74 @@ def encode_prompt_conditioning(
     prompt_embeds, text_ids = output[:2]
     if not isinstance(prompt_embeds, torch.Tensor) or not isinstance(text_ids, torch.Tensor):
         raise TypeError("pipeline.encode_prompt() outputs must be torch tensors")
-    return ConditioningPackage(recorded_prompt, prompt_embeds.detach(), text_ids.detach())
+    attention_mask = _encode_prompt_attention_mask(
+        pipeline,
+        prompt_value,
+        sequence_length=int(prompt_embeds.shape[1]),
+        num_images_per_prompt=num_images_per_prompt,
+        device=prompt_embeds.device,
+    )
+    return ConditioningPackage(
+        recorded_prompt,
+        prompt_embeds.detach(),
+        text_ids.detach(),
+        attention_mask,
+    )
+
+
+def _encode_prompt_attention_mask(
+    pipeline: Any,
+    prompt: str | list[str],
+    *,
+    sequence_length: int,
+    num_images_per_prompt: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Reproduce Klein's Qwen chat tokenization to retain its discarded mask.
+
+    The pinned Diffusers pipeline returns only embeddings and text position IDs
+    from ``encode_prompt``. SAP also needs to know which of the 512 positions
+    are real chat/prompt tokens, so the inexpensive tokenization step is
+    repeated here without invoking the text encoder again. Pipelines without a
+    compatible tokenizer retain the legacy ``None`` mask for test and custom
+    backends.
+    """
+
+    tokenizer = getattr(pipeline, "tokenizer", None)
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if tokenizer is None or not callable(tokenizer) or not callable(apply_chat_template):
+        return None
+    prompts = [prompt] if isinstance(prompt, str) else prompt
+    masks: list[torch.Tensor] = []
+    for value in prompts:
+        text = apply_chat_template(
+            [{"role": "user", "content": value}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        tokenized = tokenizer(
+            text,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=sequence_length,
+        )
+        if not isinstance(tokenized, Mapping) or "attention_mask" not in tokenized:
+            raise TypeError("Klein tokenizer must return an attention_mask")
+        mask = tokenized["attention_mask"]
+        if not isinstance(mask, torch.Tensor) or mask.shape != (1, sequence_length):
+            raise ValueError(
+                "Klein tokenizer attention_mask disagrees with encoded prompt length"
+            )
+        masks.append(mask.to(dtype=torch.bool))
+    attention_mask = torch.cat(masks, dim=0)
+    batch_size = attention_mask.shape[0]
+    attention_mask = attention_mask.repeat(1, num_images_per_prompt).view(
+        batch_size * num_images_per_prompt,
+        sequence_length,
+    )
+    return attention_mask.to(device=device).detach()
 
 
 def build_conditioning_cache(
@@ -327,10 +440,17 @@ def interpolate_conditioning(
         dtype=source.prompt_embeds.dtype,
     )
     embeds = torch.lerp(source.prompt_embeds, target_embeds, alpha).detach()
+    attention_mask = None
+    if source.attention_mask is not None or target.attention_mask is not None:
+        attention_mask = (
+            _full_attention_mask(source)
+            | _full_attention_mask(target).to(device=source.prompt_embeds.device)
+        ).detach()
     return ConditioningPackage(
         prompt=(f"interpolated:{alpha:.8g}",),
         prompt_embeds=embeds,
         text_ids=source.text_ids.detach(),
+        attention_mask=attention_mask,
     )
 
 

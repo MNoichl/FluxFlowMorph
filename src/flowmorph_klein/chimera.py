@@ -1119,9 +1119,12 @@ class FluxFeatureController:
         self._source: ChimeraEndpointCache | None = None
         self._target: ChimeraEndpointCache | None = None
         self._inject_step: int | None = None
-        self._inject_group: GroupName | None = None
+        self._inject_cache_group: GroupName | None = None
         self._inject_alphas: Tensor | None = None
         self._inject_weight = 0.0
+        self._inject_cached_features: dict[
+            tuple[torch.device, torch.dtype, int], Tensor
+        ] = {}
 
     def __enter__(self) -> "FluxFeatureController":
         if self._handles:
@@ -1167,19 +1170,12 @@ class FluxFeatureController:
                     self._capture_step
                 ] = StoredFeature.from_tensor(feature, self.storage)
                 return output
-            if self._mode != "inject" or self._inject_group != group:
+            if self._mode != "inject":
                 return output
             assert self._source is not None and self._target is not None
             assert self._inject_step is not None and self._inject_alphas is not None
+            assert self._inject_cache_group is not None
             image = _output_image_tensor(output, self.image_token_count)
-            source = self._source.feature(group, self._inject_step).materialize(
-                device=image.device,
-                dtype=image.dtype,
-            )
-            target = self._target.feature(group, self._inject_step).materialize(
-                device=image.device,
-                dtype=image.dtype,
-            )
             alphas = self._inject_alphas
             if image.shape[0] == 2 * alphas.numel():
                 # predict_cfg_velocity concatenates [conditional, unconditional].
@@ -1189,10 +1185,28 @@ class FluxFeatureController:
                     "ACI alpha batch does not match transformer feature batch: "
                     f"{alphas.numel()} versus {image.shape[0]}"
                 )
-            cached = _batch_slerp(source, target, alphas).to(
-                device=image.device,
-                dtype=image.dtype,
-            )
+            cache_key = (image.device, image.dtype, image.shape[0])
+            cached = self._inject_cached_features.get(cache_key)
+            if cached is None:
+                source = self._source.feature(
+                    self._inject_cache_group,
+                    self._inject_step,
+                ).materialize(device=image.device, dtype=image.dtype)
+                target = self._target.feature(
+                    self._inject_cache_group,
+                    self._inject_step,
+                ).materialize(device=image.device, dtype=image.dtype)
+                cached = _batch_slerp(source, target, alphas).to(
+                    device=image.device,
+                    dtype=image.dtype,
+                )
+                self._inject_cached_features[cache_key] = cached
+            if cached.shape != image.shape:
+                raise ValueError(
+                    "selected ACI cache is incompatible with representative "
+                    f"{group} feature shape: {tuple(cached.shape)} versus "
+                    f"{tuple(image.shape)}"
+                )
             updated_image = image + self._inject_weight * cached
             tensor = output[-1] if isinstance(output, (tuple, list)) else output
             updated = tensor.clone()
@@ -1258,9 +1272,10 @@ class FluxFeatureController:
         self._source = source
         self._target = target
         self._inject_step = int(inversion_step)
-        self._inject_group = group
+        self._inject_cache_group = group
         self._inject_alphas = torch.as_tensor(alphas, dtype=torch.float64).reshape(-1)
         self._inject_weight = float(weight)
+        self._inject_cached_features.clear()
         try:
             yield
         finally:
@@ -1268,9 +1283,10 @@ class FluxFeatureController:
             self._source = None
             self._target = None
             self._inject_step = None
-            self._inject_group = None
+            self._inject_cache_group = None
             self._inject_alphas = None
             self._inject_weight = 0.0
+            self._inject_cached_features.clear()
 
     def endpoint_cache(
         self,
@@ -1459,23 +1475,75 @@ def append_anchor_conditioning(
     *,
     max_anchor_tokens: int | None = None,
 ) -> ConditioningPackage:
-    """Implement SAP by appending anchor tokens to the active text context."""
+    """Append valid, coverage-preserving SAP tokens to the active context.
+
+    Klein right-pads Qwen conditioning to 512 positions. Padding is excluded,
+    and a capped anchor is sampled across its complete valid chat sequence so
+    both the prompt prefix and final generation marker survive instead of
+    blindly retaining only the first tokens.
+    """
 
     if base.prompt_embeds.shape[2] != anchor.prompt_embeds.shape[2]:
         raise ValueError("base and anchor embedding widths must match")
-    count = anchor.sequence_length
+    anchor_mask = (
+        anchor.attention_mask.to(device=anchor.prompt_embeds.device, dtype=torch.bool)
+        if anchor.attention_mask is not None
+        else torch.ones(
+            anchor.prompt_embeds.shape[:2],
+            device=anchor.prompt_embeds.device,
+            dtype=torch.bool,
+        )
+    )
+    valid_positions = [
+        torch.nonzero(row, as_tuple=False).reshape(-1)
+        for row in anchor_mask
+    ]
+    if any(positions.numel() == 0 for positions in valid_positions):
+        raise ValueError("anchor conditioning contains no valid text tokens")
+    count = min(int(positions.numel()) for positions in valid_positions)
     if max_anchor_tokens is not None:
         if max_anchor_tokens < 1:
             raise ValueError("max_anchor_tokens must be positive")
         count = min(count, max_anchor_tokens)
-    anchor_embeds = anchor.prompt_embeds[:, :count]
-    anchor_ids = anchor.text_ids[:, :count]
+    selected_positions = torch.stack(
+        [
+            positions[
+                torch.linspace(
+                    0,
+                    positions.numel() - 1,
+                    steps=count,
+                    device=positions.device,
+                ).round().to(dtype=torch.long)
+            ]
+            for positions in valid_positions
+        ],
+        dim=0,
+    )
+    anchor_embeds = torch.gather(
+        anchor.prompt_embeds,
+        1,
+        selected_positions.unsqueeze(-1).expand(-1, -1, anchor.feature_width),
+    )
+    anchor_ids = torch.gather(
+        anchor.text_ids,
+        1,
+        selected_positions.unsqueeze(-1).expand(-1, -1, anchor.text_ids.shape[-1]),
+    )
     batch = base.batch_size
     if anchor_embeds.shape[0] == 1 and batch > 1:
         anchor_embeds = anchor_embeds.expand(batch, -1, -1)
         anchor_ids = anchor_ids.expand(batch, -1, -1)
     elif anchor_embeds.shape[0] != batch:
         raise ValueError("anchor conditioning batch must be one or match the base batch")
+    base_mask = (
+        base.attention_mask.to(device=base.prompt_embeds.device, dtype=torch.bool)
+        if base.attention_mask is not None
+        else torch.ones(
+            base.prompt_embeds.shape[:2],
+            device=base.prompt_embeds.device,
+            dtype=torch.bool,
+        )
+    )
     return ConditioningPackage(
         prompt=(f"sap:{base.prompt!r}+{anchor.prompt!r}",),
         prompt_embeds=torch.cat(
@@ -1492,6 +1560,17 @@ def append_anchor_conditioning(
             (base.text_ids, anchor_ids.to(device=base.text_ids.device)),
             dim=1,
         ).detach(),
+        attention_mask=torch.cat(
+            (
+                base_mask,
+                torch.ones(
+                    (batch, count),
+                    device=base_mask.device,
+                    dtype=torch.bool,
+                ),
+            ),
+            dim=1,
+        ).detach(),
     )
 
 
@@ -1500,7 +1579,14 @@ def prompt_anchor_reliability(
     endpoint_a: ConditioningPackage,
     endpoint_b: ConditioningPackage,
 ) -> tuple[float, float, float]:
-    """Flux-native pooled-embedding proxy for CHIMERA's CLIP reliability gate."""
+    """Return endpoint cosines and a Qwen-native normalized bridge score.
+
+    Padding is excluded before pooling. The final reliability score measures
+    how much the anchor improves upon the endpoint-to-endpoint cosine, scaled
+    so zero equals the direct endpoint baseline and one equals identity with
+    each endpoint. This makes the configurable threshold meaningful without
+    copying the paper's CLIP-specific cosine scale onto Qwen hidden states.
+    """
 
     widths = {
         anchor.feature_width,
@@ -1511,14 +1597,34 @@ def prompt_anchor_reliability(
         raise ValueError("anchor and endpoint embedding widths must match")
 
     def pooled(package: ConditioningPackage) -> Tensor:
-        return package.prompt_embeds.float().mean(dim=1).mean(dim=0)
+        embeds = package.prompt_embeds.float()
+        mask = (
+            package.attention_mask.to(device=embeds.device, dtype=torch.bool)
+            if package.attention_mask is not None
+            else torch.ones(embeds.shape[:2], device=embeds.device, dtype=torch.bool)
+        )
+        weights = mask.unsqueeze(-1).to(dtype=embeds.dtype)
+        per_prompt = (embeds * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        return per_prompt.mean(dim=0)
+
+    def cosine(a: Tensor, b: Tensor) -> float:
+        return float(torch.nn.functional.cosine_similarity(a, b, dim=0).item())
 
     anchor_vector = pooled(anchor)
     a_vector = pooled(endpoint_a).to(anchor_vector.device)
     b_vector = pooled(endpoint_b).to(anchor_vector.device)
-    similarity_a = float(torch.nn.functional.cosine_similarity(anchor_vector, a_vector, dim=0).item())
-    similarity_b = float(torch.nn.functional.cosine_similarity(anchor_vector, b_vector, dim=0).item())
-    return similarity_a, similarity_b, min(similarity_a, similarity_b)
+    similarity_a = cosine(anchor_vector, a_vector)
+    similarity_b = cosine(anchor_vector, b_vector)
+    endpoint_similarity = cosine(a_vector, b_vector)
+    remaining = 1.0 - endpoint_similarity
+    if remaining <= 1e-6:
+        reliability = min(similarity_a, similarity_b)
+    else:
+        reliability = min(
+            (similarity_a - endpoint_similarity) / remaining,
+            (similarity_b - endpoint_similarity) / remaining,
+        )
+    return similarity_a, similarity_b, max(-1.0, min(1.0, reliability))
 
 
 def interpolate_chimera_conditioning(
@@ -1554,6 +1660,7 @@ def interpolate_chimera_conditioning(
         prompt=(f"chimera-slerp:{alpha:.8g}",),
         prompt_embeds=embeds,
         text_ids=linear.text_ids,
+        attention_mask=linear.attention_mask,
     )
 
 
@@ -1616,21 +1723,25 @@ def smooth_velocity_along_alpha(
     left_distance = amounts[1:-1] - amounts[:-2]
     right_distance = amounts[2:] - amounts[1:-1]
     span = left_distance + right_distance
+    # Preserve sub-bfloat16 trajectory corrections through the Euler update.
+    # The transformer still runs in its native dtype; only this small
+    # alpha-neighbour calculation and the returned velocity stay float32.
+    working = velocity.float()
     left_weight = (right_distance / span).to(
         device=velocity.device,
-        dtype=velocity.dtype,
+        dtype=torch.float32,
     ).reshape(-1, 1, 1)
     right_weight = (left_distance / span).to(
         device=velocity.device,
-        dtype=velocity.dtype,
+        dtype=torch.float32,
     ).reshape(-1, 1, 1)
     neighbour_linear = (
-        left_weight * velocity[:-2]
-        + right_weight * velocity[2:]
+        left_weight * working[:-2]
+        + right_weight * working[2:]
     )
-    result = velocity.clone()
+    result = working.clone()
     result[1:-1] = torch.lerp(
-        velocity[1:-1],
+        working[1:-1],
         neighbour_linear,
         float(strength),
     )
@@ -1655,6 +1766,11 @@ def _slice_conditioning(
         sliced_prompt,
         conditioning.prompt_embeds[start:stop].detach(),
         conditioning.text_ids[start:stop].detach(),
+        (
+            conditioning.attention_mask[start:stop].detach()
+            if conditioning.attention_mask is not None
+            else None
+        ),
     )
 
 

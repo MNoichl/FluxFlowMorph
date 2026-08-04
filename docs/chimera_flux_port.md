@@ -22,11 +22,11 @@ The implementation follows the paper's algorithm:
 4. Spherically interpolate both endpoint latents and endpoint caches.
 5. Use a linear inversion-denoising timestep mapping (IDM) when retrieving a
    cache during forward denoising.
-6. Add the interpolated feature as an ACI residual with the published default
-   weight `0.4`.
-7. Construct an anchor-correlated prompt triplet with a VLM, require a minimum
-   endpoint-anchor cosine similarity of `0.45`, and append the shared anchor
-   tokens during the first `20%` of denoising steps only.
+6. Add the LTM-selected interpolated feature as an ACI residual at all three
+   representative FLUX depth groups with the published default weight `0.4`.
+7. Generate one image-aware intermediate/SAP prompt per pair with a VLM,
+   require a normalized endpoint-relative bridge score of `0.45`, and append
+   its valid anchor tokens during the first `20%` of denoising steps only.
 
 The notebook uses the paper's FLUX setting: the native Euler flow-matching
 sampler with 50 inversion and 50 denoising steps. LoRA activation, model
@@ -72,9 +72,11 @@ together. A radius-one temporal mean suppresses single-step spectral jitter.
 The independent minimum-L1 matches remain in the calibration report; a
 constrained fit turns healthy matches into one monotonic early-to-middle-to-
 late schedule. A collapsed one-group argmin is rejected and transparently
-falls back to fixed coarse-to-fine thirds. Hooks cache and inject image tokens
-only; SAP may change the number of text tokens without invalidating the
-image-feature boundary.
+falls back to fixed coarse-to-fine thirds. Hooks cache image tokens only. At
+render time, the LTM-selected cache is injected at the early, middle, and late
+representatives, matching CHIMERA's all-group ACI structure while retaining a
+bounded FLUX hook set. SAP may change the number of text tokens without
+invalidating the image-feature boundary.
 
 The production notebook calibrates on a configurable set of unique, evenly spaced anchors
 from the active cycle; requesting more anchors than exist never duplicates a
@@ -126,7 +128,9 @@ alpha trajectory in memory-bounded microbatches. It then pulls each interior
 velocity toward the alpha-aware linear interpolation of both neighbours before
 performing the Euler update. The first and last interior velocities remain
 unchanged, and reversing the endpoint direction produces the reversed
-smoothing operation.
+smoothing operation. Neighbour interpolation and the resulting Euler velocity
+remain float32, so weak corrections are not repeatedly rounded away in
+bfloat16 even though transformer inference retains its native model dtype.
 
 This loop ordering is important: microbatches limit transformer activation
 memory but are not allowed to define independent trajectory segments. A
@@ -137,16 +141,21 @@ can be audited rather than inferred from the output images.
 ## Semantic Anchor Prompting
 
 The original prompt-only notebook already used a signed API call to create
-image-aware midpoint text. The CHIMERA notebook replaces that contract with
-three mutually correlated prompts: a shared semantic/structural anchor and two
-anchor-conditioned endpoint descriptions. Reliability is measured with pooled
-FLUX text embeddings rather than the paper's CLIP text encoder, avoiding a
-second text model and keeping the gate aligned with the generator actually in
-use. Weak triplets trigger at most three bounded re-queries.
+image-aware midpoint text. The CHIMERA notebook sends both endpoint prompts
+and images to the VLM and requests one stable intermediate/SAP prompt per
+pair; authored endpoint prompts are not rewritten. Reliability is measured
+from padding-masked FLUX text embeddings rather than the paper's CLIP text
+encoder. The score is normalized relative to the endpoint-to-endpoint cosine:
+zero is the direct endpoint baseline and one is identity with both endpoints.
+This gives the `0.45` threshold a generator-native meaning instead of copying
+a CLIP-specific cosine scale. Weak proposals trigger at most three bounded
+re-queries.
 
-SAP is implemented by concatenating up to 64 anchor embedding tokens to the
-conditional text context during the first 20% of Euler steps. Early SAP steps
-use sequential external CFG because conditional and unconditional token counts
+SAP is implemented by concatenating up to 64 valid anchor embedding tokens to
+the conditional text context during the first 20% of Euler steps. Padding is
+excluded, and capped prompts are sampled across the complete valid Qwen chat
+sequence rather than truncated at the first 64 positions. Early SAP steps use
+sequential external CFG because conditional and unconditional token counts
 differ; later steps return to the configured batched CFG path.
 
 Endpoint prompt embeddings follow a norm-preserving spherical interpolation
@@ -159,15 +168,14 @@ linear-conditioning results cannot be silently reused as SLERP results.
 
 ## Perceptual spacing and video timing
 
-Uniform CHIMERA coefficients can put too few samples around a fast semantic
-transition. The notebook therefore uses an endpoint-preserving sinusoidal
-schedule by default:
+The notebook supports an endpoint-preserving sinusoidal experimental schedule:
 
 `alpha(u) = u + s * sin(2*pi*u) / (2*pi)`
 
-`CHIMERA_ALPHA_WARP_STRENGTH=0.35` moves samples on either side toward the
-midpoint while retaining the same number of FLUX renders. Set it to `0` for
-the original uniform schedule. The strength is stored in pair fingerprints and
+Positive `CHIMERA_ALPHA_WARP_STRENGTH` moves samples on either side toward the
+midpoint while retaining the same number of FLUX renders. The active setting
+is `0`, restoring uniform CHIMERA coefficients and avoiding enlarged gaps next
+to the real endpoint anchors. The strength is stored in pair fingerprints and
 manifests, so cached uniform results cannot be mistaken for warped results.
 
 RIFE then measures reduced-resolution mean pixelwise CIE76 distance for every
