@@ -269,13 +269,29 @@ def test_one_gap_quality_gate_matches_production_schedule_and_correction() -> No
     assert '"alpha_warp_strength": CHIMERA_ALPHA_WARP_STRENGTH' in code
 
 
-def test_sap_triplet_is_image_aware_reliable_and_bounded() -> None:
-    code = code_source(load_notebook())
-    assert "class ChimeraPromptTriplet(BaseModel):" in code
-    assert "anchor_prompt:" in code
-    assert "prompt_a:" in code
-    assert "prompt_b:" in code
+def test_sap_uses_one_image_aware_intermediate_prompt_per_pair() -> None:
+    notebook = load_notebook()
+    code = code_source(notebook)
+    sap_cell = next(
+        cell for cell in notebook["cells"] if cell.get("id") == "prompt-only-chimera-17"
+    )
+    sap_source = "".join(sap_cell["source"])
+    assert 'CHIMERA_INTERMEDIATE_PROMPT_MODE = "openai_per_pair"' in code
+    assert "class ChimeraIntermediateProposal(BaseModel):" in code
+    assert "intermediate_prompt:" in code
     assert '"type": "input_image"' in code
+    assert "propose_chimera_intermediate(" in code
+    assert "OPENAI_INTERMEDIATE_PROMPT_COUNT += len(pair_jobs)" in code
+    assert "proposal.prompt_a" not in code
+    assert "proposal.prompt_b" not in code
+    assert 'PROMPT_CONDITIONING_CACHE[job["left"]["prompt"]]' in code
+    assert 'PROMPT_CONDITIONING_CACHE[job["right"]["prompt"]]' in code
+    assert "anchor_conditioning=PROMPT_CONDITIONING_CACHE[proposal.intermediate_prompt]" in code
+    assert 'clean.startswith(f"{LORA_TRIGGER},")' in code
+    assert "contain the LoRA trigger exactly once" in code
+    assert "seventeenth-century Dutch Baroque" not in sap_source
+    assert "Keep sparse scenes sparse" in sap_source
+    assert "The authored endpoint prompts are immutable" in sap_source
     assert "prompt_anchor_reliability(" in code
     assert "CHIMERA_SAP_MAX_REQUERIES" in code
     assert "reliability >= CHIMERA_ANCHOR_RELIABILITY_THRESHOLD" in code
