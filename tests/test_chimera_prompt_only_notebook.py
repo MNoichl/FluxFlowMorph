@@ -313,7 +313,9 @@ def test_glcs_and_existing_rife_finishing_stack_are_available() -> None:
     assert 'CHIMERA_DINO_MODEL_ID = "facebook/dinov2-base"' in code
     assert "compute_glcs_from_similarities" in code
     assert "RUN_RIFE_POSTPROCESS = True" in code
-    assert "RIFE_MULTIPLIER = int(round(2 * VIDEO_SLOWDOWN_FACTOR))" in code
+    assert "VIDEO_SLOWDOWN_FACTOR = 4.0" in code
+    assert "SOURCE_SEQUENCE_FPS = 12.0 / VIDEO_SLOWDOWN_FACTOR" in code
+    assert "RIFE_MULTIPLIER = 24" in code
     assert "RIFE_PERCEPTUAL_ALLOCATION = True" in code
     assert "allocate_perceptual_subdivisions(" in code
     assert '"--multipliers-json", str(RIFE_ALLOCATION_PATH)' in code

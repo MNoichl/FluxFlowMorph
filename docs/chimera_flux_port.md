@@ -176,7 +176,12 @@ edges more interpolation subdivisions and smaller edges fewer, subject to a
 minimum, maximum, and robust median-relative distance cap. Its integer
 allocation preserves exactly `pair_count * RIFE_MULTIPLIER` subdivisions, so
 adaptive allocation does not increase the total RIFE image budget. The
-existing dense circular SSIM resampling remains as a final timing pass.
+existing dense circular SSIM resampling remains as a final timing pass. The
+active notebook renders 24 dense RIFE candidates per source edge, then selects
+an average of eight at 24 fps for an exact fourfold slowdown from the nominal
+12 fps source sequence. Dense candidate count and playback duration are kept
+separate so additional RIFE work improves temporal selection without silently
+making the output slower.
 
 The optional temporal correction stage also provides a chroma-only mode,
 enabled in the CHIMERA notebook independently of its luminance/contrast
