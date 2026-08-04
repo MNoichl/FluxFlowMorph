@@ -11,6 +11,7 @@ from flowmorph_klein.chimera import (
     ChimeraConfig,
     ChimeraEndpointCache,
     FluxFeatureController,
+    LTM_CALIBRATION_VERSION,
     LTMCalibration,
     LTMPrototypeAccumulator,
     StoredFeature,
@@ -22,8 +23,10 @@ from flowmorph_klein.chimera import (
     flux_depth_ltm,
     invert_endpoint,
     interpolate_chimera_conditioning,
+    ltm_mapping_report,
     map_denoising_to_inversion_step,
     match_ltm_prototypes,
+    match_monotonic_ltm_prototypes,
     nearest_cached_step,
     prompt_anchor_reliability,
     radial_frequency_descriptor,
@@ -234,8 +237,33 @@ def test_fft_ltm_prototype_matching_and_roundtrip_are_deterministic() -> None:
         mapping=mapping,
     )
     restored = LTMCalibration.from_dict(calibration.to_dict())
+    assert calibration.version == 1
+    assert "mapping_strategy" not in calibration.to_dict()
     assert restored == calibration
     assert restored.fingerprint == calibration.fingerprint
+
+
+def test_monotonic_ltm_matching_selects_contiguous_coarse_to_fine_regions() -> None:
+    layers = {
+        "early": [1.0, 0.0, 0.0],
+        "middle": [0.0, 1.0, 0.0],
+        "late": [0.0, 0.0, 1.0],
+    }
+    timesteps = (
+        [0.9, 0.1, 0.0],
+        [0.8, 0.2, 0.0],
+        [0.1, 0.8, 0.1],
+        [0.0, 0.7, 0.3],
+        [0.0, 0.2, 0.8],
+        [0.0, 0.1, 0.9],
+    )
+
+    mapping = match_monotonic_ltm_prototypes(layers, timesteps, bands=3)
+    report = ltm_mapping_report(mapping)
+
+    assert mapping == ("early", "early", "middle", "middle", "late", "late")
+    assert report["group_counts"] == {"early": 2, "middle": 2, "late": 2}
+    assert report["monotonic_coarse_to_fine"] is True
 
 
 def test_ltm_accumulator_builds_dataset_level_layer_and_timestep_means() -> None:
@@ -251,12 +279,78 @@ def test_ltm_accumulator_builds_dataset_level_layer_and_timestep_means() -> None
                     [1.0 + group_index, 1.0 + step, 1.0 + sample_offset]
                 )
                 accumulator.add(group, step, descriptor)
+            accumulator.add_timestep(
+                step,
+                torch.tensor([1.0 + step, 2.0 - step, 1.0 + sample_offset]),
+            )
     calibration = accumulator.finalize()
 
+    assert calibration.version == LTM_CALIBRATION_VERSION
+    assert calibration.descriptor_normalized is True
     assert calibration.sample_count == 2
     assert calibration.step_count == 2
     assert calibration.group_module_map == {"early": "e", "middle": "m", "late": "l"}
     assert len(calibration.mapping) == 2
+
+
+def test_ltm_accumulator_rejects_collapsed_fft_mapping_with_fixed_fallback() -> None:
+    accumulator = LTMPrototypeAccumulator(
+        step_count=6,
+        group_modules={"early": "e", "middle": "m", "late": "l"},
+        bands=3,
+    )
+    layer_descriptors = {
+        "early": torch.tensor([1.0, 0.0, 0.0]),
+        "middle": torch.tensor([0.0, 1.0, 0.0]),
+        "late": torch.tensor([0.0, 0.0, 1.0]),
+    }
+    for step in range(6):
+        for group, descriptor in layer_descriptors.items():
+            accumulator.add(group, step, descriptor)
+        accumulator.add_timestep(step, layer_descriptors["middle"])
+
+    calibration = accumulator.finalize()
+
+    assert calibration.mapping_strategy == "fixed_coarse_to_fine_fallback"
+    assert calibration.mapping == (
+        "early",
+        "early",
+        "middle",
+        "middle",
+        "late",
+        "late",
+    )
+    assert calibration.independent_mapping == ("middle",) * 6
+    assert calibration.fallback_reason is not None
+    assert calibration.mapping_report["groups_used"] == 3
+    restored = LTMCalibration.from_dict(calibration.to_dict())
+    assert restored == calibration
+    assert restored.fingerprint == calibration.fingerprint
+
+
+def test_ltm_accumulator_uses_monotonic_fft_mapping_when_spectra_are_healthy() -> None:
+    accumulator = LTMPrototypeAccumulator(
+        step_count=6,
+        group_modules={"early": "e", "middle": "m", "late": "l"},
+        bands=3,
+    )
+    descriptors = {
+        "early": torch.tensor([1.0, 0.0, 0.0]),
+        "middle": torch.tensor([0.0, 1.0, 0.0]),
+        "late": torch.tensor([0.0, 0.0, 1.0]),
+    }
+    expected = ("early", "early", "middle", "middle", "late", "late")
+    for step, active_group in enumerate(expected):
+        for group, descriptor in descriptors.items():
+            accumulator.add(group, step, descriptor)
+        accumulator.add_timestep(step, descriptors[active_group])
+
+    calibration = accumulator.finalize()
+
+    assert calibration.mapping_strategy == "fft_monotonic"
+    assert calibration.fallback_reason is None
+    assert calibration.mapping == expected
+    assert calibration.mapping_report["monotonic_coarse_to_fine"] is True
 
 
 def test_sparse_cache_always_captures_calibrated_group_transitions() -> None:

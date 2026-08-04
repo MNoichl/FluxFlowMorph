@@ -55,6 +55,9 @@ CacheStorage = Literal["int8", "float16", "bfloat16", "float32"]
 GroupName = Literal["early", "middle", "late"]
 LTMMode = Literal["fft", "linear"]
 ConditioningInterpolation = Literal["linear", "slerp"]
+LTM_CALIBRATION_VERSION = 2
+LTM_MINIMUM_GROUP_FRACTION = 0.10
+LTM_TIMESTEP_SMOOTHING_RADIUS = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +327,35 @@ def _finite_descriptor(values: Sequence[float] | Tensor, *, bands: int) -> Tenso
     return descriptor
 
 
+def _normalized_descriptor(values: Sequence[float] | Tensor, *, bands: int) -> Tensor:
+    descriptor = _finite_descriptor(values, bands=bands)
+    total = descriptor.sum()
+    if float(total.item()) <= torch.finfo(descriptor.dtype).eps:
+        raise ValueError("frequency descriptor must contain positive spectral energy")
+    return descriptor / total
+
+
+def _smooth_timestep_descriptors(values: Tensor, *, radius: int) -> Tensor:
+    if values.ndim != 2:
+        raise ValueError("timestep descriptor matrix must have shape (steps, bands)")
+    if radius < 0:
+        raise ValueError("timestep smoothing radius must be non-negative")
+    if radius == 0 or values.shape[0] == 1:
+        return values.clone()
+    smoothed = torch.stack(
+        [
+            values[max(0, index - radius) : min(values.shape[0], index + radius + 1)].mean(
+                dim=0
+            )
+            for index in range(values.shape[0])
+        ]
+    )
+    return smoothed / torch.clamp(
+        smoothed.sum(dim=1, keepdim=True),
+        min=torch.finfo(smoothed.dtype).eps,
+    )
+
+
 def match_ltm_prototypes(
     layer_prototypes: Mapping[GroupName, Sequence[float] | Tensor],
     timestep_prototypes: Sequence[Sequence[float] | Tensor],
@@ -357,6 +389,110 @@ def match_ltm_prototypes(
     return tuple(mapping)
 
 
+def match_monotonic_ltm_prototypes(
+    layer_prototypes: Mapping[GroupName, Sequence[float] | Tensor],
+    timestep_prototypes: Sequence[Sequence[float] | Tensor],
+    *,
+    bands: int,
+    minimum_group_fraction: float = LTM_MINIMUM_GROUP_FRACTION,
+) -> tuple[GroupName, ...]:
+    """Find the lowest-cost contiguous coarse-to-fine FLUX depth schedule.
+
+    Independent FFT argmins can oscillate between transformer depths even
+    though diffusion denoising progresses from coarse structure to fine
+    detail.  This constrained fit chooses two transition points while
+    requiring a small, non-zero dwell in each depth group.
+    """
+
+    if not 0.0 <= minimum_group_fraction < 1.0 / 3.0:
+        raise ValueError("minimum_group_fraction must lie in [0, 1/3)")
+    if bands < 2:
+        raise ValueError("bands must be at least two")
+    if set(layer_prototypes) != set(CHIMERA_GROUPS):
+        raise ValueError("layer prototypes must contain early, middle, and late")
+    if not timestep_prototypes:
+        raise ValueError("at least one timestep prototype is required")
+
+    step_count = len(timestep_prototypes)
+    if step_count < 3:
+        return tuple(flux_depth_ltm(index, step_count) for index in range(step_count))
+    layers = {
+        group: _finite_descriptor(layer_prototypes[group], bands=bands)
+        for group in CHIMERA_GROUPS
+    }
+    distances = torch.stack(
+        [
+            torch.stack(
+                [
+                    torch.sum(
+                        torch.abs(
+                            layers[group]
+                            - _finite_descriptor(values, bands=bands)
+                        )
+                    )
+                    for group in CHIMERA_GROUPS
+                ]
+            )
+            for values in timestep_prototypes
+        ]
+    )
+    prefix = torch.cat(
+        [
+            torch.zeros(1, len(CHIMERA_GROUPS), dtype=distances.dtype),
+            torch.cumsum(distances, dim=0),
+        ],
+        dim=0,
+    )
+    minimum_dwell = max(1, int(math.ceil(step_count * minimum_group_fraction)))
+    candidates: list[tuple[float, int, int]] = []
+    for first_transition in range(
+        minimum_dwell,
+        step_count - 2 * minimum_dwell + 1,
+    ):
+        for second_transition in range(
+            first_transition + minimum_dwell,
+            step_count - minimum_dwell + 1,
+        ):
+            cost = (
+                prefix[first_transition, 0]
+                + (prefix[second_transition, 1] - prefix[first_transition, 1])
+                + (prefix[step_count, 2] - prefix[second_transition, 2])
+            )
+            candidates.append(
+                (float(cost.item()), first_transition, second_transition)
+            )
+    if not candidates:
+        return tuple(flux_depth_ltm(index, step_count) for index in range(step_count))
+    _, first_transition, second_transition = min(candidates)
+    return (
+        ("early",) * first_transition
+        + ("middle",) * (second_transition - first_transition)
+        + ("late",) * (step_count - second_transition)
+    )
+
+
+def ltm_mapping_report(mapping: Sequence[GroupName]) -> dict[str, Any]:
+    """Summarize depth coverage and coarse-to-fine ordering."""
+
+    values = tuple(mapping)
+    if not values:
+        raise ValueError("LTM mapping must not be empty")
+    if any(group not in CHIMERA_GROUPS for group in values):
+        raise ValueError("LTM mapping contains an unknown feature group")
+    indices = [CHIMERA_GROUPS.index(group) for group in values]
+    counts = {group: values.count(group) for group in CHIMERA_GROUPS}
+    return {
+        "step_count": len(values),
+        "group_counts": counts,
+        "groups_used": sum(count > 0 for count in counts.values()),
+        "monotonic_coarse_to_fine": all(
+            left <= right for left, right in zip(indices, indices[1:])
+        ),
+        "starts_with": values[0],
+        "ends_with": values[-1],
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class LTMCalibration:
     """Immutable FFT prototypes and the resulting FLUX layer lookup."""
@@ -368,6 +504,10 @@ class LTMCalibration:
     timestep_prototypes: tuple[tuple[float, ...], ...]
     mapping: tuple[GroupName, ...]
     descriptor_normalized: bool = False
+    version: int = 1
+    mapping_strategy: str = "independent"
+    independent_mapping: tuple[GroupName, ...] = ()
+    fallback_reason: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -392,6 +532,9 @@ class LTMCalibration:
             ),
         )
         object.__setattr__(self, "mapping", tuple(self.mapping))
+        object.__setattr__(self, "independent_mapping", tuple(self.independent_mapping))
+        if self.version not in {1, LTM_CALIBRATION_VERSION}:
+            raise ValueError("unsupported LTM calibration version")
         if self.bands < 2:
             raise ValueError("LTM calibration bands must be at least two")
         if self.sample_count < 1:
@@ -408,13 +551,34 @@ class LTMCalibration:
             raise ValueError("LTM calibration must contain timestep prototypes")
         for values in self.timestep_prototypes:
             _finite_descriptor(values, bands=self.bands)
-        expected = match_ltm_prototypes(
+        independent = match_ltm_prototypes(
             layers,
             self.timestep_prototypes,
             bands=self.bands,
         )
+        if not self.independent_mapping:
+            object.__setattr__(self, "independent_mapping", independent)
+        elif tuple(self.independent_mapping) != independent:
+            raise ValueError("stored independent LTM mapping does not match its prototypes")
+        if self.mapping_strategy == "independent":
+            expected = independent
+        elif self.mapping_strategy == "fft_monotonic":
+            expected = match_monotonic_ltm_prototypes(
+                layers,
+                self.timestep_prototypes,
+                bands=self.bands,
+            )
+        elif self.mapping_strategy == "fixed_coarse_to_fine_fallback":
+            expected = tuple(
+                flux_depth_ltm(index, len(self.timestep_prototypes))
+                for index in range(len(self.timestep_prototypes))
+            )
+            if not self.fallback_reason:
+                raise ValueError("fallback LTM calibration must record its reason")
+        else:
+            raise ValueError(f"unsupported LTM mapping strategy {self.mapping_strategy!r}")
         if tuple(self.mapping) != expected:
-            raise ValueError("LTM mapping does not match its stored FFT prototypes")
+            raise ValueError("LTM mapping does not match its stored strategy and prototypes")
 
     @property
     def step_count(self) -> int:
@@ -427,6 +591,14 @@ class LTMCalibration:
     @property
     def layer_prototype_map(self) -> dict[GroupName, tuple[float, ...]]:
         return dict(zip(CHIMERA_GROUPS, self.layer_prototypes, strict=True))
+
+    @property
+    def mapping_report(self) -> dict[str, Any]:
+        return ltm_mapping_report(self.mapping)
+
+    @property
+    def independent_mapping_report(self) -> dict[str, Any]:
+        return ltm_mapping_report(self.independent_mapping)
 
     @property
     def fingerprint(self) -> str:
@@ -443,8 +615,8 @@ class LTMCalibration:
         return self.mapping[step_index]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "version": 1,
+        payload = {
+            "version": self.version,
             "bands": self.bands,
             "sample_count": self.sample_count,
             "descriptor_normalized": self.descriptor_normalized,
@@ -456,10 +628,20 @@ class LTMCalibration:
             "timestep_prototypes": [list(values) for values in self.timestep_prototypes],
             "mapping": list(self.mapping),
         }
+        if self.version >= LTM_CALIBRATION_VERSION:
+            payload.update(
+                {
+                    "mapping_strategy": self.mapping_strategy,
+                    "independent_mapping": list(self.independent_mapping),
+                    "fallback_reason": self.fallback_reason,
+                }
+            )
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "LTMCalibration":
-        if int(payload.get("version", 0)) != 1:
+        version = int(payload.get("version", 0))
+        if version not in {1, LTM_CALIBRATION_VERSION}:
             raise ValueError("unsupported LTM calibration version")
         bands = int(payload["bands"])
         modules = payload["group_modules"]
@@ -478,6 +660,16 @@ class LTMCalibration:
                 for values in payload["timestep_prototypes"]
             ),
             mapping=tuple(str(group) for group in payload["mapping"]),
+            version=version,
+            mapping_strategy=str(payload.get("mapping_strategy", "independent")),
+            independent_mapping=tuple(
+                str(group) for group in payload.get("independent_mapping", ())
+            ),
+            fallback_reason=(
+                str(payload["fallback_reason"])
+                if payload.get("fallback_reason") is not None
+                else None
+            ),
         )
 
 
@@ -511,37 +703,91 @@ class LTMPrototypeAccumulator:
             self.step_count,
             dtype=torch.int64,
         )
+        self._timestep_sums = torch.zeros(
+            self.step_count,
+            self.bands,
+            dtype=torch.float64,
+        )
+        self._timestep_counts = torch.zeros(
+            self.step_count,
+            dtype=torch.int64,
+        )
 
     def add(self, group: GroupName, step_index: int, descriptor: Tensor) -> None:
         if group not in CHIMERA_GROUPS:
             raise ValueError(f"unknown CHIMERA group {group!r}")
         if not 0 <= step_index < self.step_count:
             raise IndexError("step_index is outside the calibration schedule")
-        values = _finite_descriptor(descriptor.detach().to("cpu"), bands=self.bands)
+        values = _normalized_descriptor(
+            descriptor.detach().to("cpu"),
+            bands=self.bands,
+        )
         group_index = CHIMERA_GROUPS.index(group)
         self._sums[group_index, step_index] += values
         self._counts[group_index, step_index] += 1
+
+    def add_timestep(self, step_index: int, descriptor: Tensor) -> None:
+        """Accumulate a dedicated model-output spectrum for one timestep."""
+
+        if not 0 <= step_index < self.step_count:
+            raise IndexError("step_index is outside the calibration schedule")
+        values = _normalized_descriptor(
+            descriptor.detach().to("cpu"),
+            bands=self.bands,
+        )
+        self._timestep_sums[step_index] += values
+        self._timestep_counts[step_index] += 1
 
     def finalize(self) -> LTMCalibration:
         if bool((self._counts == 0).any().item()):
             missing = int((self._counts == 0).sum().item())
             raise RuntimeError(f"LTM calibration is incomplete ({missing} group/timestep cells missing)")
+        if bool((self._timestep_counts == 0).any().item()):
+            missing = int((self._timestep_counts == 0).sum().item())
+            raise RuntimeError(
+                f"LTM timestep calibration is incomplete ({missing} timesteps missing)"
+            )
         unique_counts = torch.unique(self._counts)
         if unique_counts.numel() != 1:
             raise RuntimeError("LTM calibration samples are imbalanced across groups or timesteps")
         sample_count = int(unique_counts.item())
+        if not bool((self._timestep_counts == sample_count).all().item()):
+            raise RuntimeError("LTM layer and timestep calibration sample counts disagree")
         cell_means = self._sums / self._counts.unsqueeze(-1)
         layer_values = cell_means.mean(dim=1)
-        timestep_values = cell_means.mean(dim=0)
+        timestep_values = self._timestep_sums / self._timestep_counts.unsqueeze(-1)
+        timestep_values = _smooth_timestep_descriptors(
+            timestep_values,
+            radius=LTM_TIMESTEP_SMOOTHING_RADIUS,
+        )
         layer_map = {
             group: layer_values[index]
             for index, group in enumerate(CHIMERA_GROUPS)
         }
-        mapping = match_ltm_prototypes(
+        independent_mapping = match_ltm_prototypes(
             layer_map,
             tuple(timestep_values[index] for index in range(self.step_count)),
             bands=self.bands,
         )
+        independent_report = ltm_mapping_report(independent_mapping)
+        if independent_report["groups_used"] < 2:
+            mapping = tuple(
+                flux_depth_ltm(index, self.step_count)
+                for index in range(self.step_count)
+            )
+            mapping_strategy = "fixed_coarse_to_fine_fallback"
+            fallback_reason = (
+                "independent FFT argmin collapsed to "
+                f"{independent_report['groups_used']} of {len(CHIMERA_GROUPS)} groups"
+            )
+        else:
+            mapping = match_monotonic_ltm_prototypes(
+                layer_map,
+                tuple(timestep_values[index] for index in range(self.step_count)),
+                bands=self.bands,
+            )
+            mapping_strategy = "fft_monotonic"
+            fallback_reason = None
         return LTMCalibration(
             bands=self.bands,
             sample_count=sample_count,
@@ -555,7 +801,11 @@ class LTMPrototypeAccumulator:
                 for index in range(self.step_count)
             ),
             mapping=mapping,
-            descriptor_normalized=False,
+            descriptor_normalized=True,
+            version=LTM_CALIBRATION_VERSION,
+            mapping_strategy=mapping_strategy,
+            independent_mapping=independent_mapping,
+            fallback_reason=fallback_reason,
         )
 
 
@@ -771,7 +1021,7 @@ class FluxFeatureController:
                     feature,
                     bands=self._calibration_accumulator.bands,
                     channel_chunk_size=self._calibration_channel_chunk_size,
-                    normalize=False,
+                    normalize=True,
                 )
                 self._calibration_accumulator.add(
                     group,
@@ -980,6 +1230,15 @@ def calibrate_flux_ltm(
                         image_ids,
                         joint_attention_kwargs=joint_attention_kwargs,
                     )
+                accumulator.add_timestep(
+                    schedule_index,
+                    radial_frequency_descriptor(
+                        velocity,
+                        bands=bands,
+                        channel_chunk_size=channel_chunk_size,
+                        normalize=True,
+                    ),
+                )
                 current_sigma = float(schedule.sigmas[schedule_index + 1].item())
                 next_sigma = float(schedule.sigmas[schedule_index].item())
                 state = (
@@ -1695,9 +1954,9 @@ def radial_frequency_descriptor(
     FLUX features are token grids.  Square token counts use their natural
     square layout; non-square counts are factored into the closest rectangle.
     Channel chunks bound the transient complex FFT allocation without changing
-    the descriptor.  ``normalize=False`` follows the paper's published
-    magnitude equation and is used for LTM calibration; normalization remains
-    available for scale-independent diagnostics.
+    the descriptor. LTM-v2 uses normalized band energy so activation scale
+    differences between FLUX transformer depths cannot dominate matching;
+    ``normalize=False`` remains available for raw-spectrum diagnostics.
     """
 
     if feature.ndim == 3:
@@ -1808,6 +2067,8 @@ def compute_glcs_from_similarities(
 
 __all__ = [
     "CHIMERA_GROUPS",
+    "LTM_CALIBRATION_VERSION",
+    "LTM_TIMESTEP_SMOOTHING_RADIUS",
     "AdaptiveBatchSizer",
     "ChimeraConfig",
     "ChimeraEndpointCache",
@@ -1825,8 +2086,10 @@ __all__ = [
     "flux_depth_ltm",
     "invert_endpoint",
     "interpolate_chimera_conditioning",
+    "ltm_mapping_report",
     "map_denoising_to_inversion_step",
     "match_ltm_prototypes",
+    "match_monotonic_ltm_prototypes",
     "nearest_cached_step",
     "prompt_anchor_reliability",
     "radial_frequency_descriptor",

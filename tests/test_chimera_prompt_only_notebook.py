@@ -103,11 +103,22 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
 
 def test_fft_ltm_is_calibrated_persisted_and_part_of_pair_identity() -> None:
     code = code_source(load_notebook())
+    assert "LTM_CALIBRATION_VERSION," in code
+    assert "LTM_TIMESTEP_SMOOTHING_RADIUS," in code
     assert "LTMCalibration," in code
     assert 'RUN_DIRECTORY / "metadata" / "chimera_ltm_calibration.json"' in code
     assert "CHIMERA_SESSION.calibrate_ltm(" in code
     assert "CHIMERA_SESSION.set_ltm_calibration(candidate)" in code
-    assert '"descriptor_normalized": False' in code
+    assert '"descriptor_normalized": True' in code
+    assert '"timestep_descriptor": "conditional_velocity"' in code
+    assert '"timestep_smoothing_radius": LTM_TIMESTEP_SMOOTHING_RADIUS' in code
+    assert "calibration_count = min(CHIMERA_LTM_CALIBRATION_ANCHORS, len(BASE_RECORDS))" in code
+    assert "len(set(calibration_indices)) != calibration_count" in code
+    assert '"calibration_version": LTM_CALIBRATION_VERSION' in code
+    assert '"mapping_strategy": CHIMERA_LTM_CALIBRATION.mapping_strategy' in code
+    assert '"mapping_report": CHIMERA_LTM_CALIBRATION.mapping_report' in code
+    assert '"independent_mapping_report"' in code
+    assert '"ltm_report": CHIMERA_LTM_REPORT' in code
     assert '"calibration_fingerprint": CHIMERA_LTM_CALIBRATION.fingerprint' in code
     assert '"ltm_fingerprint": CHIMERA_LTM_FINGERPRINT' in code
 

@@ -15,8 +15,9 @@ The implementation follows the paper's algorithm:
 
 1. Encode each endpoint image and reverse the native deterministic sampler to
    obtain an inverted endpoint latent.
-2. Calibrate radial FFT prototypes for the representative FLUX layer groups
-   and every inversion timestep, then select the minimum-L1 group per step.
+2. Calibrate normalized radial FFT prototypes for representative FLUX layer
+   groups and dedicated per-timestep velocity outputs, then fit a robust
+   coarse-to-fine layer schedule from their L1 distances.
 3. Cache the frequency-matched diffusion feature during pair inversion.
 4. Spherically interpolate both endpoint latents and endpoint caches.
 5. Use a linear inversion-denoising timestep mapping (IDM) when retrieving a
@@ -62,16 +63,24 @@ steps exhibit the same coarse-to-fine progression.
 `select_flux_feature_groups()` maps the centers of the first, middle, and last
 transformer-depth thirds to `early`, `middle`, and `late` representatives.
 `radial_frequency_descriptor()` computes the channel-mean, radially pooled FFT
-magnitude in exact channel chunks. `calibrate_flux_ltm()` averages descriptors
-over a calibration anchor set to form layer and timestep prototypes, then uses
-the paper's per-timestep minimum-L1 rule. Hooks cache and inject image tokens
+magnitude in exact channel chunks. LTM-v2 normalizes these descriptors by total
+band energy so differences in activation scale between transformer depths do
+not dominate the comparison. `calibrate_flux_ltm()` forms layer prototypes
+from the three representative hooks and timestep prototypes from the model's
+conditional velocity output rather than averaging the candidate layers back
+together. A radius-one temporal mean suppresses single-step spectral jitter.
+The independent minimum-L1 matches remain in the calibration report; a
+constrained fit turns healthy matches into one monotonic early-to-middle-to-
+late schedule. A collapsed one-group argmin is rejected and transparently
+falls back to fixed coarse-to-fine thirds. Hooks cache and inject image tokens
 only; SAP may change the number of text tokens without invalidating the
 image-feature boundary.
 
-The production notebook calibrates on four evenly spaced anchors from the
-active cycle. This is model-, LoRA-, resolution-, prompt-, and image-specific,
-is saved to Google Drive, and is reused across every pair. Only the small FFT
-statistics and final 50-step mapping are persisted. Setting
+The production notebook calibrates on up to four unique, evenly spaced anchors
+from the active cycle; requesting more anchors than exist never duplicates a
+sample. This is model-, LoRA-, resolution-, prompt-, and image-specific, is
+saved to Google Drive, and is reused across every pair. Only the small FFT
+statistics, mapping diagnostics, and final 50-step mapping are persisted. Setting
 `CHIMERA_LTM_MODE="linear"` explicitly restores the old fixed-third fallback.
 
 ## Memory contract
@@ -135,7 +144,7 @@ not across the whole multi-anchor cycle.
 ## Known limitations
 
 - The paper's dataset-level FFT prototypes were not released. This port derives
-  run-level prototypes from four evenly spaced cyclic anchors; increase
+  run-level prototypes from up to four unique evenly spaced cyclic anchors; increase
   `CHIMERA_LTM_CALIBRATION_ANCHORS` for a broader but slower calibration set.
 - This port cannot reproduce unpublished feature-layer choices, VLM instruction
   details, or reference-code numerical behavior.
