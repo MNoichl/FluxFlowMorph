@@ -101,6 +101,42 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "measures their timestep correspondence" in text
 
 
+def test_cost_preview_resolves_automatic_prompt_count_without_policy_gates() -> None:
+    notebook = load_notebook()
+    cell = next(
+        cell for cell in notebook["cells"] if cell.get("id") == "prompt-only-chimera-10"
+    )
+    source = "".join(cell["source"])
+    namespace = {
+        "BASE_PROMPT_COUNT": None,
+        "BASE_STAGES": [{"id": f"anchor_{index}"} for index in range(3)],
+        "CHIMERA_ROUND_SPECS": [{"midpoint_count": 16}],
+        "IMAGE_WIDTH": 1024,
+        "IMAGE_HEIGHT": 1024,
+        "CHIMERA_RENDER_BATCH_SIZE": 2,
+        "CHIMERA_RENDER_BATCH_MAX": 10,
+        "CHIMERA_LTM_CALIBRATION_ANCHORS": 4,
+        "CHIMERA_INVERSION_STEPS": 50,
+        "CHIMERA_DENOISING_STEPS": 50,
+        "CHIMERA_LTM_MODE": "fft",
+        "CHIMERA_LTM_BANDS": 16,
+        "CHIMERA_BATCH_MEMORY_RESERVE_FRACTION": 0.1,
+        "CHIMERA_BATCH_MEMORY_RESERVE_GIB": 2.0,
+        "CHIMERA_CACHE_STORAGE": "int8",
+        "CHIMERA_CACHE_STRIDE": 2,
+        "CHIMERA_CONDITIONING_INTERPOLATION": "slerp",
+        "RIFE_MULTIPLIER": 2,
+    }
+
+    exec(source, namespace)
+
+    assert namespace["BASE_PROMPT_COUNT"] == 3
+    assert namespace["round_counts"] == [3, 51]
+    assert "production contract" not in source
+    assert "CHIMERA_DENOISING_STEPS !=" not in source
+    assert "CHIMERA_LORA_SCALE !=" not in source
+
+
 def test_fft_ltm_is_calibrated_persisted_and_part_of_pair_identity() -> None:
     code = code_source(load_notebook())
     assert "LTM_CALIBRATION_VERSION," in code
