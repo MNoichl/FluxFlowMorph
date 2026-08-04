@@ -100,6 +100,36 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "measures their timestep correspondence" in text
 
 
+def test_base_pipeline_defaults_to_gpu_resident_and_releases_before_chimera() -> None:
+    notebook = load_notebook()
+    code = code_source(notebook)
+    model_source = "".join(
+        next(
+            cell for cell in notebook["cells"]
+            if cell.get("id") == "prompt-only-chimera-12"
+        )["source"]
+    )
+    chimera_source = "".join(
+        next(
+            cell for cell in notebook["cells"]
+            if cell.get("id") == "prompt-only-chimera-19"
+        )["source"]
+    )
+
+    assert "BASE_PIPELINE_CPU_OFFLOAD = False" in code
+    assert "if BASE_PIPELINE_CPU_OFFLOAD:" in model_source
+    assert "pipeline.enable_model_cpu_offload()" in model_source
+    assert 'pipeline.to("cuda")' in model_source
+    assert 'globals().pop("FLUX_PIPE_CPU_OFFLOAD", None)' in model_source
+    assert 'globals().get("FLUX_PIPE_CPU_OFFLOAD")' in model_source
+    assert "Base pipeline LoRA/residency setting changed" in model_source
+    runner_load = chimera_source.index("CHIMERA_RUNNER = FlowMorphRunner.from_config")
+    final_release = chimera_source.rfind("release_flux_pipeline()", 0, runner_load)
+    assert final_release >= 0
+    assert 'if "FLUX_PIPE" in globals()' in chimera_source[final_release:runner_load]
+    assert "torch.cuda.empty_cache()" in model_source
+
+
 def test_cost_preview_resolves_automatic_prompt_count_without_policy_gates() -> None:
     notebook = load_notebook()
     cell = next(cell for cell in notebook["cells"] if cell.get("id") == "prompt-only-chimera-10")

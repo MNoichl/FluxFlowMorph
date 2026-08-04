@@ -87,6 +87,17 @@ statistics, mapping diagnostics, and final 50-step mapping are persisted. Settin
 
 ## Memory contract
 
+Standalone base-anchor generation defaults to
+`BASE_PIPELINE_CPU_OFFLOAD=False`. On a high-VRAM GPU this keeps the fused
+text encoder, transformer, and VAE resident and avoids copying the 9B model
+between CPU and CUDA for every anchor. Set the switch to `True` for smaller
+GPUs; rerunning the load cell detects a residency-mode change and rebuilds the
+pipeline instead of reusing an incompatible instance. Regardless of this
+choice, the base pipeline is deleted, hooks are released, garbage collection
+is run, and the CUDA allocator cache is emptied immediately before the
+separate CHIMERA runner is prepared. Base and intermediate-generation model
+instances therefore never intentionally coexist on the GPU.
+
 Uncompressed 1024px features from a 9B transformer are very large. Calibration
 therefore stores descriptors rather than full features from all three groups.
 After calibration, only the selected group is cached for each timestep. The
