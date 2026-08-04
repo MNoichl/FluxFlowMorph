@@ -254,10 +254,27 @@ def test_render_batch_is_measured_grown_and_bounded_with_memory_reserve() -> Non
 
 def test_midpoint_conditioning_diagnostics_are_dense_and_persisted() -> None:
     code = code_source(load_notebook())
-    assert "CHIMERA_ONE_GAP_TEST_ALPHAS = [0.05, 0.25, 0.5, 0.75, 0.95]" in code
+    assert "CHIMERA_ONE_GAP_TEST_ALPHAS" not in code
+    assert 'quality_midpoint_count = int(CHIMERA_ROUND_SPECS[0]["midpoint_count"])' in code
+    assert "quality_alphas = list(center_weighted_alpha_schedule(" in code
+    assert '"production_alphas": quality_alphas' in code
     assert '"conditioning_interpolation": CHIMERA_CONDITIONING_INTERPOLATION' in code
     assert "CHIMERA_SESSION.conditioning_diagnostics_report" in code
     assert '"conditioning_diagnostics"' in code
+
+
+def test_one_gap_quality_gate_matches_production_schedule_and_correction() -> None:
+    code = code_source(load_notebook())
+    assert "quality_midpoint_count, strength=CHIMERA_ALPHA_WARP_STRENGTH" in code
+    assert '"quality_sheet_raw.png"' in code
+    assert '"quality_sheet.png"' in code
+    assert "quality_tone_result = stabilize_cyclic_tone(" in code
+    assert "[0, len(quality_raw_paths) - 1]" in code
+    assert '"chroma_trajectory_before_after.png"' in code
+    assert '"chroma_metrics": (' in code
+    assert '"output_target_mae"' in code
+    assert '"repository_commit": project_commit' in code
+    assert '"alpha_warp_strength": CHIMERA_ALPHA_WARP_STRENGTH' in code
 
 
 def test_sap_triplet_is_image_aware_reliable_and_bounded() -> None:

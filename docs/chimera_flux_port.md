@@ -168,6 +168,15 @@ that receive a change, and saves both a JSON audit and a two-panel plot of raw,
 target, and corrected chroma plus the applied gain trajectory. RIFE consumes
 the corrected paths when chroma stabilization is enabled.
 
+The one-gap quality gate now mirrors the first production round rather than
+using a separate five-alpha sample. It renders the configured midpoint count
+with the configured alpha warp, then runs the same endpoint-anchored temporal
+tone/chroma correction used by the full sequence. The gate preserves a raw
+contact sheet, a representative corrected sheet, the correction JSON, and the
+before/after chroma plot. Its printed summary includes the repository commit,
+warp strength, and exact alpha values so a stale or nonrepresentative run is
+immediately visible.
+
 ## GLCS
 
 `compute_glcs_from_similarities()` implements the paper's GCS, LCS, and
