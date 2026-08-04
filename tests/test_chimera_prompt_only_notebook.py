@@ -315,6 +315,22 @@ def test_glcs_and_existing_rife_finishing_stack_are_available() -> None:
     assert "diagnose_cyclic_flicker(" in code
 
 
+def test_soft_chroma_correction_is_endpoint_anchored_plotted_and_feeds_rife() -> None:
+    code = code_source(load_notebook())
+    assert "TEMPORAL_TONE_STABILIZATION_ENABLED = False" in code
+    assert "TEMPORAL_CHROMA_STABILIZATION_ENABLED = True" in code
+    assert "TEMPORAL_CHROMA_STRENGTH = 0.50" in code
+    assert "TEMPORAL_CHROMA_MAX_GAIN = 0.08" in code
+    assert "TEMPORAL_CHROMA_SMOOTHING_PASSES = 4" in code
+    assert "luminance_enabled=TEMPORAL_TONE_STABILIZATION_ENABLED" in code
+    assert "chroma_anchor_indices = [" in code
+    assert 'item.get("round") != INTERPOLATION_ROUNDS' in code
+    assert "chroma_anchor_indices=(" in code
+    assert 'tone_result.report["chroma_trajectory"]' in code
+    assert '"chroma_trajectory_before_after.png"' in code
+    assert 'EXPORT_FRAME_PATHS = canonical_paths[' in code
+
+
 def test_embedded_variable_density_rife_runner_is_parseable() -> None:
     notebook = load_notebook()
     setup_cell = next(

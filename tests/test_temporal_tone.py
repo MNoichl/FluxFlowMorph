@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from flowmorph_klein.temporal_tone import (
     TemporalToneConfig,
+    image_chroma_statistics,
     image_tone_statistics,
     stabilize_cyclic_tone,
 )
@@ -25,6 +27,17 @@ def _write_frame(path: Path, mean: float, contrast: float = 0.08) -> None:
         ],
         axis=-1,
     )
+    Image.fromarray(np.rint(rgb * 255).astype(np.uint8)).save(path)
+
+
+def _write_chroma_frame(path: Path, amount: float) -> None:
+    horizontal = np.linspace(-0.02, 0.02, 96, dtype=np.float32)[None, :, None]
+    base = np.asarray(
+        [0.50 + amount, 0.49 - 0.35 * amount, 0.47 - 0.25 * amount],
+        dtype=np.float32,
+    )[None, None, :]
+    rgb = np.clip(base + horizontal, 0.0, 1.0)
+    rgb = np.repeat(rgb, 64, axis=0)
     Image.fromarray(np.rint(rgb * 255).astype(np.uint8)).save(path)
 
 
@@ -114,3 +127,47 @@ def test_temporal_tone_leaves_smooth_sequence_unchanged(tmp_path: Path) -> None:
         source.read_bytes() == output.read_bytes()
         for source, output in zip(paths, result.output_paths, strict=True)
     )
+
+
+def test_temporal_chroma_lifts_midpoint_deficit_with_smooth_zero_endpoint_gain(
+    tmp_path: Path,
+) -> None:
+    paths = []
+    for index, amount in enumerate((0.16, 0.14, 0.10, 0.07, 0.10, 0.14, 0.16)):
+        path = tmp_path / f"chroma_{index:02d}.png"
+        _write_chroma_frame(path, amount)
+        paths.append(path)
+
+    result = stabilize_cyclic_tone(
+        paths,
+        tmp_path / "chroma_stabilized",
+        config=TemporalToneConfig(
+            luminance_enabled=False,
+            chroma_enabled=True,
+            chroma_strength=0.5,
+            chroma_threshold=0.0,
+            max_chroma_gain=0.08,
+            chroma_smoothing_passes=4,
+        ),
+        chroma_anchor_indices=[0, 6],
+    )
+
+    trajectory = result.report["chroma_trajectory"]
+    gains = np.asarray(trajectory["gain"])
+    source = np.asarray(trajectory["source"])
+    target = np.asarray(trajectory["target"])
+    output = np.asarray(trajectory["output"])
+    assert gains[0] == 0.0
+    assert gains[6] == 0.0
+    assert gains == pytest.approx(gains[::-1])
+    assert np.max(gains) <= 0.08
+    assert output[3] > source[3]
+    assert np.mean(np.abs(output - target)) < np.mean(np.abs(source - target))
+    assert result.output_paths[0] == paths[0]
+    assert result.output_paths[6] == paths[6]
+    assert image_chroma_statistics(result.output_paths[3]) > image_chroma_statistics(paths[3])
+    before_mean, _ = image_tone_statistics(paths[3])
+    after_mean, _ = image_tone_statistics(result.output_paths[3])
+    assert after_mean == pytest.approx(before_mean, abs=0.005)
+    assert trajectory["endpoint_gain_is_zero"] is True
+    assert trajectory["maximum_adjacent_gain_step"] < 0.03

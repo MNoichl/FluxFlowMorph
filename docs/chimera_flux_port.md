@@ -153,6 +153,21 @@ allocation preserves exactly `pair_count * RIFE_MULTIPLIER` subdivisions, so
 adaptive allocation does not increase the total RIFE image budget. The
 existing dense circular SSIM resampling remains as a final timing pass.
 
+The optional temporal correction stage also provides a chroma-only mode,
+enabled in the CHIMERA notebook independently of its luminance/contrast
+outlier correction. It measures mean OKLab chroma, linearly interpolates a
+target between every pair of final-round endpoint anchors, and only lifts
+frames that fall below that target. The default recovers half the deficit,
+ignores deficits below 1%, and caps the chroma gain at 8%. A sine-squared gap
+envelope plus four local binomial smoothing passes makes the gain and its slope
+return gently to zero at every endpoint. OKLab lightness and hue are retained
+except for unavoidable output-gamut clipping.
+
+The stage keeps the raw CHIMERA PNGs, writes corrected copies only for frames
+that receive a change, and saves both a JSON audit and a two-panel plot of raw,
+target, and corrected chroma plus the applied gain trajectory. RIFE consumes
+the corrected paths when chroma stabilization is enabled.
+
 ## GLCS
 
 `compute_glcs_from_similarities()` implements the paper's GCS, LCS, and
