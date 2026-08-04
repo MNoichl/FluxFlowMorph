@@ -101,8 +101,8 @@ CUDA peak. It preserves the larger of 10% or 2 GiB as free memory, pads the
 observed per-item requirement by 25%, and probes upward only to that guarded
 ceiling. OOM results establish an upper bound and subsequent attempts use binary
 backoff; the learned successful batch is retained across gaps. The VAE-only
-decode phase starts with all ten interiors and persists its existing OOM
-backoff result.
+decode phase starts with all configured interiors and persists its existing
+OOM backoff result.
 
 Set stride `1` and storage `float32` for the closest published-algorithm
 contract. Pair caches are never retained for the whole flat sequence:
@@ -131,6 +131,27 @@ the active and hypothetical linear embedding norms plus mean CFG-residual RMS
 for the SAP and post-SAP phases. These diagnostics are persisted in each pair's
 cache report, and the interpolation mode is part of the pair fingerprint so
 linear-conditioning results cannot be silently reused as SLERP results.
+
+## Perceptual spacing and video timing
+
+Uniform CHIMERA coefficients can put too few samples around a fast semantic
+transition. The notebook therefore uses an endpoint-preserving sinusoidal
+schedule by default:
+
+`alpha(u) = u + s * sin(2*pi*u) / (2*pi)`
+
+`CHIMERA_ALPHA_WARP_STRENGTH=0.5` moves samples on either side toward the
+midpoint while retaining the same number of FLUX renders. Set it to `0` for
+the original uniform schedule. The strength is stored in pair fingerprints and
+manifests, so cached uniform results cannot be mistaken for warped results.
+
+RIFE then measures reduced-resolution mean pixelwise CIE76 distance for every
+cyclic source-frame edge. `allocate_perceptual_subdivisions()` gives larger
+edges more interpolation subdivisions and smaller edges fewer, subject to a
+minimum, maximum, and robust median-relative distance cap. Its integer
+allocation preserves exactly `pair_count * RIFE_MULTIPLIER` subdivisions, so
+adaptive allocation does not increase the total RIFE image budget. The
+existing dense circular SSIM resampling remains as a final timing pass.
 
 ## GLCS
 

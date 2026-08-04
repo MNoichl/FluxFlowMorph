@@ -60,6 +60,129 @@ LTM_MINIMUM_GROUP_FRACTION = 0.10
 LTM_TIMESTEP_SMOOTHING_RADIUS = 1
 
 
+def center_weighted_alpha_schedule(
+    midpoint_count: int,
+    *,
+    strength: float = 0.5,
+) -> tuple[float, ...]:
+    """Return a monotone endpoint-preserving schedule concentrated at 0.5.
+
+    ``strength=0`` is the usual uniform schedule.  Positive strengths apply
+    ``u + strength * sin(2πu) / (2π)`` so samples on both sides move toward
+    the midpoint without changing the number of FLUX renders.  Restricting
+    strength to less than one keeps the continuous mapping strictly monotone.
+    """
+
+    if midpoint_count < 1:
+        raise ValueError("midpoint_count must be positive")
+    if not math.isfinite(strength) or not 0.0 <= strength < 1.0:
+        raise ValueError("alpha warp strength must lie in [0, 1)")
+    denominator = midpoint_count + 1
+    return tuple(
+        u + strength * math.sin(2.0 * math.pi * u) / (2.0 * math.pi)
+        for index in range(1, midpoint_count + 1)
+        for u in (index / denominator,)
+    )
+
+
+def allocate_perceptual_subdivisions(
+    distances: Sequence[float],
+    *,
+    average_multiplier: int,
+    minimum_multiplier: int = 2,
+    maximum_multiplier: int | None = None,
+    maximum_weight_ratio: float = 2.5,
+) -> tuple[int, ...]:
+    """Distribute a fixed RIFE budget according to adjacent-frame distance.
+
+    The returned integer multipliers always sum to
+    ``len(distances) * average_multiplier``.  A robust upper clip prevents one
+    pathological edge from consuming the complete budget, while minimum and
+    maximum multipliers keep every original transition represented.
+    """
+
+    values = tuple(float(value) for value in distances)
+    if not values:
+        raise ValueError("perceptual allocation needs at least one distance")
+    if any(not math.isfinite(value) or value < 0.0 for value in values):
+        raise ValueError("perceptual distances must be finite and non-negative")
+    if average_multiplier < 1 or minimum_multiplier < 1:
+        raise ValueError("RIFE multipliers must be positive")
+    if minimum_multiplier > average_multiplier:
+        raise ValueError("minimum_multiplier cannot exceed average_multiplier")
+    if maximum_multiplier is None:
+        maximum_multiplier = len(values) * average_multiplier
+    if maximum_multiplier < average_multiplier:
+        raise ValueError("maximum_multiplier cannot be below average_multiplier")
+    if not math.isfinite(maximum_weight_ratio) or maximum_weight_ratio < 1.0:
+        raise ValueError("maximum_weight_ratio must be finite and at least one")
+
+    positive = sorted(value for value in values if value > 0.0)
+    if positive:
+        middle = len(positive) // 2
+        median = (
+            positive[middle]
+            if len(positive) % 2
+            else (positive[middle - 1] + positive[middle]) / 2.0
+        )
+        ceiling = median * maximum_weight_ratio
+        epsilon = max(median * 1e-6, torch.finfo(torch.float64).eps)
+        weights = [max(epsilon, min(value, ceiling)) for value in values]
+    else:
+        weights = [1.0] * len(values)
+
+    target = len(values) * average_multiplier
+    allocations = [minimum_multiplier] * len(values)
+    remaining = target - sum(allocations)
+    capacities = [maximum_multiplier - minimum_multiplier] * len(values)
+    ideal_extras = [0.0] * len(values)
+    active = set(range(len(values)))
+    while remaining > 0 and active:
+        active_weight = sum(weights[index] for index in active)
+        provisional = {
+            index: remaining * weights[index] / active_weight
+            for index in active
+        }
+        capped = [
+            index
+            for index in active
+            if provisional[index] >= capacities[index]
+        ]
+        if not capped:
+            for index in active:
+                ideal_extras[index] = provisional[index]
+            break
+        for index in capped:
+            ideal_extras[index] = float(capacities[index])
+            remaining -= capacities[index]
+            active.remove(index)
+
+    for index, extra in enumerate(ideal_extras):
+        allocations[index] += int(math.floor(extra))
+    units_left = target - sum(allocations)
+    while units_left:
+        candidates = [
+            index
+            for index, allocation in enumerate(allocations)
+            if allocation < maximum_multiplier
+        ]
+        if not candidates:
+            raise RuntimeError("bounded RIFE allocation exhausted before reaching its budget")
+        chosen = max(
+            candidates,
+            key=lambda index: (
+                ideal_extras[index] - math.floor(ideal_extras[index]),
+                weights[index],
+                -index,
+            ),
+        )
+        allocations[chosen] += 1
+        ideal_extras[chosen] = float(math.floor(ideal_extras[chosen]))
+        units_left -= 1
+
+    return tuple(allocations)
+
+
 @dataclass(frozen=True, slots=True)
 class ChimeraConfig:
     """Runtime settings for the FLUX CHIMERA port.
@@ -2079,7 +2202,9 @@ __all__ = [
     "LTMPrototypeAccumulator",
     "StoredFeature",
     "append_anchor_conditioning",
+    "allocate_perceptual_subdivisions",
     "calibrate_flux_ltm",
+    "center_weighted_alpha_schedule",
     "conditioning_interpolation_report",
     "compute_glcs_from_similarities",
     "estimate_safe_cuda_batch_size",

@@ -95,6 +95,9 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_BATCH_MEMORY_RESERVE_GIB = 2.0" in text
     assert "CHIMERA_DECODE_BATCH_SIZE = 10" in text
     assert 'CHIMERA_CONDITIONING_INTERPOLATION = "slerp"' in text
+    assert "CHIMERA_ALPHA_WARP_STRENGTH = 0.5" in text
+    assert "center_weighted_alpha_schedule(" in text
+    assert '"alpha_warp_strength": CHIMERA_ALPHA_WARP_STRENGTH' in text
     assert "conditioning_interpolation=CHIMERA_CONDITIONING_INTERPOLATION" in text
     assert 'CHIMERA_CACHE_STORAGE = "int8"' in text
     assert "CHIMERA_CACHE_STRIDE = 2" in text
@@ -302,6 +305,34 @@ def test_glcs_and_existing_rife_finishing_stack_are_available() -> None:
     assert "compute_glcs_from_similarities" in code
     assert "RUN_RIFE_POSTPROCESS = True" in code
     assert "RIFE_MULTIPLIER = int(round(2 * VIDEO_SLOWDOWN_FACTOR))" in code
+    assert "RIFE_PERCEPTUAL_ALLOCATION = True" in code
+    assert "allocate_perceptual_subdivisions(" in code
+    assert '"--multipliers-json", str(RIFE_ALLOCATION_PATH)' in code
+    assert "sum(RIFE_PAIR_MULTIPLIERS) != expected_rife_budget" in code
+    assert "mean pixelwise CIE76 at reduced resolution" in code
     assert "RIFE_FINAL_FPS = 24.0" in code
     assert "recursive_chimera_prompt_only_rife_ssim_loop.mp4" in code
     assert "diagnose_cyclic_flicker(" in code
+
+
+def test_embedded_variable_density_rife_runner_is_parseable() -> None:
+    notebook = load_notebook()
+    setup_cell = next(
+        cell for cell in notebook["cells"] if cell.get("id") == "prompt-only-chimera-26"
+    )
+    parsed = ast.parse("".join(setup_cell["source"]))
+    runner_assignment = next(
+        node
+        for node in ast.walk(parsed)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "RIFE_RUNNER_SOURCE"
+            for target in node.targets
+        )
+    )
+    assert isinstance(runner_assignment.value, ast.Constant)
+    runner_source = runner_assignment.value.value
+    ast.parse(runner_source)
+    assert 'parser.add_argument("--multipliers-json", required=True)' in runner_source
+    assert "output_count = sum(pair_multipliers) + 1" in runner_source
+    assert "step / pair_multipliers[index]" in runner_source

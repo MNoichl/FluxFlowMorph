@@ -15,8 +15,10 @@ from flowmorph_klein.chimera import (
     LTMCalibration,
     LTMPrototypeAccumulator,
     StoredFeature,
+    allocate_perceptual_subdivisions,
     append_anchor_conditioning,
     calibrate_flux_ltm,
+    center_weighted_alpha_schedule,
     compute_glcs_from_similarities,
     conditioning_interpolation_report,
     estimate_safe_cuda_batch_size,
@@ -156,6 +158,41 @@ def test_chimera_slerp_prevents_midpoint_conditioning_norm_collapse() -> None:
     assert report["linear_norm_retention"] == pytest.approx(math.sqrt(1.25) / 1.5)
     assert report["active_norm_retention"] == pytest.approx(1.0)
     assert report["mode"] == "slerp"
+
+
+def test_center_weighted_alpha_schedule_preserves_endpoints_and_symmetry() -> None:
+    uniform = center_weighted_alpha_schedule(5, strength=0.0)
+    warped = center_weighted_alpha_schedule(5, strength=0.5)
+
+    assert uniform == pytest.approx((1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6))
+    assert all(left < right for left, right in zip(warped, warped[1:]))
+    assert warped[0] > uniform[0]
+    assert warped[-1] < uniform[-1]
+    assert warped[2] == pytest.approx(0.5)
+    assert [1.0 - value for value in reversed(warped)] == pytest.approx(warped)
+
+
+def test_perceptual_rife_allocation_preserves_budget_and_favors_large_gaps() -> None:
+    allocation = allocate_perceptual_subdivisions(
+        [1.0, 1.0, 4.0, 1.0],
+        average_multiplier=6,
+        minimum_multiplier=2,
+        maximum_multiplier=12,
+    )
+
+    assert sum(allocation) == 24
+    assert min(allocation) >= 2
+    assert max(allocation) <= 12
+    assert allocation[2] > max(allocation[0], allocation[1], allocation[3])
+
+
+def test_perceptual_rife_allocation_is_uniform_for_zero_motion() -> None:
+    assert allocate_perceptual_subdivisions(
+        [0.0, 0.0, 0.0],
+        average_multiplier=4,
+        minimum_multiplier=2,
+        maximum_multiplier=8,
+    ) == (4, 4, 4)
 
 
 def test_cuda_batch_estimate_keeps_reserve_and_overhead_margin() -> None:
