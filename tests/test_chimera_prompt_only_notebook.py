@@ -117,12 +117,23 @@ def test_base_pipeline_defaults_to_gpu_resident_and_releases_before_chimera() ->
     )
 
     assert "BASE_PIPELINE_CPU_OFFLOAD = False" in code
-    assert "if BASE_PIPELINE_CPU_OFFLOAD:" in model_source
+    assert "BASE_PIPELINE_RESIDENT_RESERVE_GIB = 12.0" in code
+    assert "effective_cpu_offload = bool(BASE_PIPELINE_CPU_OFFLOAD)" in model_source
+    assert "if effective_cpu_offload:" in model_source
     assert "pipeline.enable_model_cpu_offload()" in model_source
     assert 'pipeline.to("cuda")' in model_source
     assert 'globals().pop("FLUX_PIPE_CPU_OFFLOAD", None)' in model_source
-    assert 'globals().get("FLUX_PIPE_CPU_OFFLOAD")' in model_source
+    assert 'globals().pop("FLUX_PIPE_CPU_OFFLOAD_REQUESTED", None)' in model_source
+    assert 'globals().get("FLUX_PIPE_CPU_OFFLOAD_REQUESTED")' in model_source
     assert "Base pipeline LoRA/residency setting changed" in model_source
+    assert "def pipeline_storage_bytes(pipeline):" in model_source
+    assert "def resident_memory_preflight(pipeline):" in model_source
+    assert "torch.cuda.mem_get_info()" in model_source
+    assert '"resident_fit": model_bytes + reserve_bytes <= free_bytes' in model_source
+    assert "automatic CPU-offload fallback" in model_source
+    assert "except (torch.cuda.OutOfMemoryError, RuntimeError) as error:" in model_source
+    assert 'pipeline.to("cpu")' in model_source
+    assert "automatic low-free-VRAM fallback" in model_source
     runner_load = chimera_source.index("CHIMERA_RUNNER = FlowMorphRunner.from_config")
     final_release = chimera_source.rfind("release_flux_pipeline()", 0, runner_load)
     assert final_release >= 0

@@ -91,12 +91,17 @@ Standalone base-anchor generation defaults to
 `BASE_PIPELINE_CPU_OFFLOAD=False`. On a high-VRAM GPU this keeps the fused
 text encoder, transformer, and VAE resident and avoids copying the 9B model
 between CPU and CUDA for every anchor. Set the switch to `True` for smaller
-GPUs; rerunning the load cell detects a residency-mode change and rebuilds the
-pipeline instead of reusing an incompatible instance. Regardless of this
-choice, the base pipeline is deleted, hooks are released, garbage collection
-is run, and the CUDA allocator cache is emptied immediately before the
-separate CHIMERA runner is prepared. Base and intermediate-generation model
-instances therefore never intentionally coexist on the GPU.
+GPUs. Resident mode first compares the fused model's actual tensor storage
+against current free VRAM while retaining the configurable 12 GiB generation
+reserve. This sees memory occupied by other processes as unavailable. If the
+preflight fails—or the subsequent move still encounters CUDA OOM—the notebook
+automatically normalizes the partially moved pipeline back to CPU and enables
+model offload. Requested and effective modes are tracked separately, so the
+fallback does not cause repeated reload attempts when the cell is rerun.
+Regardless of this choice, the base pipeline is deleted, hooks are released,
+garbage collection is run, and the CUDA allocator cache is emptied immediately
+before the separate CHIMERA runner is prepared. Base and intermediate-
+generation model instances therefore never intentionally coexist on the GPU.
 
 Uncompressed 1024px features from a 9B transformer are very large. Calibration
 therefore stores descriptors rather than full features from all three groups.
