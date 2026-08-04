@@ -165,7 +165,7 @@ schedule by default:
 
 `alpha(u) = u + s * sin(2*pi*u) / (2*pi)`
 
-`CHIMERA_ALPHA_WARP_STRENGTH=0.5` moves samples on either side toward the
+`CHIMERA_ALPHA_WARP_STRENGTH=0.35` moves samples on either side toward the
 midpoint while retaining the same number of FLUX renders. Set it to `0` for
 the original uniform schedule. The strength is stored in pair fingerprints and
 manifests, so cached uniform results cannot be mistaken for warped results.
