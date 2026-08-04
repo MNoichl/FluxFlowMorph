@@ -124,8 +124,7 @@ def test_temporal_tone_leaves_smooth_sequence_unchanged(tmp_path: Path) -> None:
 
     assert result.report["corrected_count"] == 0
     assert all(
-        source.read_bytes() == output.read_bytes()
-        for source, output in zip(paths, result.output_paths, strict=True)
+        source.read_bytes() == output.read_bytes() for source, output in zip(paths, result.output_paths, strict=True)
     )
 
 
@@ -144,10 +143,11 @@ def test_temporal_chroma_lifts_midpoint_deficit_with_smooth_zero_endpoint_gain(
         config=TemporalToneConfig(
             luminance_enabled=False,
             chroma_enabled=True,
-            chroma_strength=0.5,
+            chroma_strength=0.7,
             chroma_threshold=0.0,
-            max_chroma_gain=0.08,
-            chroma_smoothing_passes=4,
+            max_chroma_gain=0.12,
+            max_chroma_decrease=0.08,
+            chroma_smoothness=6.0,
         ),
         chroma_anchor_indices=[0, 6],
     )
@@ -160,9 +160,10 @@ def test_temporal_chroma_lifts_midpoint_deficit_with_smooth_zero_endpoint_gain(
     assert gains[0] == 0.0
     assert gains[6] == 0.0
     assert gains == pytest.approx(gains[::-1])
-    assert np.max(gains) <= 0.08
+    assert np.max(gains) <= 0.12
     assert output[3] > source[3]
     assert np.mean(np.abs(output - target)) < np.mean(np.abs(source - target))
+    assert trajectory["desired_curvature_rms"] < trajectory["source_curvature_rms"]
     assert result.output_paths[0] == paths[0]
     assert result.output_paths[6] == paths[6]
     assert image_chroma_statistics(result.output_paths[3]) > image_chroma_statistics(paths[3])
@@ -170,4 +171,44 @@ def test_temporal_chroma_lifts_midpoint_deficit_with_smooth_zero_endpoint_gain(
     after_mean, _ = image_tone_statistics(result.output_paths[3])
     assert after_mean == pytest.approx(before_mean, abs=0.005)
     assert trajectory["endpoint_gain_is_zero"] is True
-    assert trajectory["maximum_adjacent_gain_step"] < 0.03
+
+
+def test_temporal_chroma_smooths_output_with_signed_upward_and_downward_changes(
+    tmp_path: Path,
+) -> None:
+    paths = []
+    for index, amount in enumerate((0.08, 0.22, 0.18, 0.06, 0.05, 0.16, 0.20)):
+        path = tmp_path / f"signed_chroma_{index:02d}.png"
+        _write_chroma_frame(path, amount)
+        paths.append(path)
+
+    result = stabilize_cyclic_tone(
+        paths,
+        tmp_path / "signed_chroma_stabilized",
+        config=TemporalToneConfig(
+            luminance_enabled=False,
+            chroma_enabled=True,
+            chroma_strength=0.7,
+            chroma_threshold=0.0,
+            max_chroma_gain=0.12,
+            max_chroma_decrease=0.08,
+            chroma_smoothness=6.0,
+        ),
+        chroma_anchor_indices=[0, 6],
+    )
+
+    trajectory = result.report["chroma_trajectory"]
+    gains = np.asarray(trajectory["gain"])
+    source = np.asarray(trajectory["source"])
+    target = np.asarray(trajectory["target"])
+    output = np.asarray(trajectory["output"])
+    assert np.any(gains < 0.0)
+    assert np.any(gains > 0.0)
+    assert gains[0] == 0.0
+    assert gains[-1] == 0.0
+    assert np.min(gains) >= -0.08
+    assert np.max(gains) <= 0.12
+    assert np.mean(np.abs(output - target)) < np.mean(np.abs(source - target))
+    assert trajectory["output_curvature_rms"] < trajectory["source_curvature_rms"]
+    assert trajectory["minimum_gain"] < 0.0
+    assert trajectory["maximum_gain"] > 0.0

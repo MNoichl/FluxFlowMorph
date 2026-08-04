@@ -156,17 +156,20 @@ existing dense circular SSIM resampling remains as a final timing pass.
 The optional temporal correction stage also provides a chroma-only mode,
 enabled in the CHIMERA notebook independently of its luminance/contrast
 outlier correction. It measures mean OKLab chroma, linearly interpolates a
-target between every pair of final-round endpoint anchors, and only lifts
-frames that fall below that target. The default recovers half the deficit,
-ignores deficits below 1%, and caps the chroma gain at 8%. A sine-squared gap
-envelope plus four local binomial smoothing passes makes the gain and its slope
-return gently to zero at every endpoint. OKLab lightness and hue are retained
-except for unavoidable output-gamut clipping.
+reference between every pair of final-round endpoint anchors, and pulls the
+measured trajectory 70% toward that line. A Whittaker second-difference solve
+then smooths the desired output trajectory itself while fixing every endpoint;
+it does not smooth the correction curve. Signed OKLab scaling can therefore
+reduce early overshoots as well as lift later deficits. Adjustments below 1%
+are ignored, increases are capped at 12%, and decreases at 8%. OKLab lightness
+and hue are retained except for unavoidable output-gamut clipping.
 
 The stage keeps the raw CHIMERA PNGs, writes corrected copies only for frames
 that receive a change, and saves both a JSON audit and a two-panel plot of raw,
-target, and corrected chroma plus the applied gain trajectory. RIFE consumes
-the corrected paths when chroma stabilization is enabled.
+endpoint-line, solved-target, and corrected chroma plus the signed adjustment
+trajectory. The report includes linear-target error and curvature RMS before
+and after correction. RIFE consumes the corrected paths when chroma
+stabilization is enabled.
 
 The one-gap quality gate now mirrors the first production round rather than
 using a separate five-alpha sample. It renders the configured midpoint count

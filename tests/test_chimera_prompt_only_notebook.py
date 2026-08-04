@@ -18,11 +18,7 @@ def load_notebook() -> dict:
 
 
 def code_source(notebook: dict) -> str:
-    return "\n".join(
-        "".join(cell.get("source", []))
-        for cell in notebook["cells"]
-        if cell.get("cell_type") == "code"
-    )
+    return "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"] if cell.get("cell_type") == "code")
 
 
 def all_source(notebook: dict) -> str:
@@ -36,9 +32,7 @@ def test_chimera_notebook_is_parseable_and_has_colab_badge() -> None:
     cell_ids = [cell.get("id") for cell in notebook["cells"]]
     assert all(cell_ids)
     assert len(cell_ids) == len(set(cell_ids))
-    assert "StillLife_Recursive_CHIMERA_Prompt_Only.ipynb" in "".join(
-        notebook["cells"][0]["source"]
-    )
+    assert "StillLife_Recursive_CHIMERA_Prompt_Only.ipynb" in "".join(notebook["cells"][0]["source"])
     for cell in notebook["cells"]:
         if cell.get("cell_type") == "code":
             ast.parse("".join(cell.get("source", [])))
@@ -106,9 +100,7 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
 
 def test_cost_preview_resolves_automatic_prompt_count_without_policy_gates() -> None:
     notebook = load_notebook()
-    cell = next(
-        cell for cell in notebook["cells"] if cell.get("id") == "prompt-only-chimera-10"
-    )
+    cell = next(cell for cell in notebook["cells"] if cell.get("id") == "prompt-only-chimera-10")
     source = "".join(cell["source"])
     namespace = {
         "BASE_PROMPT_COUNT": None,
@@ -170,10 +162,7 @@ def test_authored_prompts_are_valid_and_original_anchor_init_is_restored() -> No
         node
         for node in stages_tree.body
         if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "BASE_STAGES"
-            for target in node.targets
-        )
+        and any(isinstance(target, ast.Name) and target.id == "BASE_STAGES" for target in node.targets)
     )
     stages = ast.literal_eval(assignment.value)
     code = code_source(notebook)
@@ -336,32 +325,35 @@ def test_soft_chroma_correction_is_endpoint_anchored_plotted_and_feeds_rife() ->
     code = code_source(load_notebook())
     assert "TEMPORAL_TONE_STABILIZATION_ENABLED = False" in code
     assert "TEMPORAL_CHROMA_STABILIZATION_ENABLED = True" in code
-    assert "TEMPORAL_CHROMA_STRENGTH = 0.50" in code
-    assert "TEMPORAL_CHROMA_MAX_GAIN = 0.08" in code
-    assert "TEMPORAL_CHROMA_SMOOTHING_PASSES = 4" in code
+    assert "TEMPORAL_CHROMA_STRENGTH = 0.70" in code
+    assert "TEMPORAL_CHROMA_MAX_GAIN = 0.12" in code
+    assert "TEMPORAL_CHROMA_MAX_DECREASE = 0.08" in code
+    assert "TEMPORAL_CHROMA_SMOOTHNESS = 6.0" in code
+    assert "TEMPORAL_CHROMA_SMOOTHING_PASSES" not in code
     assert "luminance_enabled=TEMPORAL_TONE_STABILIZATION_ENABLED" in code
+    assert "max_chroma_decrease=TEMPORAL_CHROMA_MAX_DECREASE" in code
+    assert "chroma_smoothness=TEMPORAL_CHROMA_SMOOTHNESS" in code
     assert "chroma_anchor_indices = [" in code
     assert 'item.get("round") != INTERPOLATION_ROUNDS' in code
     assert "chroma_anchor_indices=(" in code
     assert 'tone_result.report["chroma_trajectory"]' in code
+    assert 'chroma_trajectory["desired"]' in code
+    assert "-100.0 * TEMPORAL_CHROMA_MAX_DECREASE" in code
+    assert '"minimum_gain"' in code
+    assert '"output_curvature_rms"' in code
     assert '"chroma_trajectory_before_after.png"' in code
-    assert 'EXPORT_FRAME_PATHS = canonical_paths[' in code
+    assert "EXPORT_FRAME_PATHS = canonical_paths[" in code
 
 
 def test_embedded_variable_density_rife_runner_is_parseable() -> None:
     notebook = load_notebook()
-    setup_cell = next(
-        cell for cell in notebook["cells"] if cell.get("id") == "prompt-only-chimera-26"
-    )
+    setup_cell = next(cell for cell in notebook["cells"] if cell.get("id") == "prompt-only-chimera-26")
     parsed = ast.parse("".join(setup_cell["source"]))
     runner_assignment = next(
         node
         for node in ast.walk(parsed)
         if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "RIFE_RUNNER_SOURCE"
-            for target in node.targets
-        )
+        and any(isinstance(target, ast.Name) and target.id == "RIFE_RUNNER_SOURCE" for target in node.targets)
     )
     assert isinstance(runner_assignment.value, ast.Constant)
     runner_source = runner_assignment.value.value
