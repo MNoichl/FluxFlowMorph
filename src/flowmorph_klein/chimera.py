@@ -203,6 +203,7 @@ class ChimeraConfig:
     ltm_channel_chunk_size: int = 128
     cache_stride: int = 2
     cache_storage: CacheStorage = "int8"
+    velocity_smoothing_strength: float = 0.0
     render_batch_size: int = 2
     render_batch_max: int = 10
     auto_render_batch_size: bool = True
@@ -237,6 +238,11 @@ class ChimeraConfig:
             raise ValueError("cache_stride must be positive")
         if self.cache_storage not in {"int8", "float16", "bfloat16", "float32"}:
             raise ValueError(f"unsupported cache storage {self.cache_storage!r}")
+        if (
+            not math.isfinite(self.velocity_smoothing_strength)
+            or not 0.0 <= self.velocity_smoothing_strength <= 1.0
+        ):
+            raise ValueError("velocity_smoothing_strength must lie in [0, 1]")
         if self.render_batch_size < 1 or self.decode_batch_size < 1:
             raise ValueError("CHIMERA batch sizes must be positive")
         if self.render_batch_max < self.render_batch_size:
@@ -1581,6 +1587,77 @@ def conditioning_interpolation_report(
     }
 
 
+def smooth_velocity_along_alpha(
+    velocity: Tensor,
+    alphas: Sequence[float] | Tensor,
+    *,
+    strength: float,
+) -> Tensor:
+    """Pull interior velocities toward an alpha-linear neighbour estimate.
+
+    The operation is invariant to reversing the morph direction: every
+    interior frame uses both adjacent alphas, while the two boundary
+    velocities are preserved.  Uneven alpha schedules are handled by linear
+    interpolation in alpha rather than by assuming equally spaced frames.
+    """
+
+    if velocity.ndim != 3:
+        raise ValueError("velocity must have shape (frames, tokens, channels)")
+    if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
+        raise ValueError("velocity smoothing strength must lie in [0, 1]")
+    amounts = torch.as_tensor(alphas, dtype=torch.float64, device="cpu").reshape(-1)
+    if amounts.numel() != velocity.shape[0]:
+        raise ValueError("alpha count must match the velocity batch")
+    if strength == 0.0 or amounts.numel() < 3:
+        return velocity
+    if amounts.numel() > 1 and not bool(torch.all(amounts[1:] > amounts[:-1]).item()):
+        raise ValueError("velocity smoothing alphas must be strictly increasing")
+
+    left_distance = amounts[1:-1] - amounts[:-2]
+    right_distance = amounts[2:] - amounts[1:-1]
+    span = left_distance + right_distance
+    left_weight = (right_distance / span).to(
+        device=velocity.device,
+        dtype=velocity.dtype,
+    ).reshape(-1, 1, 1)
+    right_weight = (left_distance / span).to(
+        device=velocity.device,
+        dtype=velocity.dtype,
+    ).reshape(-1, 1, 1)
+    neighbour_linear = (
+        left_weight * velocity[:-2]
+        + right_weight * velocity[2:]
+    )
+    result = velocity.clone()
+    result[1:-1] = torch.lerp(
+        velocity[1:-1],
+        neighbour_linear,
+        float(strength),
+    )
+    return result
+
+
+def _slice_conditioning(
+    conditioning: ConditioningPackage,
+    start: int,
+    stop: int,
+) -> ConditioningPackage:
+    """Take one batch slice while retaining prompt diagnostics."""
+
+    if not 0 <= start < stop <= conditioning.batch_size:
+        raise ValueError("conditioning slice lies outside the active batch")
+    prompt = conditioning.prompt
+    if isinstance(prompt, tuple) and len(prompt) == conditioning.batch_size:
+        sliced_prompt: str | tuple[str, ...] = prompt[start:stop]
+    else:
+        sliced_prompt = prompt
+    return ConditioningPackage(
+        sliced_prompt,
+        conditioning.prompt_embeds[start:stop].detach(),
+        conditioning.text_ids[start:stop].detach(),
+    )
+
+
 def render_chimera_morph(
     source: ChimeraEndpointCache,
     target: ChimeraEndpointCache,
@@ -1597,8 +1674,16 @@ def render_chimera_morph(
     ltm_calibration: LTMCalibration | None = None,
     joint_attention_kwargs: dict[str, Any] | None = None,
     diagnostics: list[dict[str, float | str | None]] | None = None,
+    microbatch_sizer: AdaptiveBatchSizer | None = None,
+    batch_sizes_used: list[int] | None = None,
 ) -> tuple[RenderedLatentFrame, ...]:
-    """Denoise slerped endpoint latents with IDM, ACI, and early-step SAP."""
+    """Denoise slerped endpoint latents with IDM, ACI, SAP, and smoothing.
+
+    When ``microbatch_sizer`` is supplied, every denoising timestep evaluates
+    the complete alpha trajectory in memory-bounded chunks before applying
+    symmetric velocity smoothing.  Thus batch boundaries cannot become
+    trajectory boundaries.
+    """
 
     if schedule.num_inference_steps != config.denoising_steps:
         raise ValueError("schedule length disagrees with ChimeraConfig.denoising_steps")
@@ -1641,9 +1726,10 @@ def render_chimera_morph(
     )
     cfg_residual_early_sums = torch.zeros_like(cfg_residual_sums)
     cfg_residual_late_sums = torch.zeros_like(cfg_residual_sums)
-    cfg_residual_count = 0
-    cfg_residual_early_count = 0
-    cfg_residual_late_count = 0
+    cfg_residual_counts = torch.zeros_like(cfg_residual_sums)
+    cfg_residual_early_counts = torch.zeros_like(cfg_residual_sums)
+    cfg_residual_late_counts = torch.zeros_like(cfg_residual_sums)
+    smoothing_delta_sums = torch.zeros_like(cfg_residual_sums)
 
     state = initial
     controller = FluxFeatureController(
@@ -1664,68 +1750,171 @@ def render_chimera_morph(
                 active_ltm,
             )
             sap_active = denoising_index < sap_steps
-            conditional = (
-                append_anchor_conditioning(
-                    base_batch,
-                    anchor,
-                    max_anchor_tokens=config.anchor_max_tokens,
-                )
-                if sap_active
-                else base_batch
-            )
             # Batched CFG requires matching conditional/unconditional token
             # lengths.  SAP deliberately changes only the conditional branch,
             # so its short early phase runs sequential CFG.
             execution = "sequential" if sap_active else config.cfg_execution
-
-            def record_cfg_residual(residual: Tensor) -> None:
-                nonlocal cfg_residual_count
-                nonlocal cfg_residual_early_count
-                nonlocal cfg_residual_late_count
-                if residual.shape[0] != len(amounts):
-                    raise ValueError("CFG diagnostic batch disagrees with CHIMERA alphas")
-                values = (
-                    residual.float()
-                    .reshape(residual.shape[0], -1)
-                    .square()
-                    .mean(dim=1)
-                    .sqrt()
-                    .detach()
-                    .to(dtype=torch.float64)
+            velocity_parts: list[Tensor] = []
+            position = 0
+            while position < len(amounts):
+                remaining = len(amounts) - position
+                active_batch = (
+                    microbatch_sizer.next_batch_size(remaining)
+                    if microbatch_sizer is not None
+                    else remaining
                 )
-                cfg_residual_sums.add_(values)
-                cfg_residual_count += 1
-                if sap_active:
-                    cfg_residual_early_sums.add_(values)
-                    cfg_residual_early_count += 1
-                else:
-                    cfg_residual_late_sums.add_(values)
-                    cfg_residual_late_count += 1
-
-            with controller.inject(
-                source=source,
-                target=target,
-                inversion_step=inversion_index,
-                group=group,
-                alphas=alpha_tensor,
-                weight=config.aci_weight,
-            ):
-                velocity = predict_cfg_velocity(
-                    transformer,
-                    state,
-                    schedule.timesteps[denoising_index].to(device=state.device),
-                    conditional,
-                    unconditional,
-                    image_ids,
-                    guidance_scale=config.guidance_scale,
-                    cfg_enabled=config.guidance_scale > 1.0,
-                    cfg_execution=execution,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                    cfg_residual_callback=record_cfg_residual,
+                stop = position + active_batch
+                base_chunk = _slice_conditioning(base_batch, position, stop)
+                conditional = (
+                    append_anchor_conditioning(
+                        base_chunk,
+                        anchor,
+                        max_anchor_tokens=config.anchor_max_tokens,
+                    )
+                    if sap_active
+                    else base_chunk
                 )
+                alpha_chunk = alpha_tensor[position:stop]
+                chunk_cfg_values: Tensor | None = None
+
+                def record_cfg_residual(
+                    residual: Tensor,
+                    *,
+                    chunk_start: int = position,
+                    chunk_stop: int = stop,
+                ) -> None:
+                    nonlocal chunk_cfg_values
+                    if residual.shape[0] != chunk_stop - chunk_start:
+                        raise ValueError(
+                            "CFG diagnostic batch disagrees with the CHIMERA microbatch"
+                        )
+                    chunk_cfg_values = (
+                        residual.float()
+                        .reshape(residual.shape[0], -1)
+                        .square()
+                        .mean(dim=1)
+                        .sqrt()
+                        .detach()
+                        .to(dtype=torch.float64)
+                    )
+
+                tune_cuda = (
+                    microbatch_sizer is not None
+                    and config.auto_render_batch_size
+                    and denoising_index == 0
+                    and torch.cuda.is_available()
+                    and state.device.type == "cuda"
+                )
+                baseline_allocated = 0
+                free_before = 0
+                total_memory = 0
+                if tune_cuda:
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats(state.device)
+                    baseline_allocated = int(torch.cuda.memory_allocated(state.device))
+                    free_before, total_memory = (
+                        int(value) for value in torch.cuda.mem_get_info(state.device)
+                    )
+                try:
+                    with controller.inject(
+                        source=source,
+                        target=target,
+                        inversion_step=inversion_index,
+                        group=group,
+                        alphas=alpha_chunk,
+                        weight=config.aci_weight,
+                    ):
+                        chunk_velocity = predict_cfg_velocity(
+                            transformer,
+                            state[position:stop],
+                            schedule.timesteps[denoising_index].to(device=state.device),
+                            conditional,
+                            unconditional,
+                            image_ids,
+                            guidance_scale=config.guidance_scale,
+                            cfg_enabled=config.guidance_scale > 1.0,
+                            cfg_execution=execution,
+                            joint_attention_kwargs=joint_attention_kwargs,
+                            cfg_residual_callback=record_cfg_residual,
+                        )
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+                    is_oom = (
+                        isinstance(error, torch.cuda.OutOfMemoryError)
+                        or "out of memory" in str(error).lower()
+                    )
+                    if not (
+                        microbatch_sizer is not None
+                        and config.oom_backoff
+                        and is_oom
+                        and active_batch > 1
+                    ):
+                        raise
+                    retry_batch = microbatch_sizer.record_oom(active_batch)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(
+                        "CHIMERA render OOM; bounded backoff selected "
+                        f"batch_size={retry_batch}"
+                    )
+                    continue
+
+                velocity_parts.append(chunk_velocity)
+                if chunk_cfg_values is not None:
+                    cfg_residual_sums[position:stop].add_(chunk_cfg_values)
+                    cfg_residual_counts[position:stop].add_(1)
+                    if sap_active:
+                        cfg_residual_early_sums[position:stop].add_(chunk_cfg_values)
+                        cfg_residual_early_counts[position:stop].add_(1)
+                    else:
+                        cfg_residual_late_sums[position:stop].add_(chunk_cfg_values)
+                        cfg_residual_late_counts[position:stop].add_(1)
+                if batch_sizes_used is not None:
+                    batch_sizes_used.append(active_batch)
+                if microbatch_sizer is not None:
+                    safe_hint = active_batch
+                    if tune_cuda:
+                        safe_hint = estimate_safe_cuda_batch_size(
+                            current_batch_size=active_batch,
+                            baseline_allocated_bytes=baseline_allocated,
+                            peak_allocated_bytes=int(
+                                torch.cuda.max_memory_allocated(state.device)
+                            ),
+                            free_before_bytes=free_before,
+                            total_bytes=total_memory,
+                            maximum_batch_size=config.render_batch_max,
+                            reserve_fraction=config.batch_memory_reserve_fraction,
+                            reserve_bytes=int(config.batch_memory_reserve_gib * 1024**3),
+                            overhead_factor=config.batch_estimate_overhead,
+                        )
+                    next_batch = microbatch_sizer.record_success(
+                        active_batch,
+                        safe_ceiling_hint=safe_hint,
+                    )
+                    if denoising_index == 0 and next_batch != active_batch and stop < len(amounts):
+                        print(
+                            "CHIMERA adaptive microbatching: "
+                            f"successful={active_batch}, next={next_batch}, "
+                            f"safe_hint={safe_hint}"
+                        )
+                position = stop
+
+            velocity = torch.cat(velocity_parts, dim=0)
+            smoothed_velocity = smooth_velocity_along_alpha(
+                velocity,
+                alpha_tensor,
+                strength=config.velocity_smoothing_strength,
+            )
+            smoothing_delta_sums.add_(
+                (smoothed_velocity.float() - velocity.float())
+                .reshape(len(amounts), -1)
+                .square()
+                .mean(dim=1)
+                .sqrt()
+                .to(dtype=torch.float64)
+            )
             state = euler_flow_update(
                 state,
-                velocity,
+                smoothed_velocity,
                 schedule.sigmas[denoising_index],
                 schedule.sigmas[denoising_index + 1],
             )
@@ -1745,29 +1934,43 @@ def render_chimera_morph(
             row.update(
                 {
                     "guidance_scale": float(config.guidance_scale),
+                    "velocity_smoothing_strength": float(
+                        config.velocity_smoothing_strength
+                    ),
+                    "velocity_smoothing_rms_mean": float(
+                        (
+                            smoothing_delta_sums[index]
+                            / schedule.num_inference_steps
+                        ).item()
+                    ),
                     "cfg_residual_rms_mean": (
-                        float((cfg_residual_sums[index] / cfg_residual_count).item())
-                        if cfg_residual_count
+                        float(
+                            (
+                                cfg_residual_sums[index]
+                                / cfg_residual_counts[index]
+                            ).item()
+                        )
+                        if cfg_residual_counts[index] > 0
                         else None
                     ),
                     "cfg_residual_rms_sap": (
                         float(
                             (
                                 cfg_residual_early_sums[index]
-                                / cfg_residual_early_count
+                                / cfg_residual_early_counts[index]
                             ).item()
                         )
-                        if cfg_residual_early_count
+                        if cfg_residual_early_counts[index] > 0
                         else None
                     ),
                     "cfg_residual_rms_post_sap": (
                         float(
                             (
                                 cfg_residual_late_sums[index]
-                                / cfg_residual_late_count
+                                / cfg_residual_late_counts[index]
                             ).item()
                         )
-                        if cfg_residual_late_count
+                        if cfg_residual_late_counts[index] > 0
                         else None
                     ),
                 }
@@ -1972,97 +2175,28 @@ class ChimeraFlux2Session:
             raise PipelineError("prepared runner lacks CHIMERA rendering state")
         runner._set_lora_scale(self.config.lora_scale)
         transformer = runner.pipeline.transformer
-        output: list[RenderedLatentFrame] = []
         conditioning_diagnostics: list[dict[str, float | str | None]] = []
-        position = 0
-        largest_used = 0
-        while position < len(alphas):
-            remaining = len(alphas) - position
-            active_batch = self.render_batch_sizer.next_batch_size(remaining)
-            chunk = tuple(alphas[position : position + active_batch])
-            tune_cuda = (
-                self.config.auto_render_batch_size
-                and torch.cuda.is_available()
-                and self.device.type == "cuda"
-            )
-            baseline_allocated = 0
-            free_before = 0
-            total_memory = 0
-            if tune_cuda:
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats(self.device)
-                baseline_allocated = int(torch.cuda.memory_allocated(self.device))
-                free_before, total_memory = (
-                    int(value) for value in torch.cuda.mem_get_info(self.device)
-                )
-            try:
-                chunk_diagnostics: list[dict[str, float | str | None]] = []
-                frames = render_chimera_morph(
-                    source_cache,
-                    target_cache,
-                    schedule=runner.schedule,
-                    transformer=transformer,
-                    image_ids=runner.image_ids.to(self.device),
-                    source_conditioning=source_conditioning,
-                    target_conditioning=target_conditioning,
-                    anchor_conditioning=anchor_conditioning,
-                    unconditional_conditioning=runner.conditioning_cache.unconditional,
-                    alphas=chunk,
-                    config=self.config,
-                    ltm_calibration=self._active_ltm_calibration(),
-                    diagnostics=chunk_diagnostics,
-                )
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
-                is_oom = isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error).lower()
-                if not (self.config.oom_backoff and is_oom and active_batch > 1):
-                    raise
-                retry_batch = self.render_batch_sizer.record_oom(active_batch)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print(
-                    "CHIMERA render OOM; bounded backoff selected "
-                    f"batch_size={retry_batch}"
-                )
-                continue
-            conditioning_diagnostics.extend(chunk_diagnostics)
-            safe_hint = active_batch
-            if tune_cuda:
-                safe_hint = estimate_safe_cuda_batch_size(
-                    current_batch_size=active_batch,
-                    baseline_allocated_bytes=baseline_allocated,
-                    peak_allocated_bytes=int(torch.cuda.max_memory_allocated(self.device)),
-                    free_before_bytes=free_before,
-                    total_bytes=total_memory,
-                    maximum_batch_size=self.config.render_batch_max,
-                    reserve_fraction=self.config.batch_memory_reserve_fraction,
-                    reserve_bytes=int(self.config.batch_memory_reserve_gib * 1024**3),
-                    overhead_factor=self.config.batch_estimate_overhead,
-                )
-            next_batch = self.render_batch_sizer.record_success(
-                active_batch,
-                safe_ceiling_hint=safe_hint,
-            )
-            largest_used = max(largest_used, active_batch)
-            for frame in frames:
-                output.append(
-                    RenderedLatentFrame(
-                        index=position + frame.index,
-                        alpha=frame.alpha,
-                        start_state=frame.start_state,
-                        final_latent=frame.final_latent,
-                        conditioning_mode=frame.conditioning_mode,
-                    )
-                )
-            position += len(chunk)
-            if position < len(alphas) and next_batch != active_batch:
-                print(
-                    "CHIMERA adaptive batching: "
-                    f"successful={active_batch}, next={next_batch}, "
-                    f"safe_hint={safe_hint}"
-                )
-        self.last_render_batch_size = largest_used
+        batch_sizes_used: list[int] = []
+        output = render_chimera_morph(
+            source_cache,
+            target_cache,
+            schedule=runner.schedule,
+            transformer=transformer,
+            image_ids=runner.image_ids.to(self.device),
+            source_conditioning=source_conditioning,
+            target_conditioning=target_conditioning,
+            anchor_conditioning=anchor_conditioning,
+            unconditional_conditioning=runner.conditioning_cache.unconditional,
+            alphas=alphas,
+            config=self.config,
+            ltm_calibration=self._active_ltm_calibration(),
+            diagnostics=conditioning_diagnostics,
+            microbatch_sizer=self.render_batch_sizer,
+            batch_sizes_used=batch_sizes_used,
+        )
+        self.last_render_batch_size = max(batch_sizes_used, default=1)
         self.last_conditioning_diagnostics = tuple(conditioning_diagnostics)
-        return tuple(output)
+        return output
 
 
 def radial_frequency_descriptor(
@@ -2221,4 +2355,5 @@ __all__ = [
     "render_chimera_morph",
     "resolve_ltm_group",
     "select_flux_feature_groups",
+    "smooth_velocity_along_alpha",
 ]

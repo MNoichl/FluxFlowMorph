@@ -34,6 +34,7 @@ from flowmorph_klein.chimera import (
     radial_frequency_descriptor,
     render_chimera_morph,
     select_flux_feature_groups,
+    smooth_velocity_along_alpha,
 )
 from flowmorph_klein.conditioning import ConditioningPackage
 from flowmorph_klein.flow_schedule import FlowSchedule
@@ -135,7 +136,37 @@ def test_chimera_config_exposes_paper_defaults_and_memory_controls() -> None:
     assert config.render_batch_max == 10
     assert config.cache_storage == "int8"
     assert config.cache_stride == 2
+    assert config.velocity_smoothing_strength == pytest.approx(0.0)
     assert config.conditioning_interpolation == "slerp"
+
+
+def test_velocity_smoothing_is_alpha_aware_endpoint_fixed_and_reversible() -> None:
+    alphas = (0.1, 0.3, 0.8, 0.95)
+    velocity = torch.tensor([0.0, 3.0, -2.0, 5.0]).reshape(4, 1, 1)
+
+    smoothed = smooth_velocity_along_alpha(
+        velocity,
+        alphas,
+        strength=0.25,
+    )
+    reversed_smoothed = smooth_velocity_along_alpha(
+        velocity.flip(0),
+        tuple(1.0 - alpha for alpha in reversed(alphas)),
+        strength=0.25,
+    ).flip(0)
+
+    assert smoothed[0] == velocity[0]
+    assert smoothed[-1] == velocity[-1]
+    assert not torch.equal(smoothed[1:-1], velocity[1:-1])
+    assert torch.allclose(smoothed, reversed_smoothed)
+
+
+def test_velocity_smoothing_rejects_invalid_strength_and_alpha_order() -> None:
+    velocity = torch.zeros(3, 1, 1)
+    with pytest.raises(ValueError, match="strength"):
+        smooth_velocity_along_alpha(velocity, (0.1, 0.5, 0.9), strength=1.1)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        smooth_velocity_along_alpha(velocity, (0.1, 0.9, 0.5), strength=0.1)
 
 
 def test_chimera_slerp_prevents_midpoint_conditioning_norm_collapse() -> None:
@@ -579,6 +610,7 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
             )
 
     diagnostics: list[dict[str, float | str | None]] = []
+    batch_sizes_used: list[int] = []
     frames = render_chimera_morph(
         source,
         target,
@@ -589,7 +621,7 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
         target_conditioning=target_prompt,
         anchor_conditioning=anchor_prompt,
         unconditional_conditioning=conditioning(0.0),
-        alphas=[0.25, 0.75],
+        alphas=[0.25, 0.5, 0.75],
         config=ChimeraConfig(
             inversion_steps=2,
             denoising_steps=2,
@@ -598,6 +630,7 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
             anchor_max_tokens=2,
             cache_stride=1,
             cache_storage="float32",
+            velocity_smoothing_strength=0.25,
             render_batch_size=2,
             decode_batch_size=2,
             guidance_scale=1.0,
@@ -605,12 +638,16 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
         ),
         ltm_calibration=calibration,
         diagnostics=diagnostics,
+        microbatch_sizer=AdaptiveBatchSizer(2, 2),
+        batch_sizes_used=batch_sizes_used,
     )
 
-    assert [frame.alpha for frame in frames] == [0.25, 0.75]
+    assert [frame.alpha for frame in frames] == [0.25, 0.5, 0.75]
     assert all(frame.final_latent.shape == (1, 4, 3) for frame in frames)
     assert all(bool(torch.isfinite(frame.final_latent).all()) for frame in frames)
     assert not torch.equal(frames[0].final_latent, frames[1].final_latent)
-    assert [row["alpha"] for row in diagnostics] == [0.25, 0.75]
+    assert [row["alpha"] for row in diagnostics] == [0.25, 0.5, 0.75]
     assert all(row["active_norm_retention"] == pytest.approx(1.0) for row in diagnostics)
     assert all(row["cfg_residual_rms_mean"] is None for row in diagnostics)
+    assert all(row["velocity_smoothing_strength"] == pytest.approx(0.25) for row in diagnostics)
+    assert batch_sizes_used == [2, 1, 2, 1]

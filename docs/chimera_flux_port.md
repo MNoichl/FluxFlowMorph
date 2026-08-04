@@ -76,7 +76,7 @@ falls back to fixed coarse-to-fine thirds. Hooks cache and inject image tokens
 only; SAP may change the number of text tokens without invalidating the
 image-feature boundary.
 
-The production notebook calibrates on up to four unique, evenly spaced anchors
+The production notebook calibrates on a configurable set of unique, evenly spaced anchors
 from the active cycle; requesting more anchors than exist never duplicates a
 sample. This is model-, LoRA-, resolution-, prompt-, and image-specific, is
 saved to Google Drive, and is reused across every pair. Only the small FFT
@@ -108,6 +108,31 @@ Set stride `1` and storage `float32` for the closest published-algorithm
 contract. Pair caches are never retained for the whole flat sequence:
 after each pair's interiors are decoded and its completion manifest is safely
 written, both endpoint caches are deleted.
+
+The active trajectory-fidelity experiment raises the notebook calibration set
+to eight anchors and uses stride `1` with `float16` storage. At 1024px this is a
+practical middle ground: every inversion step is retained and quantization is
+removed, while CPU cache storage remains about half of float32. These settings
+do not keep pair caches on the GPU and therefore do not directly reduce the
+learned transformer microbatch size.
+
+## Symmetric velocity smoothing
+
+CHIMERA's endpoint interpolation does not itself couple adjacent midpoint
+denoising trajectories. The notebook therefore exposes a weak, explicitly
+non-paper extension through `CHIMERA_VELOCITY_SMOOTHING_STRENGTH`. At every
+Euler step, the renderer first predicts velocities for the complete ordered
+alpha trajectory in memory-bounded microbatches. It then pulls each interior
+velocity toward the alpha-aware linear interpolation of both neighbours before
+performing the Euler update. The first and last interior velocities remain
+unchanged, and reversing the endpoint direction produces the reversed
+smoothing operation.
+
+This loop ordering is important: microbatches limit transformer activation
+memory but are not allowed to define independent trajectory segments. A
+strength of `0.10` is deliberately conservative. The applied per-frame
+velocity RMS delta is included in conditioning diagnostics so the intervention
+can be audited rather than inferred from the output images.
 
 ## Semantic Anchor Prompting
 

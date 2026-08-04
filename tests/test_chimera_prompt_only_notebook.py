@@ -81,7 +81,7 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_ANCHOR_RELIABILITY_THRESHOLD = 0.45" in text
     assert 'CHIMERA_LTM_MODE = "fft"' in text
     assert "CHIMERA_LTM_BANDS = 16" in text
-    assert "CHIMERA_LTM_CALIBRATION_ANCHORS = 4" in text
+    assert "CHIMERA_LTM_CALIBRATION_ANCHORS = 8" in text
     assert "REUSE_CHIMERA_LTM_CALIBRATION = True" in text
     assert "CHIMERA_AUTO_RENDER_BATCH_SIZE = True" in text
     assert "CHIMERA_RENDER_BATCH_MAX = 10" in text
@@ -93,8 +93,10 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "center_weighted_alpha_schedule(" in text
     assert '"alpha_warp_strength": CHIMERA_ALPHA_WARP_STRENGTH' in text
     assert "conditioning_interpolation=CHIMERA_CONDITIONING_INTERPOLATION" in text
-    assert 'CHIMERA_CACHE_STORAGE = "int8"' in text
-    assert "CHIMERA_CACHE_STRIDE = 2" in text
+    assert 'CHIMERA_CACHE_STORAGE = "float16"' in text
+    assert "CHIMERA_CACHE_STRIDE = 1" in text
+    assert "CHIMERA_VELOCITY_SMOOTHING_STRENGTH = 0.10" in text
+    assert "velocity_smoothing_strength=CHIMERA_VELOCITY_SMOOTHING_STRENGTH" in text
     assert "measures their timestep correspondence" in text
 
 
@@ -110,15 +112,16 @@ def test_cost_preview_resolves_automatic_prompt_count_without_policy_gates() -> 
         "IMAGE_HEIGHT": 1024,
         "CHIMERA_RENDER_BATCH_SIZE": 2,
         "CHIMERA_RENDER_BATCH_MAX": 10,
-        "CHIMERA_LTM_CALIBRATION_ANCHORS": 4,
+        "CHIMERA_LTM_CALIBRATION_ANCHORS": 8,
         "CHIMERA_INVERSION_STEPS": 50,
         "CHIMERA_DENOISING_STEPS": 50,
         "CHIMERA_LTM_MODE": "fft",
         "CHIMERA_LTM_BANDS": 16,
         "CHIMERA_BATCH_MEMORY_RESERVE_FRACTION": 0.1,
         "CHIMERA_BATCH_MEMORY_RESERVE_GIB": 2.0,
-        "CHIMERA_CACHE_STORAGE": "int8",
-        "CHIMERA_CACHE_STRIDE": 2,
+        "CHIMERA_CACHE_STORAGE": "float16",
+        "CHIMERA_CACHE_STRIDE": 1,
+        "CHIMERA_VELOCITY_SMOOTHING_STRENGTH": 0.10,
         "CHIMERA_CONDITIONING_INTERPOLATION": "slerp",
         "RIFE_MULTIPLIER": 2,
     }
