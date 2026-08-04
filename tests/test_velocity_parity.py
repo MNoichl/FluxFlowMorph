@@ -148,6 +148,32 @@ def test_guidance_scale_one_uses_effective_no_cfg_path() -> None:
     torch.testing.assert_close(result, expected)
 
 
+def test_cfg_residual_callback_observes_unscaled_conditional_difference() -> None:
+    transformer = TinyFlux2Transformer(channels=2, feature_width=5)
+    state = torch.randn(2, 4, 2)
+    conditional = package(0.5)
+    unconditional = package(-1.0)
+    ids = make_image_ids(batch_size=2, height=2, width=2)
+    observed: list[torch.Tensor] = []
+
+    predict_cfg_velocity(
+        transformer,
+        state,
+        250,
+        conditional,
+        unconditional,
+        ids,
+        guidance_scale=7.0,
+        execution="batched",
+        cfg_residual_callback=observed.append,
+    )
+    cond = predict_conditional_velocity(transformer, state, 250, conditional, ids)
+    uncond = predict_conditional_velocity(transformer, state, 250, unconditional, ids)
+
+    assert len(observed) == 1
+    torch.testing.assert_close(observed[0], cond - uncond)
+
+
 def test_conditioning_prompt_hash_is_stable_and_text_sensitive() -> None:
     first = package(0.5)
     repeated = package(0.5)

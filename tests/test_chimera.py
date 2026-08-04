@@ -17,9 +17,11 @@ from flowmorph_klein.chimera import (
     append_anchor_conditioning,
     calibrate_flux_ltm,
     compute_glcs_from_similarities,
+    conditioning_interpolation_report,
     estimate_safe_cuda_batch_size,
     flux_depth_ltm,
     invert_endpoint,
+    interpolate_chimera_conditioning,
     map_denoising_to_inversion_step,
     match_ltm_prototypes,
     nearest_cached_step,
@@ -128,6 +130,29 @@ def test_chimera_config_exposes_paper_defaults_and_memory_controls() -> None:
     assert config.render_batch_max == 10
     assert config.cache_storage == "int8"
     assert config.cache_stride == 2
+    assert config.conditioning_interpolation == "slerp"
+
+
+def test_chimera_slerp_prevents_midpoint_conditioning_norm_collapse() -> None:
+    text_ids = torch.zeros(1, 1, 4, dtype=torch.long)
+    source = ConditioningPackage(
+        "source",
+        torch.tensor([[[1.0, 0.0]]]),
+        text_ids,
+    )
+    target = ConditioningPackage(
+        "target",
+        torch.tensor([[[0.0, 2.0]]]),
+        text_ids,
+    )
+
+    midpoint = interpolate_chimera_conditioning(source, target, 0.5)
+    report = conditioning_interpolation_report(source, target, 0.5)
+
+    assert torch.linalg.vector_norm(midpoint.prompt_embeds) == pytest.approx(1.5)
+    assert report["linear_norm_retention"] == pytest.approx(math.sqrt(1.25) / 1.5)
+    assert report["active_norm_retention"] == pytest.approx(1.0)
+    assert report["mode"] == "slerp"
 
 
 def test_cuda_batch_estimate_keeps_reserve_and_overhead_margin() -> None:
@@ -422,6 +447,7 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
                 ltm_calibration=calibration,
             )
 
+    diagnostics: list[dict[str, float | str | None]] = []
     frames = render_chimera_morph(
         source,
         target,
@@ -447,9 +473,13 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
             ltm_bands=4,
         ),
         ltm_calibration=calibration,
+        diagnostics=diagnostics,
     )
 
     assert [frame.alpha for frame in frames] == [0.25, 0.75]
     assert all(frame.final_latent.shape == (1, 4, 3) for frame in frames)
     assert all(bool(torch.isfinite(frame.final_latent).all()) for frame in frames)
     assert not torch.equal(frames[0].final_latent, frames[1].final_latent)
+    assert [row["alpha"] for row in diagnostics] == [0.25, 0.75]
+    assert all(row["active_norm_retention"] == pytest.approx(1.0) for row in diagnostics)
+    assert all(row["cfg_residual_rms_mean"] is None for row in diagnostics)

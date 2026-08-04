@@ -42,7 +42,7 @@ from .conditioning import (
 )
 from .flow_schedule import FlowSchedule, euler_flow_update
 from .flux2_model import predict_cfg_velocity, predict_conditional_velocity
-from .interpolation import slerp
+from .interpolation import slerp, slerp_direction_and_magnitude
 from .pipeline import FlowMorphRunner, PipelineError
 from .renderer import RenderedLatentFrame
 from .sequence import EncodedSequenceImage, FlowMorphSequenceSession
@@ -54,6 +54,7 @@ CHIMERA_GROUPS = ("early", "middle", "late")
 CacheStorage = Literal["int8", "float16", "bfloat16", "float32"]
 GroupName = Literal["early", "middle", "late"]
 LTMMode = Literal["fft", "linear"]
+ConditioningInterpolation = Literal["linear", "slerp"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +86,7 @@ class ChimeraConfig:
     decode_batch_size: int = 4
     guidance_scale: float = 7.0
     lora_scale: float = 1.2
+    conditioning_interpolation: ConditioningInterpolation = "slerp"
     cfg_execution: Literal["sequential", "batched"] = "batched"
     oom_backoff: bool = True
 
@@ -123,6 +125,8 @@ class ChimeraConfig:
             raise ValueError("guidance_scale must be finite and non-negative")
         if not math.isfinite(self.lora_scale) or self.lora_scale <= 0:
             raise ValueError("lora_scale must be finite and positive")
+        if self.conditioning_interpolation not in {"linear", "slerp"}:
+            raise ValueError("conditioning_interpolation must be 'linear' or 'slerp'")
 
 
 def estimate_safe_cuda_batch_size(
@@ -1129,6 +1133,72 @@ def prompt_anchor_reliability(
     return similarity_a, similarity_b, min(similarity_a, similarity_b)
 
 
+def interpolate_chimera_conditioning(
+    source: ConditioningPackage,
+    target: ConditioningPackage,
+    alpha: float,
+    *,
+    mode: ConditioningInterpolation = "slerp",
+) -> ConditioningPackage:
+    """Interpolate CHIMERA text embeddings without midpoint norm collapse.
+
+    The shared conditioning helper intentionally retains linear interpolation
+    for older workflows. CHIMERA defaults to a global embedding SLERP, whose
+    magnitude follows the linear interpolation of endpoint magnitudes while
+    its direction follows the embedding-space great circle.
+    """
+
+    linear = interpolate_conditioning(source, target, alpha)
+    if mode == "linear":
+        return linear
+    if mode != "slerp":
+        raise ValueError("CHIMERA conditioning interpolation must be linear or slerp")
+    target_embeds = target.prompt_embeds.to(
+        device=source.prompt_embeds.device,
+        dtype=source.prompt_embeds.dtype,
+    )
+    embeds = slerp_direction_and_magnitude(
+        source.prompt_embeds,
+        target_embeds,
+        alpha,
+    ).detach()
+    return ConditioningPackage(
+        prompt=(f"chimera-slerp:{alpha:.8g}",),
+        prompt_embeds=embeds,
+        text_ids=linear.text_ids,
+    )
+
+
+def conditioning_interpolation_report(
+    source: ConditioningPackage,
+    target: ConditioningPackage,
+    alpha: float,
+    *,
+    mode: ConditioningInterpolation = "slerp",
+) -> dict[str, float | str]:
+    """Return JSON-safe norm diagnostics for one interpolated prompt."""
+
+    linear = interpolate_conditioning(source, target, alpha)
+    active = interpolate_chimera_conditioning(source, target, alpha, mode=mode)
+    source_norm = float(torch.linalg.vector_norm(source.prompt_embeds.float()).item())
+    target_norm = float(torch.linalg.vector_norm(target.prompt_embeds.float()).item())
+    expected_norm = (1.0 - alpha) * source_norm + alpha * target_norm
+    linear_norm = float(torch.linalg.vector_norm(linear.prompt_embeds.float()).item())
+    active_norm = float(torch.linalg.vector_norm(active.prompt_embeds.float()).item())
+    denominator = max(expected_norm, torch.finfo(torch.float32).eps)
+    return {
+        "alpha": float(alpha),
+        "mode": mode,
+        "source_embedding_norm": source_norm,
+        "target_embedding_norm": target_norm,
+        "expected_embedding_norm": expected_norm,
+        "linear_embedding_norm": linear_norm,
+        "linear_norm_retention": linear_norm / denominator,
+        "active_embedding_norm": active_norm,
+        "active_norm_retention": active_norm / denominator,
+    }
+
+
 def render_chimera_morph(
     source: ChimeraEndpointCache,
     target: ChimeraEndpointCache,
@@ -1144,6 +1214,7 @@ def render_chimera_morph(
     config: ChimeraConfig,
     ltm_calibration: LTMCalibration | None = None,
     joint_attention_kwargs: dict[str, Any] | None = None,
+    diagnostics: list[dict[str, float | str | None]] | None = None,
 ) -> tuple[RenderedLatentFrame, ...]:
     """Denoise slerped endpoint latents with IDM, ACI, and early-step SAP."""
 
@@ -1168,7 +1239,12 @@ def render_chimera_morph(
         dim=0,
     ).to(device=image_ids.device, dtype=torch.float32)
     base_conditionings = [
-        interpolate_conditioning(source_conditioning, target_conditioning, alpha)
+        interpolate_chimera_conditioning(
+            source_conditioning,
+            target_conditioning,
+            alpha,
+            mode=config.conditioning_interpolation,
+        )
         for alpha in amounts
     ]
     base_batch = stack_conditioning_packages(base_conditionings).to(initial.device)
@@ -1176,6 +1252,16 @@ def render_chimera_morph(
     unconditional = unconditional_conditioning.to(initial.device)
     alpha_tensor = torch.tensor(amounts, dtype=torch.float64)
     sap_steps = int(math.ceil(config.sap_active_ratio * schedule.num_inference_steps))
+    cfg_residual_sums = torch.zeros(
+        len(amounts),
+        device=initial.device,
+        dtype=torch.float64,
+    )
+    cfg_residual_early_sums = torch.zeros_like(cfg_residual_sums)
+    cfg_residual_late_sums = torch.zeros_like(cfg_residual_sums)
+    cfg_residual_count = 0
+    cfg_residual_early_count = 0
+    cfg_residual_late_count = 0
 
     state = initial
     controller = FluxFeatureController(
@@ -1209,6 +1295,31 @@ def render_chimera_morph(
             # lengths.  SAP deliberately changes only the conditional branch,
             # so its short early phase runs sequential CFG.
             execution = "sequential" if sap_active else config.cfg_execution
+
+            def record_cfg_residual(residual: Tensor) -> None:
+                nonlocal cfg_residual_count
+                nonlocal cfg_residual_early_count
+                nonlocal cfg_residual_late_count
+                if residual.shape[0] != len(amounts):
+                    raise ValueError("CFG diagnostic batch disagrees with CHIMERA alphas")
+                values = (
+                    residual.float()
+                    .reshape(residual.shape[0], -1)
+                    .square()
+                    .mean(dim=1)
+                    .sqrt()
+                    .detach()
+                    .to(dtype=torch.float64)
+                )
+                cfg_residual_sums.add_(values)
+                cfg_residual_count += 1
+                if sap_active:
+                    cfg_residual_early_sums.add_(values)
+                    cfg_residual_early_count += 1
+                else:
+                    cfg_residual_late_sums.add_(values)
+                    cfg_residual_late_count += 1
+
             with controller.inject(
                 source=source,
                 target=target,
@@ -1228,6 +1339,7 @@ def render_chimera_morph(
                     cfg_enabled=config.guidance_scale > 1.0,
                     cfg_execution=execution,
                     joint_attention_kwargs=joint_attention_kwargs,
+                    cfg_residual_callback=record_cfg_residual,
                 )
             state = euler_flow_update(
                 state,
@@ -1239,6 +1351,46 @@ def render_chimera_morph(
                 raise FloatingPointError(
                     f"CHIMERA denoising produced non-finite values at step {denoising_index}"
                 )
+
+    if diagnostics is not None:
+        for index, alpha in enumerate(amounts):
+            row: dict[str, float | str | None] = conditioning_interpolation_report(
+                source_conditioning,
+                target_conditioning,
+                alpha,
+                mode=config.conditioning_interpolation,
+            )
+            row.update(
+                {
+                    "guidance_scale": float(config.guidance_scale),
+                    "cfg_residual_rms_mean": (
+                        float((cfg_residual_sums[index] / cfg_residual_count).item())
+                        if cfg_residual_count
+                        else None
+                    ),
+                    "cfg_residual_rms_sap": (
+                        float(
+                            (
+                                cfg_residual_early_sums[index]
+                                / cfg_residual_early_count
+                            ).item()
+                        )
+                        if cfg_residual_early_count
+                        else None
+                    ),
+                    "cfg_residual_rms_post_sap": (
+                        float(
+                            (
+                                cfg_residual_late_sums[index]
+                                / cfg_residual_late_count
+                            ).item()
+                        )
+                        if cfg_residual_late_count
+                        else None
+                    ),
+                }
+            )
+            diagnostics.append(row)
 
     return tuple(
         RenderedLatentFrame(
@@ -1276,6 +1428,9 @@ class ChimeraFlux2Session:
             config.render_batch_max,
         )
         self.last_render_batch_size = 1
+        self.last_conditioning_diagnostics: tuple[
+            dict[str, float | str | None], ...
+        ] = ()
 
     @property
     def device(self) -> torch.device:
@@ -1288,6 +1443,12 @@ class ChimeraFlux2Session:
     @property
     def render_batch_report(self) -> dict[str, int | None]:
         return self.render_batch_sizer.report()
+
+    @property
+    def conditioning_diagnostics_report(
+        self,
+    ) -> tuple[dict[str, float | str | None], ...]:
+        return self.last_conditioning_diagnostics
 
     def seed_prepared_assets(self, source_key: str, target_key: str):
         return self.assets.seed_prepared_assets(source_key, target_key)
@@ -1430,6 +1591,7 @@ class ChimeraFlux2Session:
         runner._set_lora_scale(self.config.lora_scale)
         transformer = runner.pipeline.transformer
         output: list[RenderedLatentFrame] = []
+        conditioning_diagnostics: list[dict[str, float | str | None]] = []
         position = 0
         largest_used = 0
         while position < len(alphas):
@@ -1452,6 +1614,7 @@ class ChimeraFlux2Session:
                     int(value) for value in torch.cuda.mem_get_info(self.device)
                 )
             try:
+                chunk_diagnostics: list[dict[str, float | str | None]] = []
                 frames = render_chimera_morph(
                     source_cache,
                     target_cache,
@@ -1465,6 +1628,7 @@ class ChimeraFlux2Session:
                     alphas=chunk,
                     config=self.config,
                     ltm_calibration=self._active_ltm_calibration(),
+                    diagnostics=chunk_diagnostics,
                 )
             except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
                 is_oom = isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error).lower()
@@ -1478,6 +1642,7 @@ class ChimeraFlux2Session:
                     f"batch_size={retry_batch}"
                 )
                 continue
+            conditioning_diagnostics.extend(chunk_diagnostics)
             safe_hint = active_batch
             if tune_cuda:
                 safe_hint = estimate_safe_cuda_batch_size(
@@ -1514,6 +1679,7 @@ class ChimeraFlux2Session:
                     f"safe_hint={safe_hint}"
                 )
         self.last_render_batch_size = largest_used
+        self.last_conditioning_diagnostics = tuple(conditioning_diagnostics)
         return tuple(output)
 
 
@@ -1653,10 +1819,12 @@ __all__ = [
     "StoredFeature",
     "append_anchor_conditioning",
     "calibrate_flux_ltm",
+    "conditioning_interpolation_report",
     "compute_glcs_from_similarities",
     "estimate_safe_cuda_batch_size",
     "flux_depth_ltm",
     "invert_endpoint",
+    "interpolate_chimera_conditioning",
     "map_denoising_to_inversion_step",
     "match_ltm_prototypes",
     "nearest_cached_step",

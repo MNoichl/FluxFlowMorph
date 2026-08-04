@@ -69,6 +69,8 @@ def test_colab_setup_imports_chimera_from_the_updated_repository() -> None:
     assert '"origin", REPOSITORY_REF' in setup
     assert '"checkout", "--detach", "FETCH_HEAD"' in setup
     assert '"pull", "--ff-only"' not in setup
+    assert "UPDATE_REPOSITORY" not in settings
+    assert "UPDATE_REPOSITORY" not in setup
     assert 'importlib.import_module("flowmorph_klein.chimera")' in setup
     assert "import flowmorph_klein" in setup
     assert "from flowmorph_klein.chimera import (" in code
@@ -92,6 +94,8 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_BATCH_MEMORY_RESERVE_FRACTION = 0.10" in text
     assert "CHIMERA_BATCH_MEMORY_RESERVE_GIB = 2.0" in text
     assert "CHIMERA_DECODE_BATCH_SIZE = 10" in text
+    assert 'CHIMERA_CONDITIONING_INTERPOLATION = "slerp"' in text
+    assert "conditioning_interpolation=CHIMERA_CONDITIONING_INTERPOLATION" in text
     assert 'CHIMERA_CACHE_STORAGE = "int8"' in text
     assert "CHIMERA_CACHE_STRIDE = 2" in text
     assert "measures their timestep correspondence" in text
@@ -196,6 +200,14 @@ def test_render_batch_is_measured_grown_and_bounded_with_memory_reserve() -> Non
     assert "batch_memory_reserve_fraction=CHIMERA_BATCH_MEMORY_RESERVE_FRACTION" in code
     assert '"render_batch_report": CHIMERA_SESSION.render_batch_report' in code
     assert "binary backoff" in all_source(load_notebook())
+
+
+def test_midpoint_conditioning_diagnostics_are_dense_and_persisted() -> None:
+    code = code_source(load_notebook())
+    assert "CHIMERA_ONE_GAP_TEST_ALPHAS = [0.05, 0.25, 0.5, 0.75, 0.95]" in code
+    assert '"conditioning_interpolation": CHIMERA_CONDITIONING_INTERPOLATION' in code
+    assert "CHIMERA_SESSION.conditioning_diagnostics_report" in code
+    assert '"conditioning_diagnostics"' in code
 
 
 def test_sap_triplet_is_image_aware_reliable_and_bounded() -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -269,6 +270,7 @@ def predict_cfg_velocity(
     cfg_execution: str = "sequential",
     execution: str | None = None,
     joint_attention_kwargs: dict[str, Any] | None = None,
+    cfg_residual_callback: Callable[[torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
     """Apply exact external CFG using sequential or batched evaluation."""
 
@@ -319,9 +321,10 @@ def predict_cfg_velocity(
             image_ids,
             joint_attention_kwargs=joint_attention_kwargs,
         )
-    return unconditional_velocity + float(guidance_scale) * (
-        conditional_velocity - unconditional_velocity
-    )
+    cfg_residual = conditional_velocity - unconditional_velocity
+    if cfg_residual_callback is not None:
+        cfg_residual_callback(cfg_residual.detach())
+    return unconditional_velocity + float(guidance_scale) * cfg_residual
 
 
 class FlowMorphFlux2Model:

@@ -45,6 +45,12 @@ A new run seed is drawn from OS entropy, saved as `metadata/run_seed.json`, and
 reused when that run is resumed; rerunning into a new run directory therefore
 produces new anchors.
 
+The Colab setup cell always fetches `REPOSITORY_REF`, checks out the freshly
+fetched commit, clears previously imported `flowmorph_klein` modules, and then
+imports the package from the checked-out `src` directory. Rerunning that cell
+therefore refreshes implementation code even when the repository is already
+present in the runtime.
+
 ## FLUX architecture mapping
 
 The main CHIMERA derivation describes U-Net down, mid, and up features. FLUX.2
@@ -108,6 +114,14 @@ SAP is implemented by concatenating up to 64 anchor embedding tokens to the
 conditional text context during the first 20% of Euler steps. Early SAP steps
 use sequential external CFG because conditional and unconditional token counts
 differ; later steps return to the configured batched CFG path.
+
+Endpoint prompt embeddings follow a norm-preserving spherical interpolation
+by default. This avoids the midpoint norm loss possible under direct linear
+averaging of semantically different endpoint embeddings. Every render records
+the active and hypothetical linear embedding norms plus mean CFG-residual RMS
+for the SAP and post-SAP phases. These diagnostics are persisted in each pair's
+cache report, and the interpolation mode is part of the pair fingerprint so
+linear-conditioning results cannot be silently reused as SLERP results.
 
 ## GLCS
 
