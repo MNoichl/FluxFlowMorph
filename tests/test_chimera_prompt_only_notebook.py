@@ -74,8 +74,8 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     text = all_source(load_notebook())
     assert "CHIMERA_ROUND_SPECS = [" in text
     assert '"midpoint_count":' in text
-    assert "CHIMERA_INVERSION_STEPS = 50" in text
-    assert "CHIMERA_DENOISING_STEPS = 50" in text
+    assert "CHIMERA_INVERSION_STEPS = 32" in text
+    assert "CHIMERA_DENOISING_STEPS = 32" in text
     assert "CHIMERA_ACI_WEIGHT = 0.4" in text
     assert "CHIMERA_SAP_ACTIVE_RATIO = 0.2" in text
     assert "CHIMERA_ANCHOR_RELIABILITY_THRESHOLD = 0.45" in text
@@ -88,6 +88,8 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_BATCH_MEMORY_RESERVE_FRACTION = 0.10" in text
     assert "CHIMERA_BATCH_MEMORY_RESERVE_GIB = 2.0" in text
     assert "CHIMERA_DECODE_BATCH_SIZE = 10" in text
+    assert "CHIMERA_CFG_START_RATIO = 0.0" in text
+    assert "CHIMERA_CFG_STOP_RATIO = 0.70" in text
     assert 'CHIMERA_CONDITIONING_INTERPOLATION = "slerp"' in text
     assert "CHIMERA_ALPHA_WARP_STRENGTH = 0.0" in text
     assert "center_weighted_alpha_schedule(" in text
@@ -118,6 +120,7 @@ def test_base_pipeline_defaults_to_gpu_resident_and_releases_before_chimera() ->
 
     assert "BASE_PIPELINE_CPU_OFFLOAD = False" in code
     assert "BASE_PIPELINE_RESIDENT_RESERVE_GIB = 12.0" in code
+    assert "CHIMERA_HANDOFF_MAX_CUDA_GIB = 1.0" in code
     assert "effective_cpu_offload = bool(BASE_PIPELINE_CPU_OFFLOAD)" in model_source
     assert "if effective_cpu_offload:" in model_source
     assert "pipeline.enable_model_cpu_offload()" in model_source
@@ -133,11 +136,15 @@ def test_base_pipeline_defaults_to_gpu_resident_and_releases_before_chimera() ->
     assert "automatic CPU-offload fallback" in model_source
     assert "except (torch.cuda.OutOfMemoryError, RuntimeError) as error:" in model_source
     assert 'pipeline.to("cpu")' in model_source
+    assert 'move_to_cpu("cpu")' in model_source
     assert "automatic low-free-VRAM fallback" in model_source
     runner_load = chimera_source.index("CHIMERA_RUNNER = FlowMorphRunner.from_config")
     final_release = chimera_source.rfind("release_flux_pipeline()", 0, runner_load)
     assert final_release >= 0
     assert 'if "FLUX_PIPE" in globals()' in chimera_source[final_release:runner_load]
+    assert "allocated_gib > CHIMERA_HANDOFF_MAX_CUDA_GIB" in chimera_source
+    assert "cuda_process_report()" in chimera_source
+    assert "CHIMERA preparation ran out of VRAM" in chimera_source
     assert "torch.cuda.empty_cache()" in model_source
 
 
@@ -154,8 +161,10 @@ def test_cost_preview_resolves_automatic_prompt_count_without_policy_gates() -> 
         "CHIMERA_RENDER_BATCH_SIZE": 2,
         "CHIMERA_RENDER_BATCH_MAX": 10,
         "CHIMERA_LTM_CALIBRATION_ANCHORS": 8,
-        "CHIMERA_INVERSION_STEPS": 50,
-        "CHIMERA_DENOISING_STEPS": 50,
+        "CHIMERA_INVERSION_STEPS": 32,
+        "CHIMERA_DENOISING_STEPS": 32,
+        "CHIMERA_CFG_START_RATIO": 0.0,
+        "CHIMERA_CFG_STOP_RATIO": 0.70,
         "CHIMERA_LTM_MODE": "fft",
         "CHIMERA_LTM_BANDS": 16,
         "CHIMERA_BATCH_MEMORY_RESERVE_FRACTION": 0.1,
@@ -171,6 +180,8 @@ def test_cost_preview_resolves_automatic_prompt_count_without_policy_gates() -> 
 
     assert namespace["BASE_PROMPT_COUNT"] == 3
     assert namespace["round_counts"] == [3, 51]
+    assert namespace["cfg_active_steps"] == 23
+    assert namespace["conditional_only_steps"] == 9
     assert "production contract" not in source
     assert "CHIMERA_DENOISING_STEPS !=" not in source
     assert "CHIMERA_LORA_SCALE !=" not in source
@@ -281,6 +292,10 @@ def test_render_batch_is_measured_grown_and_bounded_with_memory_reserve() -> Non
     assert "render_batch_max=CHIMERA_RENDER_BATCH_MAX" in code
     assert "auto_render_batch_size=CHIMERA_AUTO_RENDER_BATCH_SIZE" in code
     assert "batch_memory_reserve_fraction=CHIMERA_BATCH_MEMORY_RESERVE_FRACTION" in code
+    assert "cfg_start_ratio=CHIMERA_CFG_START_RATIO" in code
+    assert "cfg_stop_ratio=CHIMERA_CFG_STOP_RATIO" in code
+    assert '"cfg_start_ratio": CHIMERA_CFG_START_RATIO' in code
+    assert '"cfg_stop_ratio": CHIMERA_CFG_STOP_RATIO' in code
     assert '"render_batch_report": CHIMERA_SESSION.render_batch_report' in code
     assert "binary backoff" in all_source(load_notebook())
 

@@ -212,6 +212,8 @@ class ChimeraConfig:
     batch_estimate_overhead: float = 1.25
     decode_batch_size: int = 4
     guidance_scale: float = 7.0
+    cfg_start_ratio: float = 0.0
+    cfg_stop_ratio: float = 1.0
     lora_scale: float = 1.2
     conditioning_interpolation: ConditioningInterpolation = "slerp"
     cfg_execution: Literal["sequential", "batched"] = "batched"
@@ -255,6 +257,12 @@ class ChimeraConfig:
             raise ValueError("batch_estimate_overhead must be finite and at least one")
         if not math.isfinite(self.guidance_scale) or self.guidance_scale < 0:
             raise ValueError("guidance_scale must be finite and non-negative")
+        if (
+            not math.isfinite(self.cfg_start_ratio)
+            or not math.isfinite(self.cfg_stop_ratio)
+            or not 0.0 <= self.cfg_start_ratio <= self.cfg_stop_ratio <= 1.0
+        ):
+            raise ValueError("CFG interval ratios must satisfy 0 <= start <= stop <= 1")
         if not math.isfinite(self.lora_scale) or self.lora_scale <= 0:
             raise ValueError("lora_scale must be finite and positive")
         if self.conditioning_interpolation not in {"linear", "slerp"}:
@@ -1086,10 +1094,17 @@ def _output_image_tensor(output: Any, image_token_count: int) -> Tensor:
 def _batch_slerp(a: Tensor, b: Tensor, alphas: Tensor) -> Tensor:
     if a.shape != b.shape or a.ndim != 3 or a.shape[0] != 1:
         raise ValueError("cached feature endpoints must share shape (1, tokens, channels)")
-    values = []
-    for amount in alphas.detach().to("cpu", dtype=torch.float64).tolist():
-        values.append(slerp(a, b, float(amount)))
-    return torch.cat(values, dim=0)
+    amounts = alphas.detach().to("cpu", dtype=torch.float64).tolist()
+    output = torch.empty(
+        (len(amounts), *a.shape[1:]),
+        device=a.device,
+        dtype=a.dtype,
+    )
+    for index, amount in enumerate(amounts):
+        # Copy each result directly into its final slot. Building a list and
+        # concatenating retained every temporary alongside a second full buffer.
+        output[index : index + 1].copy_(slerp(a, b, float(amount)))
+    return output
 
 
 class FluxFeatureController:
@@ -1798,7 +1813,9 @@ def render_chimera_morph(
     When ``microbatch_sizer`` is supplied, every denoising timestep evaluates
     the complete alpha trajectory in memory-bounded chunks before applying
     symmetric velocity smoothing.  Thus batch boundaries cannot become
-    trajectory boundaries.
+    trajectory boundaries. External CFG is evaluated only inside the
+    configured denoising-step interval; outside it the conditional branch is
+    retained and the unconditional branch is skipped.
     """
 
     if schedule.num_inference_steps != config.denoising_steps:
@@ -1834,7 +1851,23 @@ def render_chimera_morph(
     anchor = anchor_conditioning.to(initial.device)
     unconditional = unconditional_conditioning.to(initial.device)
     alpha_tensor = torch.tensor(amounts, dtype=torch.float64)
-    sap_steps = int(math.ceil(config.sap_active_ratio * schedule.num_inference_steps))
+    step_count = schedule.num_inference_steps
+    sap_steps = int(math.ceil(config.sap_active_ratio * step_count))
+    cfg_start_step = int(math.floor(config.cfg_start_ratio * step_count))
+    cfg_stop_step = int(math.ceil(config.cfg_stop_ratio * step_count))
+    cfg_possible = config.guidance_scale > 1.0 and cfg_start_step < cfg_stop_step
+    # Probe the first non-SAP batched-CFG step, which has the largest activation
+    # footprint, rather than learning an unsafe ceiling from sequential CFG.
+    batched_cfg_start = max(sap_steps, cfg_start_step)
+    tuning_step = (
+        batched_cfg_start
+        if (
+            cfg_possible
+            and config.cfg_execution == "batched"
+            and batched_cfg_start < cfg_stop_step
+        )
+        else 0
+    )
     cfg_residual_sums = torch.zeros(
         len(amounts),
         device=initial.device,
@@ -1866,10 +1899,18 @@ def render_chimera_morph(
                 active_ltm,
             )
             sap_active = denoising_index < sap_steps
+            cfg_active = (
+                cfg_possible
+                and cfg_start_step <= denoising_index < cfg_stop_step
+            )
             # Batched CFG requires matching conditional/unconditional token
             # lengths.  SAP deliberately changes only the conditional branch,
             # so its short early phase runs sequential CFG.
-            execution = "sequential" if sap_active else config.cfg_execution
+            execution = (
+                "sequential"
+                if sap_active and cfg_active
+                else config.cfg_execution
+            )
             velocity_parts: list[Tensor] = []
             position = 0
             while position < len(amounts):
@@ -1917,7 +1958,7 @@ def render_chimera_morph(
                 tune_cuda = (
                     microbatch_sizer is not None
                     and config.auto_render_batch_size
-                    and denoising_index == 0
+                    and denoising_index == tuning_step
                     and torch.cuda.is_available()
                     and state.device.type == "cuda"
                 )
@@ -1948,7 +1989,7 @@ def render_chimera_morph(
                             unconditional,
                             image_ids,
                             guidance_scale=config.guidance_scale,
-                            cfg_enabled=config.guidance_scale > 1.0,
+                            cfg_enabled=cfg_active,
                             cfg_execution=execution,
                             joint_attention_kwargs=joint_attention_kwargs,
                             cfg_residual_callback=record_cfg_residual,
@@ -2006,7 +2047,11 @@ def render_chimera_morph(
                         active_batch,
                         safe_ceiling_hint=safe_hint,
                     )
-                    if denoising_index == 0 and next_batch != active_batch and stop < len(amounts):
+                    if (
+                        denoising_index == tuning_step
+                        and next_batch != active_batch
+                        and stop < len(amounts)
+                    ):
                         print(
                             "CHIMERA adaptive microbatching: "
                             f"successful={active_batch}, next={next_batch}, "
@@ -2050,6 +2095,12 @@ def render_chimera_morph(
             row.update(
                 {
                     "guidance_scale": float(config.guidance_scale),
+                    "cfg_start_ratio": float(config.cfg_start_ratio),
+                    "cfg_stop_ratio": float(config.cfg_stop_ratio),
+                    "cfg_active_steps": float(max(0, cfg_stop_step - cfg_start_step)),
+                    "cfg_residual_step_count": float(
+                        cfg_residual_counts[index].item()
+                    ),
                     "velocity_smoothing_strength": float(
                         config.velocity_smoothing_strength
                     ),

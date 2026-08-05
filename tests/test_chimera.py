@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import flowmorph_klein.chimera as chimera_module
 from flowmorph_klein.chimera import (
     AdaptiveBatchSizer,
     ChimeraConfig,
@@ -138,6 +139,17 @@ def test_chimera_config_exposes_paper_defaults_and_memory_controls() -> None:
     assert config.cache_stride == 2
     assert config.velocity_smoothing_strength == pytest.approx(0.0)
     assert config.conditioning_interpolation == "slerp"
+    assert config.cfg_start_ratio == pytest.approx(0.0)
+    assert config.cfg_stop_ratio == pytest.approx(1.0)
+
+
+def test_chimera_config_validates_limited_cfg_interval() -> None:
+    config = ChimeraConfig(cfg_start_ratio=0.2, cfg_stop_ratio=0.7)
+    assert config.cfg_start_ratio == pytest.approx(0.2)
+    assert config.cfg_stop_ratio == pytest.approx(0.7)
+
+    with pytest.raises(ValueError, match="CFG interval"):
+        ChimeraConfig(cfg_start_ratio=0.8, cfg_stop_ratio=0.7)
 
 
 def test_velocity_smoothing_is_alpha_aware_endpoint_fixed_and_reversible() -> None:
@@ -624,7 +636,7 @@ def test_glcs_returns_geometric_mean_of_global_and_local_terms() -> None:
     )
 
 
-def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
+def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite(monkeypatch) -> None:
     transformer = FakeFluxTransformer()
     schedule = FlowSchedule(
         timesteps=torch.tensor([1000.0, 500.0]),
@@ -672,6 +684,18 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
                 ltm_calibration=calibration,
             )
 
+    cfg_enabled_calls: list[bool] = []
+    original_predict_cfg_velocity = chimera_module.predict_cfg_velocity
+
+    def observed_predict_cfg_velocity(*args, **kwargs):
+        cfg_enabled_calls.append(bool(kwargs["cfg_enabled"]))
+        return original_predict_cfg_velocity(*args, **kwargs)
+
+    monkeypatch.setattr(
+        chimera_module,
+        "predict_cfg_velocity",
+        observed_predict_cfg_velocity,
+    )
     diagnostics: list[dict[str, float | str | None]] = []
     batch_sizes_used: list[int] = []
     frames = render_chimera_morph(
@@ -696,7 +720,8 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
             velocity_smoothing_strength=0.25,
             render_batch_size=2,
             decode_batch_size=2,
-            guidance_scale=1.0,
+            guidance_scale=7.0,
+            cfg_stop_ratio=0.5,
             ltm_bands=4,
         ),
         ltm_calibration=calibration,
@@ -711,6 +736,9 @@ def test_tiny_end_to_end_inversion_aci_and_sap_path_is_finite() -> None:
     assert not torch.equal(frames[0].final_latent, frames[1].final_latent)
     assert [row["alpha"] for row in diagnostics] == [0.25, 0.5, 0.75]
     assert all(row["active_norm_retention"] == pytest.approx(1.0) for row in diagnostics)
-    assert all(row["cfg_residual_rms_mean"] is None for row in diagnostics)
+    assert all(row["cfg_residual_rms_mean"] is not None for row in diagnostics)
+    assert all(row["cfg_active_steps"] == pytest.approx(1.0) for row in diagnostics)
+    assert all(row["cfg_residual_step_count"] == pytest.approx(1.0) for row in diagnostics)
     assert all(row["velocity_smoothing_strength"] == pytest.approx(0.25) for row in diagnostics)
+    assert cfg_enabled_calls == [True, True, False, False]
     assert batch_sizes_used == [2, 1, 2, 1]
