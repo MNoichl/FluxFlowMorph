@@ -79,6 +79,7 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_ACI_WEIGHT = 0.4" in text
     assert "CHIMERA_SAP_ACTIVE_RATIO = 0.2" in text
     assert "CHIMERA_ANCHOR_RELIABILITY_THRESHOLD = 0.45" in text
+    assert "CHIMERA_ENFORCE_SAP_RELIABILITY = False" in text
     assert 'CHIMERA_LTM_MODE = "fft"' in text
     assert "CHIMERA_LTM_BANDS = 16" in text
     assert "CHIMERA_LTM_CALIBRATION_ANCHORS = 8" in text
@@ -362,7 +363,9 @@ def test_sap_uses_one_image_aware_intermediate_prompt_per_pair() -> None:
     assert "ROUND {round_number} GAP {job['gap_index']} PROMPT PLAN" in code
     assert "prompt_anchor_reliability(" in code
     assert "CHIMERA_SAP_MAX_REQUERIES" in code
-    assert "reliability >= CHIMERA_ANCHOR_RELIABILITY_THRESHOLD" in code
+    assert "reliability_passed = reliability >= CHIMERA_ANCHOR_RELIABILITY_THRESHOLD" in code
+    assert "reliability_passed or not CHIMERA_ENFORCE_SAP_RELIABILITY" in code
+    assert '"below diagnostic threshold; accepted without requery"' in code
     assert "validate_flux_prompt_length" in code
 
 
