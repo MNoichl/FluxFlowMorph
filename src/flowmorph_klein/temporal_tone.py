@@ -28,9 +28,9 @@ class TemporalToneConfig:
     analysis_max_side: int = 256
     chroma_enabled: bool = False
     chroma_strength: float = 0.7
-    chroma_threshold: float = 0.01
-    max_chroma_gain: float = 0.12
-    max_chroma_decrease: float = 0.08
+    chroma_threshold: float = 0.0
+    max_chroma_gain: float | None = None
+    max_chroma_decrease: float | None = None
     chroma_smoothness: float = 6.0
 
     def validate(self, frame_count: int) -> None:
@@ -54,10 +54,15 @@ class TemporalToneConfig:
             raise ValueError("chroma_strength must lie in [0, 1]")
         if not 0.0 <= self.chroma_threshold < 1.0:
             raise ValueError("chroma_threshold must lie in [0, 1)")
-        if not 0.0 <= self.max_chroma_gain < 1.0:
-            raise ValueError("max_chroma_gain must lie in [0, 1)")
-        if not 0.0 <= self.max_chroma_decrease < 1.0:
-            raise ValueError("max_chroma_decrease must lie in [0, 1)")
+        if self.max_chroma_gain is not None and (
+            not math.isfinite(self.max_chroma_gain) or self.max_chroma_gain < 0.0
+        ):
+            raise ValueError("max_chroma_gain must be None or a finite non-negative value")
+        if self.max_chroma_decrease is not None and (
+            not math.isfinite(self.max_chroma_decrease)
+            or not 0.0 <= self.max_chroma_decrease < 1.0
+        ):
+            raise ValueError("max_chroma_decrease must be None or lie in [0, 1)")
         if self.chroma_smoothness < 0.0:
             raise ValueError("chroma_smoothness cannot be negative")
 
@@ -201,8 +206,10 @@ def _chroma_correction_trajectory(
     The endpoint line is the perceptual reference, while ``chroma_strength``
     controls how far the raw measurements are pulled toward it. A Whittaker
     second-difference penalty then smooths that desired output trajectory
-    itself. Only after that solve do we derive and cap signed per-frame gains;
-    the correction curve is deliberately not smoothed independently.
+    itself. Only after that solve do we derive the exact signed per-frame gains;
+    the correction curve is deliberately not smoothed independently. Optional
+    gain limits remain available as explicit emergency guards, but the default
+    path follows the solved trajectory without clipping it.
     """
 
     frame_count = len(chromas)
@@ -246,17 +253,22 @@ def _chroma_correction_trajectory(
         for offset, index in enumerate(segment):
             desired[index] = segment_desired[offset]
 
-    denominators = np.maximum(chromas, np.finfo(np.float64).eps)
-    requested_gains = desired / denominators - 1.0
-    effective_gains = np.sign(requested_gains) * np.maximum(
-        np.abs(requested_gains) - config.chroma_threshold,
+    # A truly achromatic frame has no hue direction that can be amplified.
+    # Leave only that pathological case untouched instead of manufacturing a
+    # color from numerical noise. Every ordinary frame receives the exact
+    # multiplicative scale required by the solved smooth target.
+    chroma_floor = np.finfo(np.float32).eps
+    requested_gains = np.zeros(frame_count, dtype=np.float64)
+    chromatic = chromas > chroma_floor
+    requested_gains[chromatic] = desired[chromatic] / chromas[chromatic] - 1.0
+    gains = np.where(
+        np.abs(requested_gains) <= config.chroma_threshold,
         0.0,
+        requested_gains,
     )
-    gains = np.clip(
-        effective_gains,
-        -config.max_chroma_decrease,
-        config.max_chroma_gain,
-    )
+    lower_limit = -config.max_chroma_decrease if config.max_chroma_decrease is not None else -np.inf
+    upper_limit = config.max_chroma_gain if config.max_chroma_gain is not None else np.inf
+    gains = np.clip(gains, lower_limit, upper_limit)
     gains[np.asarray(anchors, dtype=int)] = 0.0
     return targets, desired, gains
 
@@ -288,7 +300,7 @@ def _fingerprint(
     chroma_anchor_indices: Sequence[int] | None,
 ) -> tuple[str, dict[str, Any]]:
     contract = {
-        "algorithm": "cyclic_luminance_affine_and_signed_smooth_oklab_chroma_v3",
+        "algorithm": "cyclic_luminance_affine_and_direct_smooth_oklab_chroma_v4",
         "config": asdict(config),
         "chroma_anchor_indices": (list(chroma_anchor_indices) if chroma_anchor_indices is not None else None),
         "sources": [_source_contract(path) for path in paths],
@@ -393,9 +405,10 @@ def stabilize_cyclic_tone(
     The detector compares every frame with the median tone of its cyclic
     neighbors. Only robust outliers are corrected. Correction is an explicitly
     capped affine change to luminance. Optional chroma correction follows a
-    smooth endpoint-anchored OKLab trajectory, applies bounded signed chroma
-    changes, and remains exactly fixed at every endpoint. All source files
-    remain untouched.
+    smooth endpoint-anchored OKLab trajectory, applies the exact signed chroma
+    scale needed to follow it, and remains fixed at every endpoint. Optional
+    gain limits are emergency guards rather than part of the default path. All
+    source files remain untouched.
     """
 
     paths = tuple(Path(path) for path in image_paths)
@@ -568,6 +581,8 @@ def stabilize_cyclic_tone(
             "output": [float(value) for value in output_chromas],
             "source_target_mae": float(np.mean(np.abs(chromas - chroma_targets))),
             "desired_target_mae": float(np.mean(np.abs(chroma_desired - chroma_targets))),
+            "desired_output_mae": float(np.mean(np.abs(output_chromas - chroma_desired))),
+            "maximum_desired_output_error": float(np.max(np.abs(output_chromas - chroma_desired))),
             "output_target_mae": float(np.mean(np.abs(output_chromas - chroma_targets))),
             "source_curvature_rms": curvature_rms(chromas),
             "desired_curvature_rms": curvature_rms(chroma_desired),

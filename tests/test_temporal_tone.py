@@ -145,8 +145,8 @@ def test_temporal_chroma_lifts_midpoint_deficit_with_smooth_zero_endpoint_gain(
             chroma_enabled=True,
             chroma_strength=0.7,
             chroma_threshold=0.0,
-            max_chroma_gain=0.12,
-            max_chroma_decrease=0.08,
+            max_chroma_gain=None,
+            max_chroma_decrease=None,
             chroma_smoothness=6.0,
         ),
         chroma_anchor_indices=[0, 6],
@@ -160,16 +160,19 @@ def test_temporal_chroma_lifts_midpoint_deficit_with_smooth_zero_endpoint_gain(
     assert gains[0] == 0.0
     assert gains[6] == 0.0
     assert gains == pytest.approx(gains[::-1])
-    assert np.max(gains) <= 0.12
     assert output[3] > source[3]
     assert np.mean(np.abs(output - target)) < np.mean(np.abs(source - target))
+    assert trajectory["desired_output_mae"] < 0.001
+    assert output == pytest.approx(trajectory["desired"], abs=0.0015)
     assert trajectory["desired_curvature_rms"] < trajectory["source_curvature_rms"]
     assert result.output_paths[0] == paths[0]
     assert result.output_paths[6] == paths[6]
     assert image_chroma_statistics(result.output_paths[3]) > image_chroma_statistics(paths[3])
     before_mean, _ = image_tone_statistics(paths[3])
     after_mean, _ = image_tone_statistics(result.output_paths[3])
-    assert after_mean == pytest.approx(before_mean, abs=0.005)
+    # This synthetic midpoint requires almost a 2x chroma scale and touches
+    # the sRGB gamut boundary; lightness remains close despite gamut mapping.
+    assert after_mean == pytest.approx(before_mean, abs=0.015)
     assert trajectory["endpoint_gain_is_zero"] is True
 
 
@@ -190,8 +193,8 @@ def test_temporal_chroma_smooths_output_with_signed_upward_and_downward_changes(
             chroma_enabled=True,
             chroma_strength=0.7,
             chroma_threshold=0.0,
-            max_chroma_gain=0.12,
-            max_chroma_decrease=0.08,
+            max_chroma_gain=None,
+            max_chroma_decrease=None,
             chroma_smoothness=6.0,
         ),
         chroma_anchor_indices=[0, 6],
@@ -206,9 +209,37 @@ def test_temporal_chroma_smooths_output_with_signed_upward_and_downward_changes(
     assert np.any(gains > 0.0)
     assert gains[0] == 0.0
     assert gains[-1] == 0.0
-    assert np.min(gains) >= -0.08
-    assert np.max(gains) <= 0.12
     assert np.mean(np.abs(output - target)) < np.mean(np.abs(source - target))
+    assert trajectory["desired_output_mae"] < 0.001
+    assert output == pytest.approx(trajectory["desired"], abs=0.0015)
     assert trajectory["output_curvature_rms"] < trajectory["source_curvature_rms"]
     assert trajectory["minimum_gain"] < 0.0
     assert trajectory["maximum_gain"] > 0.0
+
+
+def test_temporal_chroma_optional_emergency_limits_remain_available(
+    tmp_path: Path,
+) -> None:
+    paths = []
+    for index, amount in enumerate((0.18, 0.04, 0.02, 0.01, 0.02, 0.04, 0.18)):
+        path = tmp_path / f"limited_chroma_{index:02d}.png"
+        _write_chroma_frame(path, amount)
+        paths.append(path)
+
+    result = stabilize_cyclic_tone(
+        paths,
+        tmp_path / "limited_chroma_stabilized",
+        config=TemporalToneConfig(
+            luminance_enabled=False,
+            chroma_enabled=True,
+            chroma_strength=1.0,
+            max_chroma_gain=0.15,
+            max_chroma_decrease=0.10,
+            chroma_smoothness=6.0,
+        ),
+        chroma_anchor_indices=[0, 6],
+    )
+
+    gains = np.asarray(result.report["chroma_trajectory"]["gain"])
+    assert np.max(gains) <= 0.15
+    assert np.min(gains) >= -0.10

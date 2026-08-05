@@ -413,13 +413,14 @@ def test_glcs_and_existing_rife_finishing_stack_are_available() -> None:
     assert "diagnose_cyclic_flicker(" in code
 
 
-def test_soft_chroma_correction_is_endpoint_anchored_plotted_and_feeds_rife() -> None:
+def test_smooth_target_chroma_correction_is_endpoint_anchored_plotted_and_feeds_rife() -> None:
     code = code_source(load_notebook())
     assert "TEMPORAL_TONE_STABILIZATION_ENABLED = False" in code
     assert "TEMPORAL_CHROMA_STABILIZATION_ENABLED = True" in code
     assert "TEMPORAL_CHROMA_STRENGTH = 0.70" in code
-    assert "TEMPORAL_CHROMA_MAX_GAIN = 0.12" in code
-    assert "TEMPORAL_CHROMA_MAX_DECREASE = 0.08" in code
+    assert "TEMPORAL_CHROMA_THRESHOLD = 0.0" in code
+    assert "TEMPORAL_CHROMA_MAX_GAIN = None" in code
+    assert "TEMPORAL_CHROMA_MAX_DECREASE = None" in code
     assert "TEMPORAL_CHROMA_SMOOTHNESS = 6.0" in code
     assert "TEMPORAL_CHROMA_SMOOTHING_PASSES" not in code
     assert "luminance_enabled=TEMPORAL_TONE_STABILIZATION_ENABLED" in code
@@ -430,7 +431,8 @@ def test_soft_chroma_correction_is_endpoint_anchored_plotted_and_feeds_rife() ->
     assert "chroma_anchor_indices=(" in code
     assert 'tone_result.report["chroma_trajectory"]' in code
     assert 'chroma_trajectory["desired"]' in code
-    assert "-100.0 * TEMPORAL_CHROMA_MAX_DECREASE" in code
+    assert "if TEMPORAL_CHROMA_MAX_DECREASE is not None" in code
+    assert '"desired_output_mae"' in code
     assert '"minimum_gain"' in code
     assert '"output_curvature_rms"' in code
     assert '"chroma_trajectory_before_after.png"' in code
