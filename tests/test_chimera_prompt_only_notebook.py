@@ -74,8 +74,8 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     text = all_source(load_notebook())
     assert "CHIMERA_ROUND_SPECS = [" in text
     assert '"midpoint_count":' in text
-    assert "CHIMERA_INVERSION_STEPS = 32" in text
-    assert "CHIMERA_DENOISING_STEPS = 32" in text
+    assert "CHIMERA_INVERSION_STEPS = 50" in text
+    assert "CHIMERA_DENOISING_STEPS = 50" in text
     assert "CHIMERA_ACI_WEIGHT = 0.4" in text
     assert "CHIMERA_SAP_ACTIVE_RATIO = 0.2" in text
     assert "CHIMERA_ANCHOR_RELIABILITY_THRESHOLD = 0.45" in text
@@ -90,7 +90,7 @@ def test_flat_round_paper_defaults_and_flux_memory_adaptations_are_explicit() ->
     assert "CHIMERA_BATCH_MEMORY_RESERVE_GIB = 2.0" in text
     assert "CHIMERA_DECODE_BATCH_SIZE = 10" in text
     assert "CHIMERA_CFG_START_RATIO = 0.0" in text
-    assert "CHIMERA_CFG_STOP_RATIO = 0.70" in text
+    assert "CHIMERA_CFG_STOP_RATIO = 1.0" in text
     assert 'CHIMERA_CONDITIONING_INTERPOLATION = "slerp"' in text
     assert "CHIMERA_ALPHA_WARP_STRENGTH = 0.0" in text
     assert "center_weighted_alpha_schedule(" in text
@@ -162,10 +162,10 @@ def test_cost_preview_resolves_automatic_prompt_count_without_policy_gates() -> 
         "CHIMERA_RENDER_BATCH_SIZE": 2,
         "CHIMERA_RENDER_BATCH_MAX": 10,
         "CHIMERA_LTM_CALIBRATION_ANCHORS": 8,
-        "CHIMERA_INVERSION_STEPS": 32,
-        "CHIMERA_DENOISING_STEPS": 32,
+        "CHIMERA_INVERSION_STEPS": 50,
+        "CHIMERA_DENOISING_STEPS": 50,
         "CHIMERA_CFG_START_RATIO": 0.0,
-        "CHIMERA_CFG_STOP_RATIO": 0.70,
+        "CHIMERA_CFG_STOP_RATIO": 1.0,
         "CHIMERA_LTM_MODE": "fft",
         "CHIMERA_LTM_BANDS": 16,
         "CHIMERA_BATCH_MEMORY_RESERVE_FRACTION": 0.1,
@@ -181,8 +181,8 @@ def test_cost_preview_resolves_automatic_prompt_count_without_policy_gates() -> 
 
     assert namespace["BASE_PROMPT_COUNT"] == 3
     assert namespace["round_counts"] == [3, 51]
-    assert namespace["cfg_active_steps"] == 23
-    assert namespace["conditional_only_steps"] == 9
+    assert namespace["cfg_active_steps"] == 50
+    assert namespace["conditional_only_steps"] == 0
     assert "production contract" not in source
     assert "CHIMERA_DENOISING_STEPS !=" not in source
     assert "CHIMERA_LORA_SCALE !=" not in source
