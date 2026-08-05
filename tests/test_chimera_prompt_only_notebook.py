@@ -413,6 +413,36 @@ def test_glcs_and_existing_rife_finishing_stack_are_available() -> None:
     assert "diagnose_cyclic_flicker(" in code
 
 
+def test_main_frame_hold_video_reuses_dense_rife_frames_with_two_thirds_holds() -> None:
+    code = code_source(load_notebook())
+    assert "RUN_MAIN_FRAME_HOLD_VIDEO = True" in code
+    assert "MAIN_FRAME_HOLD_FRACTION = 2.0 / 3.0" in code
+    assert "from flowmorph_klein.video_timing import plan_anchor_hold_timeline" in code
+    assert "main_frame_hold_plan = plan_anchor_hold_timeline(" in code
+    assert "final_frame_count=target_frame_count" in code
+    assert "motion_weights=motion_weights" in code
+    assert "RIFE_DENSE_PATHS[dense_index]" in code
+    assert "recursive_chimera_prompt_only_main_frame_holds_loop.mp4" in code
+    assert '"requested_transition_fraction": 1.0 - MAIN_FRAME_HOLD_FRACTION' in code
+    assert '"segments": list(main_frame_hold_plan.segments)' in code
+    assert 'RIFE_RESULTS_DIRECTORY / "main_frame_hold_report.json"' in code
+
+
+def test_throwaway_reconnect_cell_restores_the_interrupted_drive_run() -> None:
+    notebook = load_notebook()
+    recovery = next(
+        cell
+        for cell in notebook["cells"]
+        if cell.get("id") == "prompt-only-chimera-recover-last-run"
+    )
+    source = "".join(recovery["source"])
+    assert "THROWAWAY RECONNECT HELPER" in source
+    assert "science_path_prompt_only_chimera_0024_20260805T171421Z" in source
+    assert "final_recursive_chimera_sequence_tone_stabilized.json" in source
+    assert 'FINAL_RECORDS = recovered_payload["records"]' in source
+    assert "Rerun sections 10-13" in source
+
+
 def test_smooth_target_chroma_correction_is_endpoint_anchored_plotted_and_feeds_rife() -> None:
     code = code_source(load_notebook())
     assert "TEMPORAL_TONE_STABILIZATION_ENABLED = False" in code
