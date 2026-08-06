@@ -195,7 +195,9 @@ def test_flashvsr_v11_is_final_streamed_cyclic_four_x_stage() -> None:
     assert 'FLASHVSR_REPOSITORY_REVISION = "b527c6f285fb30df530f5febc8b45764a789c961"' in code
     assert 'FLASHVSR_SPARSE_REPOSITORY_REVISION = "49d6c39e4dc0303442cda3bb758b3925d4399c49"' in code
     assert 'release_h3 = globals().get("release_local_h3_server")' in code
+    assert '"force_stop" in inspect.signature(release_h3).parameters' in code
     assert "release_h3(force_stop=True)" in code
+    assert "release_h3()" in code
     assert "FLASHVSR_DELETE_LOCAL_H3_CHECKPOINTS_IF_DISK_LOW = False" in code
     assert '"flashvsr_v11_streaming_runner.py"' in code
     assert '"minimax_h3_flashvsr_v1_1_x4_cyclic_loop.mp4"' in code

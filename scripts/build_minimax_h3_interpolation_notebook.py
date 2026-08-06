@@ -1456,6 +1456,7 @@ cells = [
             import gc
             import hashlib
             import imageio_ffmpeg
+            import inspect
             from IPython.display import Markdown, Video, display
 
             def flashvsr_sha256_file(path):
@@ -1488,7 +1489,16 @@ cells = [
 
             release_h3 = globals().get("release_local_h3_server")
             if callable(release_h3):
-                release_h3(force_stop=True)
+                if "force_stop" in inspect.signature(release_h3).parameters:
+                    release_h3(force_stop=True)
+                else:
+                    # A live kernel may still hold the pre-FlashVSR zero-argument helper.
+                    prior_stop_setting = globals().get("STOP_COMFY_WHEN_FINISHED", True)
+                    try:
+                        globals()["STOP_COMFY_WHEN_FINISHED"] = True
+                        release_h3()
+                    finally:
+                        globals()["STOP_COMFY_WHEN_FINISHED"] = prior_stop_setting
             gc.collect()
             torch.cuda.empty_cache()
             try:
