@@ -192,13 +192,14 @@ def test_flashvsr_v11_is_final_streamed_cyclic_four_x_stage() -> None:
     assert "FLASHVSR_SCALE = 4.0" in code
     assert 'FLASHVSR_MODEL_REPOSITORY = "JunhaoZhuang/FlashVSR-v1.1"' in code
     assert 'FLASHVSR_MODEL_REVISION = "ad1aceeac60dbd288e51acea9096b821a8703bee"' in code
-    assert 'FLASHVSR_REPOSITORY_REVISION = "b527c6f285fb30df530f5febc8b45764a789c961"' in code
-    assert 'FLASHVSR_SPARSE_REPOSITORY_REVISION = "49d6c39e4dc0303442cda3bb758b3925d4399c49"' in code
+    assert 'FLASHVSR_REPOSITORY_URL = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git"' in code
+    assert 'FLASHVSR_REPOSITORY_REVISION = "f7f55bae4c0e82b18b190d4b62a977995507c51c"' in code
+    assert 'FLASHVSR_ATTENTION_BACKEND = "sparse_sage_attention"' in code
     assert 'release_h3 = globals().get("release_local_h3_server")' in code
     assert '"force_stop" in inspect.signature(release_h3).parameters' in code
     assert "release_h3(force_stop=True)" in code
     assert "release_h3()" in code
-    assert "FLASHVSR_DELETE_LOCAL_H3_CHECKPOINTS_IF_DISK_LOW = False" in code
+    assert "FLASHVSR_DELETE_LOCAL_H3_CHECKPOINTS_IF_DISK_LOW" in code
     assert '"flashvsr_v11_streaming_runner.py"' in code
     assert '"minimax_h3_flashvsr_v1_1_x4_cyclic_loop.mp4"' in code
     assert "FLASHVSR_FINAL_VIDEO_PATH\n    if FLASHVSR_FINAL_VIDEO_PATH is not None" in code
@@ -209,9 +210,13 @@ def test_flashvsr_v11_is_final_streamed_cyclic_four_x_stage() -> None:
     assert "Local finishing PNGs were already cleaned" in code
     assert "stdlib venv creation failed; falling back to virtualenv" in code
     assert '"virtualenv>=20.26,<21"' in code
-    assert '"setup_version": 2' in code
-    assert "Resuming the compatible partial FlashVSR environment." in code
+    assert '"setup_version": 3' in code
+    assert "Resuming the compatible partial FlashVSR Stable environment." in code
     assert '"-e", str(flashvsr_root)' not in code
-    assert 'build_environment["BLOCK_SPARSE_ATTN_CUDA_ARCHS"]' in code
+    assert '"flash-attn", "sageattention", "torch", "torchaudio", "torchvision"' in code
+    assert "Refusing to install filtered requirements containing flash-attn" in code
+    assert "BLOCK_SPARSE_ATTN_CUDA_ARCHS" not in code
+    assert "FLASHVSR_SPARSE_REPOSITORY_URL" not in code
+    assert '"custom_cuda_extension_compiled": False' in code
     assert "lazy-loads temporal slices" in markdown
-    assert "locality-constrained sparse attention" in markdown
+    assert "bundled Triton Sparse Sage backend" in markdown

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Memory-bounded FlashVSR v1.1 tiny-long inference for numbered frame sequences.
+"""Memory-bounded FlashVSR Stable/Sparse-Sage inference for frame sequences.
 
-This adapter follows OpenImagingLab/FlashVSR's official v1.1 tiny-long inference
-loop at revision b527c6f285fb30df530f5febc8b45764a789c961, but lazily loads the
-4x conditioning frames and writes decoded frames to FFmpeg immediately. It also
-warms the causal stream with frames from the end of the input cycle and trims
-that warm-up from the encoded result.
+This adapter uses ComfyUI-FlashVSR-Stable's bundled Triton Sparse Sage backend,
+while preserving the repository's v1.1 tiny-long inference structure. It lazily
+loads 4x conditioning frames, writes decoded frames to FFmpeg immediately, warms
+the causal stream with frames from the end of the cycle, and trims that warm-up
+from the encoded result. It never imports or compiles Block-Sparse Attention or
+Flash Attention.
 """
 
 from __future__ import annotations
@@ -222,10 +223,29 @@ def initialize_pipeline(repository: Path, weights: Path):
     import torch
 
     sys.path.insert(0, str(repository))
-    sys.path.insert(0, str(repository / "examples" / "WanVSR"))
-    from diffsynth import FlashVSRTinyLongPipeline, ModelManager
-    from utils.TCDecoder import build_tcdecoder
-    from utils.utils import Causal_LQ4x_Proj
+    from src.models import ModelManager, wan_video_dit
+    from src.models.TCDecoder import build_tcdecoder
+    from src.models.sparse_sage.core import sparse_sageattn  # noqa: F401
+    from src.models.utils import Causal_LQ4x_Proj
+    from src.pipelines.flashvsr_tiny_long import FlashVSRTinyLongPipeline
+
+    # The fork exposes an ATTENTION_MODE label but selects its actual sparse
+    # implementation through USE_BLOCK_ATTN. Set both explicitly so an installed
+    # Block-Sparse package can never change this run's backend.
+    wan_video_dit.ATTENTION_MODE = "sparse_sage_attention"
+    wan_video_dit.USE_BLOCK_ATTN = False
+    print(
+        json.dumps(
+            {
+                "flashvsr_implementation": "ComfyUI-FlashVSR-Stable",
+                "attention_backend": wan_video_dit.ATTENTION_MODE,
+                "block_sparse_enabled": wan_video_dit.USE_BLOCK_ATTN,
+                "custom_cuda_extension_compiled": False,
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
 
     manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     manager.load_models([str(weights / "diffusion_pytorch_model_streaming_dmd.safetensors")])
@@ -237,15 +257,20 @@ def initialize_pipeline(repository: Path, weights: Path):
         torch.load(weights / "LQ_proj_in.ckpt", map_location="cpu"), strict=True
     )
     pipe.denoising_model().LQ_proj_in.to("cuda")
-    pipe.TCDecoder = build_tcdecoder(new_channels=[512, 256, 128, 128], new_latent_channels=784)
+    pipe.TCDecoder = build_tcdecoder(
+        new_channels=[512, 256, 128, 128],
+        device="cuda",
+        dtype=torch.bfloat16,
+        new_latent_channels=784,
+    )
     missing = pipe.TCDecoder.load_state_dict(
         torch.load(weights / "TCDecoder.ckpt", map_location="cpu"), strict=False
     )
     print("TCDecoder state:", missing, flush=True)
-    pipe.to("cuda")
+    pipe.to("cuda", dtype=torch.bfloat16)
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     context = torch.load(
-        repository / "examples" / "WanVSR" / "prompt_tensor" / "posi_prompt.pth",
+        repository / "posi_prompt.pth",
         map_location="cpu",
     )
     pipe.init_cross_kv(context_tensor=context)
@@ -264,9 +289,9 @@ def run_streaming(
     local_range: int,
     color_fix: bool,
 ) -> None:
-    """Official v1.1 tiny-long loop with lazy input and immediate output encoding."""
+    """Stable-fork v1.1 tiny-long loop with lazy input and immediate encoding."""
     import torch
-    from diffsynth.pipelines.flashvsr_tiny_long import model_fn_wan_video
+    from src.pipelines.flashvsr_tiny_long import model_fn_wan_video
     from tqdm.auto import tqdm
 
     frame_count = plan.pipeline_frames
@@ -391,6 +416,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--weights", type=Path, required=True)
+    parser.add_argument(
+        "--attention-backend",
+        choices=("sparse_sage_attention",),
+        default="sparse_sage_attention",
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
@@ -408,6 +438,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.attention_backend != "sparse_sage_attention":
+        raise ValueError("This runner intentionally supports only bundled Sparse Sage")
     started = time.time()
     for filename in (
         "LQ_proj_in.ckpt",
@@ -467,7 +499,12 @@ def main() -> None:
 
     report = {
         "complete": True,
-        "method": "official FlashVSR v1.1 tiny-long with lazy input and streamed H.264 output",
+        "method": (
+            "ComfyUI-FlashVSR-Stable v1.1 tiny-long with bundled Triton Sparse Sage, "
+            "lazy input, and streamed H.264 output"
+        ),
+        "attention_backend": args.attention_backend,
+        "custom_cuda_extension_compiled": False,
         "cyclic": True,
         "input_unique_frames": len(paths),
         "output_unique_frames": writer.count,

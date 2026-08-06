@@ -40,3 +40,13 @@ def test_cyclic_stream_plan_rejects_invalid_inputs() -> None:
         build_cyclic_stream_plan(0)
     with pytest.raises(ValueError):
         build_cyclic_stream_plan(8, lookahead_frames=3)
+
+
+def test_runner_forces_bundled_sparse_sage_without_custom_cuda_extensions() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert 'wan_video_dit.ATTENTION_MODE = "sparse_sage_attention"' in source
+    assert "wan_video_dit.USE_BLOCK_ATTN = False" in source
+    assert "from src.models.sparse_sage.core import sparse_sageattn" in source
+    assert 'repository / "posi_prompt.pth"' in source
+    assert '"custom_cuda_extension_compiled": False' in source
+    assert "from diffsynth" not in source

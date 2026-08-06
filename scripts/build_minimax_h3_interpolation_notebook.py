@@ -152,22 +152,18 @@ cells = [
         BORDER_CORRECTION_STRENGTH = 0.65
         BORDER_MAX_RGB_SHIFT = 0.025
 
-        # Optional final spatial super-resolution. The official v1.1 tiny-long path is
-        # streamed in a separate process after H3/RIFE have released the GPU.
+        # Optional final spatial super-resolution. The Stable fork's bundled Triton
+        # Sparse Sage path is streamed after H3/RIFE have released the GPU.
         RUN_FLASHVSR_UPSCALE = True
         FLASHVSR_SCALE = 4.0  # The official project strongly recommends its trained 4x setting.
-        FLASHVSR_REPOSITORY_URL = "https://github.com/OpenImagingLab/FlashVSR.git"
-        FLASHVSR_REPOSITORY_REVISION = "b527c6f285fb30df530f5febc8b45764a789c961"
-        FLASHVSR_ROOT = "/content/FlashVSR"
+        FLASHVSR_REPOSITORY_URL = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git"
+        FLASHVSR_REPOSITORY_REVISION = "f7f55bae4c0e82b18b190d4b62a977995507c51c"
+        FLASHVSR_ROOT = "/content/ComfyUI-FlashVSR-Stable"
+        FLASHVSR_ATTENTION_BACKEND = "sparse_sage_attention"
         FLASHVSR_MODEL_REPOSITORY = "JunhaoZhuang/FlashVSR-v1.1"
         FLASHVSR_MODEL_REVISION = "ad1aceeac60dbd288e51acea9096b821a8703bee"
         FLASHVSR_WEIGHTS_ROOT = "/content/FlashVSR-v1.1"
-        FLASHVSR_SPARSE_REPOSITORY_URL = "https://github.com/mit-han-lab/Block-Sparse-Attention.git"
-        FLASHVSR_SPARSE_REPOSITORY_REVISION = "49d6c39e4dc0303442cda3bb758b3925d4399c49"
-        FLASHVSR_SPARSE_ROOT = "/content/Block-Sparse-Attention"
-        FLASHVSR_VENV = "/content/flashvsr_venv"
-        FLASHVSR_USE_OFFICIAL_TORCH = None  # None: official torch on A100/A800/H200, runtime torch elsewhere.
-        FLASHVSR_BUILD_MAX_JOBS = 2
+        FLASHVSR_VENV = "/content/flashvsr_stable_venv"
         FLASHVSR_REBUILD_ENVIRONMENT = False
         FLASHVSR_REUSE_EXISTING_VIDEO = True
         FLASHVSR_SEED = 0
@@ -1426,10 +1422,10 @@ cells = [
 
         This is a spatial finishing stage: it keeps the same frames, frame rate, duration, and
         cyclic ordering. The default 4x setting turns the 768x768 loop into 3072x3072. It uses
-        the official v1.1 tiny-long model and required locality-constrained sparse attention;
-        the FlashVSR authors warn that dense-attention substitutes can degrade high-resolution
-        detail. Their public implementation recommends 4x and reports about 17 fps at
-        768x1408 on one A100, although this long 3072-square result will be slower and larger.
+        the v1.1 tiny-long model through the pinned ComfyUI-FlashVSR-Stable implementation. Its
+        bundled Triton Sparse Sage backend preserves the fork's locality mask without compiling
+        Block-Sparse Attention. This is a deliberate practical tradeoff: it is not bit-identical
+        to the official LCSA CUDA backend, but it avoids a 20–40 minute native build on Colab.
 
         The stock long-video example retains the complete 4x input and output in memory. This
         notebook instead lazy-loads temporal slices and streams decoded RGB frames directly to
@@ -1438,13 +1434,15 @@ cells = [
         exact same number of unique frames as its input.
 
         Before setup or inference, ComfyUI is forcibly unloaded and stopped when this notebook
-        owns its process. FlashVSR then runs in a separate environment/subprocess because its
-        sparse extension is compiled against Torch. H3 checkpoints remain on disk for cheap
-        reruns; the opt-in deletion switch is used only if local disk is genuinely short.
+        owns its process. FlashVSR then runs in a lightweight system-site-packages environment.
+        The Stable fork's full requirements file is intentionally not installed: `flash-attn`,
+        Torch packages, external SageAttention, and Triton are excluded so no hidden CUDA build
+        can start and the Colab runtime's compatible Torch/Triton stack remains authoritative.
 
-        References: [official FlashVSR repository](https://github.com/OpenImagingLab/FlashVSR),
+        References: [ComfyUI-FlashVSR-Stable](https://github.com/naxci1/ComfyUI-FlashVSR_Stable),
+        [official FlashVSR repository](https://github.com/OpenImagingLab/FlashVSR),
         [v1.1 model card](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1), and
-        [official Block-Sparse Attention backend](https://github.com/mit-han-lab/Block-Sparse-Attention).
+        [bundled Sparse Sage source](https://github.com/naxci1/ComfyUI-FlashVSR_Stable/tree/main/src/models/sparse_sage).
         """,
     ),
     code(
@@ -1621,8 +1619,8 @@ cells = [
                 "cyclic_warmup_frames": FLASHVSR_CYCLIC_WARMUP_FRAMES,
                 "crf": FLASHVSR_CRF,
                 "repository_revision": FLASHVSR_REPOSITORY_REVISION,
+                "attention_backend": FLASHVSR_ATTENTION_BACKEND,
                 "model_revision": FLASHVSR_MODEL_REVISION,
-                "sparse_repository_revision": FLASHVSR_SPARSE_REPOSITORY_REVISION,
                 "runner_sha256": flashvsr_sha256_file(
                     Path(PROJECT_ROOT) / "scripts" / "flashvsr_v11_streaming_runner.py"
                 ),
@@ -1703,39 +1701,11 @@ cells = [
                 if installed_flashvsr_revision != FLASHVSR_REPOSITORY_REVISION:
                     raise RuntimeError("FlashVSR did not resolve to its pinned revision")
 
-                sparse_root = Path(FLASHVSR_SPARSE_ROOT)
-                if not (sparse_root / ".git").is_dir():
-                    subprocess.check_call([
-                        "git", "clone", "--filter=blob:none",
-                        FLASHVSR_SPARSE_REPOSITORY_URL, FLASHVSR_SPARSE_ROOT,
-                    ])
-                subprocess.check_call([
-                    "git", "-C", FLASHVSR_SPARSE_ROOT, "fetch", "--depth", "1",
-                    "origin", FLASHVSR_SPARSE_REPOSITORY_REVISION,
-                ])
-                subprocess.check_call([
-                    "git", "-C", FLASHVSR_SPARSE_ROOT, "checkout", "--detach",
-                    FLASHVSR_SPARSE_REPOSITORY_REVISION,
-                ])
-                installed_sparse_revision = subprocess.check_output([
-                    "git", "-C", FLASHVSR_SPARSE_ROOT, "rev-parse", "HEAD",
-                ], text=True).strip()
-                if installed_sparse_revision != FLASHVSR_SPARSE_REPOSITORY_REVISION:
-                    raise RuntimeError("Block-Sparse Attention did not resolve to its pinned revision")
-
-                supported_official_torch_gpu = any(
-                    token in gpu_name.upper() for token in ("A100", "A800", "H200")
-                )
-                use_official_torch = (
-                    supported_official_torch_gpu
-                    if FLASHVSR_USE_OFFICIAL_TORCH is None
-                    else bool(FLASHVSR_USE_OFFICIAL_TORCH)
-                )
                 flashvsr_environment_spec = {
-                    "setup_version": 2,
+                    "setup_version": 3,
                     "flashvsr_revision": FLASHVSR_REPOSITORY_REVISION,
-                    "sparse_revision": FLASHVSR_SPARSE_REPOSITORY_REVISION,
-                    "torch_mode": "official_2.6.0_cu124" if use_official_torch else "colab_runtime",
+                    "attention_backend": FLASHVSR_ATTENTION_BACKEND,
+                    "torch_mode": "colab_runtime_system_site_packages",
                     "runtime_torch": torch.__version__,
                     "python": [sys.version_info.major, sys.version_info.minor],
                 }
@@ -1756,7 +1726,12 @@ cells = [
                 if environment_ready:
                     check = subprocess.run([
                         str(venv_python), "-c",
-                        "import torch, block_sparse_attn; assert torch.cuda.is_available()",
+                        (
+                            "import sys, torch, triton; "
+                            f"sys.path.insert(0, {str(flashvsr_root)!r}); "
+                            "from src.models.sparse_sage.core import sparse_sageattn; "
+                            "assert torch.cuda.is_available()"
+                        ),
                     ])
                     environment_ready = check.returncode == 0
                 partial_environment_reusable = False
@@ -1765,26 +1740,25 @@ cells = [
                     and not FLASHVSR_REBUILD_ENVIRONMENT
                     and venv_python.is_file()
                 ):
-                    expected_torch_check = (
-                        "assert torch.__version__.startswith('2.6.0')"
-                        if use_official_torch
-                        else f"assert torch.__version__ == {torch.__version__!r}"
-                    )
                     partial_check = subprocess.run([
-                        str(venv_python), "-c", f"import torch; {expected_torch_check}",
+                        str(venv_python), "-c",
+                        (
+                            "import torch, triton; "
+                            f"assert torch.__version__ == {torch.__version__!r}"
+                        ),
                     ])
                     partial_environment_reusable = partial_check.returncode == 0
                     if partial_environment_reusable:
-                        print("Resuming the compatible partial FlashVSR environment.")
+                        print("Resuming the compatible partial FlashVSR Stable environment.")
                 if not environment_ready:
                     if not partial_environment_reusable:
                         if venv_root.exists():
                             if venv_root.resolve().parent != Path("/content"):
                                 raise RuntimeError(f"Refusing to replace unexpected venv: {venv_root}")
                             shutil.rmtree(venv_root)
-                        venv_command = [sys.executable, "-m", "venv"]
-                        if not use_official_torch:
-                            venv_command.append("--system-site-packages")
+                        venv_command = [
+                            sys.executable, "-m", "venv", "--system-site-packages"
+                        ]
                         venv_result = subprocess.run(
                             [*venv_command, str(venv_root)],
                             stdout=subprocess.PIPE,
@@ -1806,49 +1780,59 @@ cells = [
                                 sys.executable, "-m", "pip", "install", "-q",
                                 "virtualenv>=20.26,<21",
                             ])
-                            virtualenv_command = [sys.executable, "-m", "virtualenv"]
-                            if not use_official_torch:
-                                virtualenv_command.append("--system-site-packages")
+                            virtualenv_command = [
+                                sys.executable, "-m", "virtualenv", "--system-site-packages"
+                            ]
                             subprocess.check_call([*virtualenv_command, str(venv_root)])
+                    print("Installing lightweight FlashVSR Stable dependencies (no CUDA builds).")
                     subprocess.check_call([
                         str(venv_python), "-m", "pip", "install", "-q", "--upgrade",
-                        "pip", "setuptools", "wheel", "packaging", "ninja",
+                        "pip", "setuptools", "wheel", "packaging",
                     ])
                     requirements_path = flashvsr_root / "requirements.txt"
-                    if use_official_torch:
-                        subprocess.check_call([
-                            str(venv_python), "-m", "pip", "install", "-q",
-                            "--extra-index-url", "https://download.pytorch.org/whl/cu124",
-                            "-r", str(requirements_path),
-                        ])
-                    else:
-                        filtered_requirements = Path(LOCAL_ASSET_ROOT) / "flashvsr_requirements_no_torch.txt"
-                        filtered_lines = [
-                            line for line in requirements_path.read_text(encoding="utf-8").splitlines()
-                            if not line.strip().lower().startswith(("torch==", "torchvision==", "torchaudio=="))
-                        ]
-                        filtered_requirements.write_text(
-                            "\n".join(filtered_lines) + "\n", encoding="utf-8"
-                        )
-                        subprocess.check_call([
-                            str(venv_python), "-m", "pip", "install", "-q",
-                            "-r", str(filtered_requirements),
-                        ])
-                    build_environment = dict(os.environ)
-                    build_environment["MAX_JOBS"] = str(FLASHVSR_BUILD_MAX_JOBS)
-                    build_environment["NVCC_THREADS"] = str(FLASHVSR_BUILD_MAX_JOBS)
-                    cuda_major, cuda_minor = torch.cuda.get_device_capability(0)
-                    build_environment["BLOCK_SPARSE_ATTN_CUDA_ARCHS"] = (
-                        f"{cuda_major}{cuda_minor}"
+                    excluded_requirements = {
+                        "flash-attn", "sageattention", "torch", "torchaudio", "torchvision",
+                        "triton", "triton-windows",
+                    }
+                    def requirement_name(line):
+                        candidate = line.split("#", 1)[0].strip()
+                        if not candidate or candidate.startswith("-"):
+                            return None
+                        token = candidate.split(";", 1)[0].strip().split()[0]
+                        token = token.split("[", 1)[0]
+                        for separator in ("==", ">=", "<=", "~=", "!=", ">", "<", "@"):
+                            token = token.split(separator, 1)[0]
+                        return token.strip().lower().replace("_", "-")
+                    filtered_lines = []
+                    excluded_lines = []
+                    for line in requirements_path.read_text(encoding="utf-8").splitlines():
+                        if requirement_name(line) in excluded_requirements:
+                            excluded_lines.append(line.strip())
+                        else:
+                            filtered_lines.append(line)
+                    if not any(line.lower().startswith("flash-attn") for line in excluded_lines):
+                        raise RuntimeError("Stable requirements changed: flash-attn was not found to exclude")
+                    filtered_requirements = (
+                        Path(LOCAL_ASSET_ROOT) / "flashvsr_stable_requirements_safe.txt"
                     )
-                    subprocess.check_call(
-                        [str(venv_python), "setup.py", "install"],
-                        cwd=str(sparse_root),
-                        env=build_environment,
+                    filtered_requirements.write_text(
+                        "\n".join(filtered_lines) + "\n", encoding="utf-8"
                     )
+                    if "flash-attn" in filtered_requirements.read_text(encoding="utf-8").lower():
+                        raise RuntimeError("Refusing to install filtered requirements containing flash-attn")
+                    print({"excluded_flashvsr_requirements": excluded_lines})
+                    subprocess.check_call([
+                        str(venv_python), "-m", "pip", "install", "-q",
+                        "-r", str(filtered_requirements),
+                    ])
                     subprocess.check_call([
                         str(venv_python), "-c",
-                        "import torch, block_sparse_attn; assert torch.cuda.is_available()",
+                        (
+                            "import sys, torch, triton; "
+                            f"sys.path.insert(0, {str(flashvsr_root)!r}); "
+                            "from src.models.sparse_sage.core import sparse_sageattn; "
+                            "assert torch.cuda.is_available()"
+                        ),
                     ])
                     environment_marker.write_text(
                         json.dumps(flashvsr_environment_spec, indent=2) + "\n", encoding="utf-8"
@@ -1912,6 +1896,7 @@ cells = [
                     str(venv_python), "-u", str(runner),
                     "--repo", FLASHVSR_ROOT,
                     "--weights", FLASHVSR_WEIGHTS_ROOT,
+                    "--attention-backend", FLASHVSR_ATTENTION_BACKEND,
                     "--manifest", str(flashvsr_manifest_path),
                     "--output", str(FLASHVSR_FINAL_VIDEO_PATH),
                     "--report", str(flashvsr_report_path),
@@ -1939,7 +1924,8 @@ cells = [
                     "flashvsr_repository_revision": FLASHVSR_REPOSITORY_REVISION,
                     "flashvsr_model_repository": FLASHVSR_MODEL_REPOSITORY,
                     "flashvsr_model_revision": FLASHVSR_MODEL_REVISION,
-                    "block_sparse_attention_revision": FLASHVSR_SPARSE_REPOSITORY_REVISION,
+                    "attention_backend": FLASHVSR_ATTENTION_BACKEND,
+                    "custom_cuda_extension_compiled": False,
                     "environment": flashvsr_environment_spec,
                 })
                 flashvsr_report_path.write_text(
@@ -1949,7 +1935,7 @@ cells = [
             if not FLASHVSR_FINAL_VIDEO_PATH.is_file() or FLASHVSR_FINAL_VIDEO_PATH.stat().st_size == 0:
                 raise RuntimeError("FlashVSR output is missing or empty")
             print(json.dumps(FLASHVSR_REPORT, indent=2))
-            display(Markdown("### FlashVSR v1.1 4x cyclic loop"))
+            display(Markdown("### FlashVSR Stable + Sparse Sage v1.1 4x cyclic loop"))
             display(Video(
                 str(FLASHVSR_FINAL_VIDEO_PATH), embed=False, width=DISPLAY_VIDEO_WIDTH,
                 html_attributes="controls loop muted playsinline",
