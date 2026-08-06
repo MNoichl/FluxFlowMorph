@@ -179,6 +179,8 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     assert "no camera movement" in prompt.lower()
     assert "No objects may enter" in prompt
     assert "title cards" in prompt
+    assert "no dissolving into particles" in prompt
+    assert "do not invent intermediate" in prompt
     assert "overall_soundscape: Silence" in prompt
     assert strip_h3_source_only_tokens("RIJKSOIL, a sparse scene") == "a sparse scene"
 
@@ -191,6 +193,8 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     assert "RIJKSOIL" not in openai_prompt
     assert "<Picture 1>" in openai_prompt and "<Picture 2>" in openai_prompt
     assert "newly invented objects" in openai_prompt
+    assert "no crumbling" in openai_prompt
+    assert "no invented intermediate" in openai_prompt
 
 
 def test_official_ui_workflow_is_patched_with_two_images_and_direct_dimensions() -> None:

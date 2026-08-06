@@ -32,7 +32,7 @@ def markdown_source() -> str:
 def test_notebook_is_new_clean_parseable_and_colab_ready() -> None:
     notebook = load_notebook()
     assert notebook["nbformat"] == 4
-    assert len(notebook["cells"]) == 24
+    assert len(notebook["cells"]) == 26
     assert notebook["metadata"]["accelerator"] == "GPU"
     assert len({cell["id"] for cell in notebook["cells"]}) == len(notebook["cells"])
     assert "StillLife_MiniMax_H3_FL2V_Interpolation.ipynb" in "".join(notebook["cells"][0]["source"])
@@ -85,6 +85,9 @@ def test_supplied_prompt_is_default_and_openai_option_sees_both_images_and_promp
     assert 'strip_h3_source_only_tokens(pair["left"]["authored_prompt"])' in code
     assert 'strip_h3_source_only_tokens(pair["right"]["authored_prompt"])' in code
     assert 'if "RIJKSOIL" in payload["h3_prompt"]' in code
+    assert "No object dissolves into particles" in code
+    assert "introduce no new intermediate textures" in code
+    assert "No crumbling, shattering, shedding, scattering" in code
     assert 'OPENAI_MODEL = "gpt-5.6"' in code
     assert "OPENAI_CLIENT.responses.parse(" in code
     assert '"image_url": image_data_url(pair["left"]["resolved_path"])' in code
@@ -134,3 +137,21 @@ def test_loop_deduplicates_exact_endpoints_and_optional_rife_closes_wrap() -> No
     assert 'shutil.copy2(H3_NATIVE_FRAME_PATHS[0], rife_input / f"{len(H3_NATIVE_FRAME_PATHS):07d}.png")' in code
     assert "if not np.array_equal(first_array, last_array):" in code
     assert "RIFE_DENSE_PATHS = dense_with_duplicate[:-1]" in code
+
+
+def test_border_flicker_correction_is_post_rife_anchor_safe_and_center_safe() -> None:
+    code = code_source()
+    markdown = markdown_source()
+    assert "RUN_BORDER_FLICKER_CORRECTION = True" in code
+    assert "BORDER_WIDTH_FRACTION = 0.025" in code
+    assert "BORDER_FEATHER_FRACTION = 0.040" in code
+    assert "BORDER_CORRECTION_STRENGTH = 0.65" in code
+    assert "BORDER_MAX_RGB_SHIFT = 0.025" in code
+    assert "H3_NATIVE_ANCHOR_INDICES.append(native_index)" in code
+    assert "border_input_paths = RIFE_DENSE_PATHS" in code
+    assert "stabilize_cyclic_borders(" in code
+    assert "index * border_anchor_multiplier for index in H3_NATIVE_ANCHOR_INDICES" in code
+    assert 'border_result.report["anchor_pixels_unchanged"]' in code
+    assert 'border_result.report["center_pixels_unchanged"]' in code
+    assert '"minimax_h3_border_stabilized_cyclic_loop.mp4"' in code
+    assert "Correct low-frequency flicker only at the image margins" in markdown

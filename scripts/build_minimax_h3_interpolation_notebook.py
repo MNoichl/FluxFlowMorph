@@ -103,7 +103,7 @@ cells = [
         H3_FPS = 24
         H3_JOB_TIMEOUT_SECONDS = 1800
         H3_ENFORCE_SOURCE_ASPECT = True
-        H3_WORKFLOW_PATCH_VERSION = 2
+        H3_WORKFLOW_PATCH_VERSION = 3
         H3_BASE_SEED = None  # OS entropy on a new run; persisted on Drive.
         H3_REUSE_EXISTING_CLIPS = True
         RUN_ONE_PAIR_TEST = True
@@ -117,6 +117,8 @@ cells = [
             "The objects in #Image1 morphing into #Image2 . No camera movement, no panning, "
             "no exchange, no cuts. Only objects changing shape, form texture and color. "
             "No alpha blending. Objects moving as little as possible."
+            " No object dissolves into particles, dust, droplets, fragments, smoke, or swarms."
+            " Objects remain coherent solid surfaces and introduce no new intermediate textures."
         )
         H3_PROMPT_MODE = "template"  # "template" or "openai_per_pair"
         H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE = False
@@ -144,6 +146,11 @@ cells = [
         RIFE_BATCH_SIZE = 4
         RIFE_USE_FP16 = True
         RIFE_RETRY_WITH_FP32 = True
+        RUN_BORDER_FLICKER_CORRECTION = True
+        BORDER_WIDTH_FRACTION = 0.025
+        BORDER_FEATHER_FRACTION = 0.040
+        BORDER_CORRECTION_STRENGTH = 0.65
+        BORDER_MAX_RGB_SHIFT = 0.025
         VIDEO_CRF = 16
         DISPLAY_VIDEO_WIDTH = 768
         KEEP_LOCAL_WORK_FRAMES = False
@@ -296,6 +303,10 @@ cells = [
             strip_h3_source_only_tokens,
             validate_h3_canvas,
             wrap_openai_h3_motion,
+        )
+        from flowmorph_klein.border_stabilization import (
+            BorderStabilizationConfig,
+            stabilize_cyclic_borders,
         )
 
         validate_h3_canvas(H3_WIDTH, H3_HEIGHT)
@@ -567,6 +578,11 @@ cells = [
         - Make each mapped form transform continuously along the shortest plausible path.
         - Preserve the observed object density and negative space. Never invent an object absent
           from both pictures; sparse scenes must remain sparse.
+        - Every object remains a coherent continuous surface. Never dissolve or break an object
+          into particles, dust, grains, droplets, smoke, sparks, fragments, shards, bubbles, or
+          swarms. No crumbling, shattering, shedding, scattering, or explosive breakup.
+        - Surface detail may change only toward detail visibly present in Picture 2. Do not invent
+          intermediate patterns, grain, glitter, cracks, fur, scales, ornament, or material texture.
         - No camera movement, cuts, pans, zooms, dissolves, alpha blends, object swaps, captions,
           production commentary, dialogue, or sound.
         - Mention <Picture 1> and <Picture 2> literally.
@@ -1049,7 +1065,9 @@ cells = [
 
         native_index = 0
         clip_frame_counts = []
+        H3_NATIVE_ANCHOR_INDICES = []
         for pair in H3_PAIRS:
+            H3_NATIVE_ANCHOR_INDICES.append(native_index)
             clip_path = Path(H3_CLIP_RECORDS[pair["index"]]["clip_path"])
             pair_frames = work_root / f"decoded_pair_{pair['index']:04d}"
             if pair_frames.exists():
@@ -1094,6 +1112,7 @@ cells = [
             "pair_count": len(H3_PAIRS),
             "decoded_frames_per_pair": clip_frame_counts,
             "native_unique_frames": len(H3_NATIVE_FRAME_PATHS),
+            "native_anchor_indices": H3_NATIVE_ANCHOR_INDICES,
             "fps": H3_FPS,
             "duration_seconds": len(H3_NATIVE_FRAME_PATHS) / H3_FPS,
             "terminal_duplicate_in_video": False,
@@ -1275,9 +1294,104 @@ cells = [
         '''
     ),
     markdown(
+        "h3-22b-border-heading",
+        r"""
+        ## 12. Correct low-frequency flicker only at the image margins
+
+        This conservative finishing pass runs after RIFE, where edge-padding artifacts can be
+        introduced. It measures robust RGB statistics only in the outer border, interpolates a
+        circular target between the exact source-anchor frames, and applies a capped correction
+        through a feathered edge mask. Anchor images remain pixel-identical, the image center is
+        untouched, and the raw native and RIFE videos remain available for comparison.
+        """,
+    ),
+    code(
+        "h3-23b-border",
+        r'''
+        BORDER_FINAL_VIDEO_PATH = None
+        BORDER_STABILIZATION_REPORT = None
+        if RUN_BORDER_FLICKER_CORRECTION:
+            if RUN_RIFE_POSTPROCESS:
+                border_input_paths = RIFE_DENSE_PATHS
+                border_fps = RIFE_FINAL_FPS
+                border_anchor_multiplier = RIFE_MULTIPLIER
+                border_input_stage = "rife_x2"
+            else:
+                border_input_paths = H3_NATIVE_FRAME_PATHS
+                border_fps = H3_FPS
+                border_anchor_multiplier = 1
+                border_input_stage = "native_h3"
+            border_anchor_indices = [
+                index * border_anchor_multiplier for index in H3_NATIVE_ANCHOR_INDICES
+            ]
+            if not border_input_paths or border_anchor_indices[-1] >= len(border_input_paths):
+                raise RuntimeError("Border correction anchor mapping is inconsistent")
+
+            border_directory = work_root / "border_stabilized"
+            if border_directory.exists():
+                shutil.rmtree(border_directory)
+            border_result = stabilize_cyclic_borders(
+                border_input_paths,
+                border_directory,
+                anchor_indices=border_anchor_indices,
+                config=BorderStabilizationConfig(
+                    border_width_fraction=BORDER_WIDTH_FRACTION,
+                    feather_fraction=BORDER_FEATHER_FRACTION,
+                    strength=BORDER_CORRECTION_STRENGTH,
+                    max_rgb_shift=BORDER_MAX_RGB_SHIFT,
+                ),
+            )
+            BORDER_STABILIZED_PATHS = list(border_result.output_paths)
+            BORDER_FINAL_VIDEO_PATH = (
+                RUN_DIRECTORY / "video" / "minimax_h3_border_stabilized_cyclic_loop.mp4"
+            )
+            subprocess.check_call([
+                ffmpeg, "-y", "-framerate", str(border_fps),
+                "-i", str(border_directory / "%07d.png"),
+                "-frames:v", str(len(BORDER_STABILIZED_PATHS)),
+                "-an", "-c:v", "libx264", "-preset", "slow", "-crf", str(VIDEO_CRF),
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(BORDER_FINAL_VIDEO_PATH),
+            ])
+            BORDER_STABILIZATION_REPORT = {
+                **border_result.report,
+                "input_stage": border_input_stage,
+                "fps": border_fps,
+                "video": str(BORDER_FINAL_VIDEO_PATH),
+                "raw_native_video_preserved": str(H3_NATIVE_VIDEO_PATH),
+                "raw_rife_video_preserved": (
+                    str(RIFE_FINAL_VIDEO_PATH) if RIFE_FINAL_VIDEO_PATH is not None else None
+                ),
+            }
+            persistent_border_report = RUN_DIRECTORY / "metadata" / "border_stabilization.json"
+            persistent_border_report.write_text(
+                json.dumps(BORDER_STABILIZATION_REPORT, indent=2) + "\n", encoding="utf-8"
+            )
+            print({
+                "border_flicker_correction": True,
+                "border_pixels": border_result.report["border_width_pixels"],
+                "feather_pixels": border_result.report["feather_width_pixels"],
+                "changed_frames": border_result.report["changed_count"],
+                "maximum_rgb_shift": border_result.report["maximum_applied_rgb_shift"],
+                "source_target_mae": border_result.report["source_target_mae"],
+                "output_target_mae": border_result.report["output_target_mae"],
+                "anchor_pixels_unchanged": border_result.report["anchor_pixels_unchanged"],
+                "center_pixels_unchanged": border_result.report["center_pixels_unchanged"],
+                "video": str(BORDER_FINAL_VIDEO_PATH),
+            })
+            display(Markdown("### Border-stabilized cyclic loop"))
+            display(Video(
+                str(BORDER_FINAL_VIDEO_PATH), embed=False, width=DISPLAY_VIDEO_WIDTH,
+                html_attributes="controls loop muted playsinline",
+            ))
+        else:
+            BORDER_STABILIZED_PATHS = None
+            print("Border flicker correction disabled; retaining the preceding video unchanged.")
+        '''
+    ),
+    markdown(
         "h3-22-audit-heading",
         r"""
-        ## 12. Persist the final audit and optionally release the Colab runtime
+        ## 13. Persist the final audit and optionally release the Colab runtime
 
         Runtime unassignment is explicit and off by default. The source FLUX run is never
         modified. Local decoded PNGs may be removed only after both persistent videos and all
@@ -1289,7 +1403,11 @@ cells = [
         r'''
         if not RUN_RIFE_POSTPROCESS and STOP_COMFY_WHEN_FINISHED:
             release_local_h3_server()
-        final_video = RIFE_FINAL_VIDEO_PATH if RUN_RIFE_POSTPROCESS else H3_NATIVE_VIDEO_PATH
+        final_video = (
+            BORDER_FINAL_VIDEO_PATH
+            if BORDER_FINAL_VIDEO_PATH is not None
+            else (RIFE_FINAL_VIDEO_PATH if RUN_RIFE_POSTPROCESS else H3_NATIVE_VIDEO_PATH)
+        )
         if final_video is None or not Path(final_video).is_file() or Path(final_video).stat().st_size == 0:
             raise RuntimeError("Final H3 video is missing or empty")
         final_audit = {
@@ -1306,6 +1424,18 @@ cells = [
             "h3_api_used": False,
             "native_video": str(H3_NATIVE_VIDEO_PATH),
             "rife_video": str(RIFE_FINAL_VIDEO_PATH) if RIFE_FINAL_VIDEO_PATH is not None else None,
+            "border_flicker_correction_enabled": RUN_BORDER_FLICKER_CORRECTION,
+            "border_stabilized_video": (
+                str(BORDER_FINAL_VIDEO_PATH) if BORDER_FINAL_VIDEO_PATH is not None else None
+            ),
+            "border_anchor_pixels_unchanged": (
+                BORDER_STABILIZATION_REPORT["anchor_pixels_unchanged"]
+                if BORDER_STABILIZATION_REPORT is not None else None
+            ),
+            "border_center_pixels_unchanged": (
+                BORDER_STABILIZATION_REPORT["center_pixels_unchanged"]
+                if BORDER_STABILIZATION_REPORT is not None else None
+            ),
             "final_video": str(final_video),
             "source_run_modified": False,
         }
