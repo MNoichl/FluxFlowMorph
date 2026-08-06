@@ -10,10 +10,12 @@ from flowmorph_klein.h3_workflow import (
     DEFAULT_H3_MOTION_DIRECTIVE,
     build_default_h3_prompt,
     cyclic_h3_pairs,
+    h3_ui_workflow_controls,
     load_h3_anchor_records,
     patch_h3_ui_workflow,
     snap_h3_frame_count,
     stable_h3_fingerprint,
+    strip_h3_source_only_tokens,
     validate_h3_canvas,
     wrap_openai_h3_motion,
 )
@@ -101,7 +103,40 @@ def _minimal_official_template() -> dict:
                     "id": "4c314f31-ecda-4b08-ae98-faaba1bf613f",
                     "inputs": [],
                     "outputs": [],
-                    "nodes": [],
+                    "nodes": [
+                        {
+                            "id": 104,
+                            "type": "MiniMaxH3ImageToVideo",
+                            "widgets_values": [
+                                "Vaporwave Greek statue title sequence, STARRING LATENT CONTROLNET",
+                                1344,
+                                768,
+                                73,
+                            ],
+                        },
+                        {"id": 111, "type": "PrimitiveFloat", "widgets_values": [2]},
+                        {"id": 15, "type": "RandomNoise", "widgets_values": [1, "randomize"]},
+                        {
+                            "id": 6,
+                            "type": "UNETLoader",
+                            "widgets_values": ["old_diffusion.safetensors", "default"],
+                        },
+                        {
+                            "id": 13,
+                            "type": "CLIPLoader",
+                            "widgets_values": ["old_encoder.safetensors", "minimax", "default"],
+                        },
+                        {
+                            "id": 11,
+                            "type": "VAELoader",
+                            "widgets_values": ["old_video_vae.safetensors"],
+                        },
+                        {
+                            "id": 24,
+                            "type": "VAELoader",
+                            "widgets_values": ["old_audio_vae.safetensors"],
+                        },
+                    ],
                     "links": [],
                 }
             ]
@@ -123,6 +158,7 @@ def test_load_records_recovers_stale_colab_paths_and_closes_cycle(tmp_path: Path
 def test_h3_frame_grid_and_canvas_contract() -> None:
     assert snap_h3_frame_count(4.0) == 107
     assert snap_h3_frame_count(5.0) == 124
+    assert snap_h3_frame_count(6.0) == 158
     validate_h3_canvas(768, 768)
     validate_h3_canvas(1344, 768)
     with pytest.raises(ValueError, match="multiples of 32"):
@@ -131,21 +167,26 @@ def test_h3_frame_grid_and_canvas_contract() -> None:
         validate_h3_canvas(1024, 1024)
 
 
-def test_default_and_openai_prompts_keep_picture_markers_trigger_and_locked_camera() -> None:
-    prompt = build_default_h3_prompt(duration_seconds=4.0)
+def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -> None:
+    prompt = build_default_h3_prompt(
+        duration_seconds=6.0,
+        motion_directive="RIJKSOIL, " + DEFAULT_H3_MOTION_DIRECTIVE,
+    )
     assert DEFAULT_H3_MOTION_DIRECTIVE.startswith("The objects")
-    assert prompt.count("RIJKSOIL") == 1
+    assert "RIJKSOIL" not in prompt
     assert "<Picture 1>" in prompt and "<Picture 2>" in prompt
     assert "no camera movement" in prompt.lower()
-    assert "Do not invent additional objects" in prompt
+    assert "No objects may enter" in prompt
+    assert "title cards" in prompt
     assert "overall_soundscape: Silence" in prompt
+    assert strip_h3_source_only_tokens("RIJKSOIL, a sparse scene") == "a sparse scene"
 
     openai_prompt = wrap_openai_h3_motion(
-        "The sparse sphere at #Image1 slowly changes its silhouette and surface into the faceted "
+        "RIJKSOIL, the sparse sphere at #Image1 slowly changes its silhouette and surface into the faceted "
         "vessel at #Image2 while every object follows the shortest stable path through the shot.",
-        duration_seconds=4.0,
+        duration_seconds=6.0,
     )
-    assert openai_prompt.count("RIJKSOIL") == 1
+    assert "RIJKSOIL" not in openai_prompt
     assert "<Picture 1>" in openai_prompt and "<Picture 2>" in openai_prompt
     assert "newly invented objects" in openai_prompt
 
@@ -155,10 +196,10 @@ def test_official_ui_workflow_is_patched_with_two_images_and_direct_dimensions()
         _minimal_official_template(),
         first_image="run_pair_first.png",
         last_image="run_pair_last.png",
-        prompt="RIJKSOIL transition",
+        prompt="continuous sparse-object transformation",
         width=768,
         height=768,
-        duration_seconds=4.0,
+        duration_seconds=6.0,
         seed=123,
         output_prefix="h3/pair_0000",
         diffusion_model="diffusion.safetensors",
@@ -177,10 +218,57 @@ def test_official_ui_workflow_is_patched_with_two_images_and_direct_dimensions()
     assert main["inputs"][1]["link"] is not None
     assert main["inputs"][2]["link"] is None
     assert main["inputs"][3]["link"] is None
-    assert main["widgets_values"][:5] == ["RIJKSOIL transition", 768, 768, 4.0, 123]
+    assert main["widgets_values"][:5] == [
+        "continuous sparse-object transformation",
+        768,
+        768,
+        6.0,
+        123,
+    ]
     assert not any(link[0] in {219, 220} for link in patched["links"])
     save = next(node for node in patched["nodes"] if node["type"] == "SaveVideo")
     assert save["widgets_values"][0] == "h3/pair_0000"
+    assert h3_ui_workflow_controls(patched) == {
+        "prompt": "continuous sparse-object transformation",
+        "width": 768,
+        "height": 768,
+        "frame_count_fallback": 158,
+        "duration_seconds": 6.0,
+        "seed": 123,
+        "seed_control": "fixed",
+        "diffusion_model": "diffusion.safetensors",
+        "text_encoder": "encoder.safetensors",
+        "video_vae": "video.safetensors",
+        "audio_vae": "audio.safetensors",
+    }
+
+
+@pytest.mark.skipif(not OFFICIAL_TEMPLATE_FIXTURE.is_file(), reason="official template fixture unavailable")
+def test_real_official_template_demo_defaults_are_fully_replaced() -> None:
+    template = json.loads(OFFICIAL_TEMPLATE_FIXTURE.read_text(encoding="utf-8"))
+    prompt = build_default_h3_prompt(duration_seconds=6.0)
+    patched = patch_h3_ui_workflow(
+        template,
+        first_image="first.png",
+        last_image="last.png",
+        prompt=prompt,
+        width=768,
+        height=768,
+        duration_seconds=6.0,
+        seed=456,
+        output_prefix="h3/real_fixture",
+        diffusion_model="diffusion.safetensors",
+        text_encoder="encoder.safetensors",
+        video_vae="video_vae.safetensors",
+        audio_vae="audio_vae.safetensors",
+    )
+    serialized = json.dumps(patched)
+    assert "Vaporwave" not in serialized
+    assert "LATENT CONTROLNET" not in serialized
+    assert "DIRECTED BY COMFYUI" not in serialized
+    controls = h3_ui_workflow_controls(patched)
+    assert controls["duration_seconds"] == 6.0
+    assert (controls["width"], controls["height"]) == (768, 768)
 
 
 def test_fingerprints_are_stable_and_sensitive() -> None:

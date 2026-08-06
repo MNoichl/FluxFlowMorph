@@ -79,7 +79,12 @@ def test_supplied_prompt_is_default_and_openai_option_sees_both_images_and_promp
         in code
     )
     assert 'H3_PROMPT_MODE = "template"' in code
-    assert 'H3_LORA_TRIGGER = "RIJKSOIL"' in code
+    assert 'H3_LORA_TRIGGER' not in code
+    assert 'H3_DURATION_SECONDS = 6.0' in code
+    assert 'H3_JOB_TIMEOUT_SECONDS = 1800' in code
+    assert 'strip_h3_source_only_tokens(pair["left"]["authored_prompt"])' in code
+    assert 'strip_h3_source_only_tokens(pair["right"]["authored_prompt"])' in code
+    assert 'if "RIJKSOIL" in payload["h3_prompt"]' in code
     assert 'OPENAI_MODEL = "gpt-5.6"' in code
     assert "OPENAI_CLIENT.responses.parse(" in code
     assert '"image_url": image_data_url(pair["left"]["resolved_path"])' in code
@@ -96,6 +101,9 @@ def test_official_workflow_is_pinned_patched_and_pair_clips_resume() -> None:
     assert 'H3_TEMPLATE_REVISION = "5097de61ef09fe75466716ac0b200515f5ea078f"' in code
     assert 'COMFY_CLI_VERSION = "1.15.0"' in code
     assert "patch_h3_ui_workflow(" in code
+    assert "h3_ui_workflow_controls(workflow)" in code
+    assert '"workflow_patch_version": H3_WORKFLOW_PATCH_VERSION' in code
+    assert 'forbidden_demo_fragments = ("Vaporwave", "LATENT CONTROLNET", "DIRECTED BY COMFYUI")' in code
     assert "first_image=first_name" in code
     assert "last_image=last_name" in code
     assert '"--workflow", str(workflow_path), "--wait"' in code
@@ -103,6 +111,15 @@ def test_official_workflow_is_pinned_patched_and_pair_clips_resume() -> None:
     assert 'prior.get("fingerprint") == fingerprint' in code
     assert 'for pair in H3_PAIRS:' in code
     assert 'H3_CLIP_RECORDS[pair["index"]] = render_h3_pair(pair)' in code
+
+
+def test_square_canvas_is_verified_against_source_aspect() -> None:
+    code = code_source()
+    assert "H3_WIDTH = 768" in code
+    assert "H3_HEIGHT = 768" in code
+    assert "H3_ENFORCE_SOURCE_ASPECT = True" in code
+    assert "source_aspects = [width / height for width, height in source_sizes]" in code
+    assert "refusing to crop or stretch silently" in code
 
 
 def test_loop_deduplicates_exact_endpoints_and_optional_rife_closes_wrap() -> None:

@@ -17,6 +17,23 @@ DEFAULT_H3_MOTION_DIRECTIVE = (
     "No alpha blending. Objects moving as little as possible."
 )
 
+SOURCE_ONLY_PROMPT_TOKENS = ("RIJKSOIL",)
+
+
+def strip_h3_source_only_tokens(
+    text: str,
+    *,
+    tokens: Sequence[str] = SOURCE_ONLY_PROMPT_TOKENS,
+) -> str:
+    """Remove prompt tokens that belong to the upstream FLUX/LoRA model only."""
+
+    clean = str(text)
+    for token in tokens:
+        normalized = " ".join(str(token).split())
+        if normalized:
+            clean = re.sub(rf"\b{re.escape(normalized)}\b\s*[,;:.\-]?\s*", "", clean, flags=re.IGNORECASE)
+    return " ".join(clean.split())
+
 
 def _record_prompt(record: Mapping[str, Any]) -> str:
     for field in ("generation_prompt", "prompt"):
@@ -135,29 +152,28 @@ def validate_h3_canvas(width: int, height: int) -> None:
 def build_default_h3_prompt(
     *,
     duration_seconds: float,
-    trigger: str = "RIJKSOIL",
     motion_directive: str = DEFAULT_H3_MOTION_DIRECTIVE,
 ) -> str:
     """Wrap the user's motion instruction in MiniMax's official FL2VA syntax."""
 
-    clean_trigger = " ".join(trigger.split())
-    if not clean_trigger:
-        raise ValueError("trigger must not be empty")
-    clean_directive = " ".join(motion_directive.split())
+    clean_directive = strip_h3_source_only_tokens(motion_directive)
     clean_directive = re.sub(r"#Image1\b", "<Picture 1>", clean_directive, flags=re.IGNORECASE)
     clean_directive = re.sub(r"#Image2\b", "<Picture 2>", clean_directive, flags=re.IGNORECASE)
     if "<Picture 1>" not in clean_directive or "<Picture 2>" not in clean_directive:
         raise ValueError("motion directive must refer to both #Image1 and #Image2")
-    if re.search(rf"\b{re.escape(clean_trigger)}\b", clean_directive, flags=re.IGNORECASE):
-        raise ValueError("the motion directive must not duplicate the LoRA trigger")
     return (
         "How the reference pictures align with the target video — "
         f"<Picture 1> aligns with the 0.00-second mark; <Picture 2> aligns with the "
         f"{float(duration_seconds):.2f}-second mark.\n\n"
         "integrated_multimodal_description: [Shot 1] "
-        f"{clean_trigger}. {clean_directive} The scene is one continuous locked-off shot. "
-        "The opening composition must exactly match <Picture 1>, and the final composition "
-        "must settle exactly into <Picture 2>. Do not invent additional objects.\n\n"
+        f"{clean_directive} This is one continuous locked-off deformation. Every visible form "
+        "stays near its screen position and progressively changes geometry, material, texture, "
+        "and color into its corresponding form. The opening composition must exactly match "
+        "<Picture 1>, and the final composition must settle exactly into <Picture 2>. Preserve "
+        "the background, tabletop, lighting, object density, and negative space throughout. "
+        "No objects may enter, leave, duplicate, disappear and reappear, or be newly invented. "
+        "No people, typography, logos, captions, credits, or title cards unless already visible "
+        "in both reference pictures.\n\n"
         "overall_soundscape: Silence; no dialogue, music, or sound effects.\n"
         "non_diegetic_music: N/A"
     )
@@ -167,11 +183,10 @@ def wrap_openai_h3_motion(
     motion_description: str,
     *,
     duration_seconds: float,
-    trigger: str = "RIJKSOIL",
 ) -> str:
     """Apply fixed endpoint/audio constraints around an image-aware OpenAI proposal."""
 
-    clean = " ".join(motion_description.split())
+    clean = strip_h3_source_only_tokens(motion_description)
     if len(clean) < 80:
         raise ValueError("OpenAI motion description is unexpectedly short")
     clean = re.sub(r"#Image1\b", "<Picture 1>", clean, flags=re.IGNORECASE)
@@ -180,17 +195,73 @@ def wrap_openai_h3_motion(
         clean = "Beginning exactly at <Picture 1>, " + clean
     if "<Picture 2>" not in clean:
         clean += " The forms settle exactly into <Picture 2>."
-    clean = re.sub(rf"\b{re.escape(trigger)}\b[,.]?\s*", "", clean, flags=re.IGNORECASE)
     return (
         "How the reference pictures align with the target video — "
         f"<Picture 1> aligns with the 0.00-second mark; <Picture 2> aligns with the "
         f"{float(duration_seconds):.2f}-second mark.\n\n"
-        f"integrated_multimodal_description: [Shot 1] {trigger}. {clean} "
+        f"integrated_multimodal_description: [Shot 1] {clean} "
         "One continuous locked-off shot; no camera movement, cuts, dissolves, alpha blending, "
-        "or newly invented objects. Objects move as little as possible.\n\n"
+        "or newly invented objects. Preserve the background, tabletop, lighting, object density, "
+        "and negative space. No objects enter, leave, duplicate, disappear and reappear, or move "
+        "farther than necessary. No people, typography, logos, captions, credits, or title cards "
+        "unless already visible in both reference pictures.\n\n"
         "overall_soundscape: Silence; no dialogue, music, or sound effects.\n"
         "non_diegetic_music: N/A"
     )
+
+
+def _unique_h3_node(nodes: Sequence[Any], node_type: str) -> dict[str, Any]:
+    matches = [node for node in nodes if isinstance(node, dict) and node.get("type") == node_type]
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one internal {node_type} node, found {len(matches)}")
+    return matches[0]
+
+
+def _h3_node_widgets(node: Mapping[str, Any], minimum: int) -> list[Any]:
+    widgets = node.get("widgets_values")
+    if not isinstance(widgets, list) or len(widgets) < minimum:
+        raise ValueError(f"official H3 {node.get('type', '<unknown>')} widget interface changed")
+    return widgets
+
+
+def h3_ui_workflow_controls(workflow: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the executable controls from inside the official H3 subgraph."""
+
+    subgraphs = workflow.get("definitions", {}).get("subgraphs")
+    if not isinstance(subgraphs, list) or len(subgraphs) != 1 or not isinstance(subgraphs[0], dict):
+        raise ValueError("expected exactly one H3 subgraph definition")
+    internal_nodes = subgraphs[0].get("nodes")
+    if not isinstance(internal_nodes, list):
+        raise ValueError("official H3 subgraph has no internal nodes")
+
+    h3_widgets = _h3_node_widgets(_unique_h3_node(internal_nodes, "MiniMaxH3ImageToVideo"), 4)
+    duration_widgets = _h3_node_widgets(_unique_h3_node(internal_nodes, "PrimitiveFloat"), 1)
+    noise_widgets = _h3_node_widgets(_unique_h3_node(internal_nodes, "RandomNoise"), 2)
+    diffusion_widgets = _h3_node_widgets(_unique_h3_node(internal_nodes, "UNETLoader"), 1)
+    text_widgets = _h3_node_widgets(_unique_h3_node(internal_nodes, "CLIPLoader"), 1)
+    vae_nodes = [
+        node for node in internal_nodes if isinstance(node, dict) and node.get("type") == "VAELoader"
+    ]
+    if len(vae_nodes) != 2:
+        raise ValueError(f"expected two internal VAELoader nodes, found {len(vae_nodes)}")
+    vae_names = [_h3_node_widgets(node, 1)[0] for node in vae_nodes]
+    audio_names = [name for name in vae_names if "audio" in str(name).lower()]
+    video_names = [name for name in vae_names if "audio" not in str(name).lower()]
+    if len(audio_names) != 1 or len(video_names) != 1:
+        raise ValueError("could not distinguish the internal H3 video and audio VAEs")
+    return {
+        "prompt": h3_widgets[0],
+        "width": h3_widgets[1],
+        "height": h3_widgets[2],
+        "frame_count_fallback": h3_widgets[3],
+        "duration_seconds": duration_widgets[0],
+        "seed": noise_widgets[0],
+        "seed_control": noise_widgets[1],
+        "diffusion_model": diffusion_widgets[0],
+        "text_encoder": text_widgets[0],
+        "video_vae": video_names[0],
+        "audio_vae": audio_names[0],
+    }
 
 
 def patch_h3_ui_workflow(
@@ -227,7 +298,8 @@ def patch_h3_ui_workflow(
         raise ValueError("H3 template is not a ComfyUI UI workflow with subgraphs")
     if len(subgraphs) != 1 or not isinstance(subgraphs[0], dict):
         raise ValueError("expected exactly one H3 subgraph definition")
-    subgraph_id = subgraphs[0].get("id")
+    subgraph = subgraphs[0]
+    subgraph_id = subgraph.get("id")
     main_nodes = [node for node in nodes if isinstance(node, dict) and node.get("type") == subgraph_id]
     if len(main_nodes) != 1:
         raise ValueError("could not identify the H3 subgraph instance")
@@ -286,6 +358,35 @@ def patch_h3_ui_workflow(
         video_vae,
         audio_vae,
     ]
+
+    # comfy-cli expands the subgraph and executes these internal widget values. Updating only
+    # the outer instance leaves the official vaporwave demo prompt, 1344x768 canvas, and 2 s
+    # duration active. Patch both layers, then audit the executable layer before submission.
+    internal_nodes = subgraph.get("nodes")
+    if not isinstance(internal_nodes, list):
+        raise ValueError("official H3 subgraph has no internal nodes")
+    h3_widgets = _h3_node_widgets(_unique_h3_node(internal_nodes, "MiniMaxH3ImageToVideo"), 4)
+    h3_widgets[:4] = [prompt, int(width), int(height), snap_h3_frame_count(duration_seconds)]
+    duration_widgets = _h3_node_widgets(_unique_h3_node(internal_nodes, "PrimitiveFloat"), 1)
+    duration_widgets[0] = float(duration_seconds)
+    noise_widgets = _h3_node_widgets(_unique_h3_node(internal_nodes, "RandomNoise"), 2)
+    noise_widgets[:2] = [int(seed), "fixed"]
+    _h3_node_widgets(_unique_h3_node(internal_nodes, "UNETLoader"), 1)[0] = diffusion_model
+    _h3_node_widgets(_unique_h3_node(internal_nodes, "CLIPLoader"), 1)[0] = text_encoder
+    vae_nodes = [
+        node for node in internal_nodes if isinstance(node, dict) and node.get("type") == "VAELoader"
+    ]
+    if len(vae_nodes) != 2:
+        raise ValueError(f"expected two internal VAELoader nodes, found {len(vae_nodes)}")
+    audio_nodes = [
+        node for node in vae_nodes if "audio" in str(_h3_node_widgets(node, 1)[0]).lower()
+    ]
+    video_nodes = [node for node in vae_nodes if node not in audio_nodes]
+    if len(audio_nodes) != 1 or len(video_nodes) != 1:
+        raise ValueError("could not distinguish the internal H3 video and audio VAEs")
+    _h3_node_widgets(video_nodes[0], 1)[0] = video_vae
+    _h3_node_widgets(audio_nodes[0], 1)[0] = audio_vae
+
     save_nodes = [node for node in nodes if isinstance(node, dict) and node.get("type") == "SaveVideo"]
     if len(save_nodes) != 1:
         raise ValueError("expected one SaveVideo node in the official H3 template")
@@ -293,6 +394,26 @@ def patch_h3_ui_workflow(
     if not isinstance(save_widgets, list) or not save_widgets:
         raise ValueError("official H3 SaveVideo interface changed")
     save_widgets[0] = output_prefix
+
+    expected_controls = {
+        "prompt": prompt,
+        "width": int(width),
+        "height": int(height),
+        "frame_count_fallback": snap_h3_frame_count(duration_seconds),
+        "duration_seconds": float(duration_seconds),
+        "seed": int(seed),
+        "seed_control": "fixed",
+        "diffusion_model": diffusion_model,
+        "text_encoder": text_encoder,
+        "video_vae": video_vae,
+        "audio_vae": audio_vae,
+    }
+    actual_controls = h3_ui_workflow_controls(workflow)
+    if actual_controls != expected_controls:
+        raise RuntimeError(
+            "H3 executable subgraph controls do not match the requested job: "
+            f"expected={expected_controls!r}, actual={actual_controls!r}"
+        )
     return workflow
 
 

@@ -99,8 +99,11 @@ cells = [
 
         H3_WIDTH = 768
         H3_HEIGHT = 768
-        H3_DURATION_SECONDS = 4.0
+        H3_DURATION_SECONDS = 6.0
         H3_FPS = 24
+        H3_JOB_TIMEOUT_SECONDS = 1800
+        H3_ENFORCE_SOURCE_ASPECT = True
+        H3_WORKFLOW_PATCH_VERSION = 2
         H3_BASE_SEED = None  # OS entropy on a new run; persisted on Drive.
         H3_REUSE_EXISTING_CLIPS = True
         RUN_ONE_PAIR_TEST = True
@@ -115,7 +118,6 @@ cells = [
             "no exchange, no cuts. Only objects changing shape, form texture and color. "
             "No alpha blending. Objects moving as little as possible."
         )
-        H3_LORA_TRIGGER = "RIJKSOIL"
         H3_PROMPT_MODE = "template"  # "template" or "openai_per_pair"
         H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE = False
 
@@ -286,10 +288,12 @@ cells = [
         from flowmorph_klein.h3_workflow import (
             build_default_h3_prompt,
             cyclic_h3_pairs,
+            h3_ui_workflow_controls,
             load_h3_anchor_records,
             patch_h3_ui_workflow,
             snap_h3_frame_count,
             stable_h3_fingerprint,
+            strip_h3_source_only_tokens,
             validate_h3_canvas,
             wrap_openai_h3_motion,
         )
@@ -490,6 +494,22 @@ cells = [
             draw = ImageDraw.Draw(canvas)
             draw.text((8, thumb_size + 10), f"{record['source_index']:02d}  {record['uid']}", fill="white")
             thumbnails.append(canvas)
+
+        source_sizes = []
+        for record in BASE_RECORDS:
+            with Image.open(record["resolved_path"]) as opened:
+                source_sizes.append(tuple(opened.size))
+        source_aspects = [width / height for width, height in source_sizes]
+        if max(source_aspects) - min(source_aspects) > 0.001:
+            raise ValueError(f"Source anchors do not share one aspect ratio: {source_sizes}")
+        source_aspect = source_aspects[0]
+        h3_aspect = H3_WIDTH / H3_HEIGHT
+        if H3_ENFORCE_SOURCE_ASPECT and abs(source_aspect - h3_aspect) > 0.001:
+            raise ValueError(
+                f"Source aspect {source_aspect:.5f} does not match H3 canvas "
+                f"{H3_WIDTH}x{H3_HEIGHT} ({h3_aspect:.5f}). Set H3_WIDTH/H3_HEIGHT to a "
+                "native H3 canvas with the same ratio; refusing to crop or stretch silently."
+            )
         columns = min(4, len(thumbnails))
         rows = (len(thumbnails) + columns - 1) // columns
         sheet = Image.new("RGB", (columns * thumb_size, rows * (thumb_size + 42)), "#080808")
@@ -507,6 +527,7 @@ cells = [
         print("\nCyclic pair order:")
         for pair in H3_PAIRS:
             print(f"  {pair['index']:02d}: {pair['left']['uid']} -> {pair['right']['uid']}")
+        print({"source_sizes": sorted(set(source_sizes)), "h3_canvas": (H3_WIDTH, H3_HEIGHT)})
         '''
     ),
     markdown(
@@ -515,9 +536,10 @@ cells = [
         ## 6. Build, cache, and print one H3 prompt per pair
 
         In `template` mode the exact supplied instruction is wrapped in MiniMax's local FL2VA
-        picture/timestamp syntax and `RIJKSOIL` is kept exactly once. In `openai_per_pair` mode,
+        picture/timestamp syntax. The FLUX-only `RIJKSOIL` LoRA token is never sent to H3.
+        In `openai_per_pair` mode,
         GPT sees both actual paintings and both immutable authored prompts, then returns only a
-        concise visual motion plan. Fixed code adds the trigger, timing, locked-camera, silence,
+        concise visual motion plan. Fixed code adds timing, locked-camera, silence,
         endpoint, and no-new-object constraints afterward. Cached plans are fingerprinted by
         the images, endpoint prompts, settings, and model.
         """,
@@ -534,7 +556,7 @@ cells = [
             visual_correspondence: str = Field(min_length=40, max_length=1200)
             motion_description: str = Field(min_length=80, max_length=1800)
 
-        H3_OAI_SYSTEM_PROMPT = f"""
+        H3_OAI_SYSTEM_PROMPT = """
         You are writing one visual motion description for the open MiniMax H3 first/last-frame
         video model. Inspect both attached endpoint paintings and both authored FLUX prompts.
         The output will be wrapped in fixed production constraints by code.
@@ -548,7 +570,7 @@ cells = [
         - No camera movement, cuts, pans, zooms, dissolves, alpha blends, object swaps, captions,
           production commentary, dialogue, or sound.
         - Mention <Picture 1> and <Picture 2> literally.
-        - Do not include the trigger word {H3_LORA_TRIGGER}; code adds it exactly once.
+        - RIJKSOIL is an upstream FLUX LoRA token. Never include it in the H3 description.
         - Return only the structured fields.
         """.strip()
 
@@ -569,8 +591,8 @@ cells = [
 
         def openai_motion_for_pair(pair):
             user_text = (
-                f"Picture 1 authored prompt:\n{pair['left']['authored_prompt']}\n\n"
-                f"Picture 2 authored prompt:\n{pair['right']['authored_prompt']}\n\n"
+                f"Picture 1 authored prompt:\n{strip_h3_source_only_tokens(pair['left']['authored_prompt'])}\n\n"
+                f"Picture 2 authored prompt:\n{strip_h3_source_only_tokens(pair['right']['authored_prompt'])}\n\n"
                 f"Requested duration: {H3_DURATION_SECONDS:.2f} seconds."
             )
             last_error = None
@@ -623,9 +645,9 @@ cells = [
                 "left_prompt": pair["left"]["authored_prompt"],
                 "right_prompt": pair["right"]["authored_prompt"],
                 "base_motion_prompt": H3_BASE_MOTION_PROMPT,
-                "trigger": H3_LORA_TRIGGER,
                 "duration_seconds": H3_DURATION_SECONDS,
                 "include_endpoint_prompts": H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE,
+                "workflow_patch_version": H3_WORKFLOW_PATCH_VERSION,
             }
             fingerprint = stable_h3_fingerprint(prompt_basis)
             cached = None
@@ -642,15 +664,14 @@ cells = [
             elif H3_PROMPT_MODE == "template":
                 h3_prompt = build_default_h3_prompt(
                     duration_seconds=H3_DURATION_SECONDS,
-                    trigger=H3_LORA_TRIGGER,
                     motion_directive=H3_BASE_MOTION_PROMPT,
                 )
                 if H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE:
                     h3_prompt += (
                         "\n\nAuthored visual intent for <Picture 1>: "
-                        + pair["left"]["authored_prompt"]
+                        + strip_h3_source_only_tokens(pair["left"]["authored_prompt"])
                         + "\nAuthored visual intent for <Picture 2>: "
-                        + pair["right"]["authored_prompt"]
+                        + strip_h3_source_only_tokens(pair["right"]["authored_prompt"])
                     )
                 plan = {
                     "fingerprint": fingerprint,
@@ -671,7 +692,6 @@ cells = [
                     "h3_prompt": wrap_openai_h3_motion(
                         proposal.motion_description,
                         duration_seconds=H3_DURATION_SECONDS,
-                        trigger=H3_LORA_TRIGGER,
                     ),
                     "visual_correspondence": proposal.visual_correspondence,
                     "openai_response_id": response_id,
@@ -860,6 +880,8 @@ cells = [
                 "duration_seconds": H3_DURATION_SECONDS,
                 "frame_count": H3_FRAME_COUNT,
                 "fps": H3_FPS,
+                "job_timeout_seconds": H3_JOB_TIMEOUT_SECONDS,
+                "workflow_patch_version": H3_WORKFLOW_PATCH_VERSION,
                 "comfyui_revision": COMFYUI_REVISION,
                 "template_revision": H3_TEMPLATE_REVISION,
                 "model_repository": H3_MODEL_REPOSITORY,
@@ -925,6 +947,14 @@ cells = [
                 video_vae=H3_VIDEO_VAE,
                 audio_vae=H3_AUDIO_VAE,
             )
+            executable_controls = h3_ui_workflow_controls(workflow)
+            forbidden_demo_fragments = ("Vaporwave", "LATENT CONTROLNET", "DIRECTED BY COMFYUI")
+            serialized_workflow = json.dumps(workflow, ensure_ascii=False)
+            leaked = [fragment for fragment in forbidden_demo_fragments if fragment in serialized_workflow]
+            if leaked:
+                raise RuntimeError(f"Official H3 demo content survived workflow patching: {leaked}")
+            if "RIJKSOIL" in payload["h3_prompt"]:
+                raise RuntimeError("Upstream FLUX LoRA token leaked into the MiniMax H3 prompt")
             workflow_path = RUN_DIRECTORY / "workflows" / f"pair_{pair['index']:04d}.json"
             workflow_path.write_text(
                 json.dumps(workflow, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -932,12 +962,13 @@ cells = [
             print("\n" + "=" * 110)
             print(f"LOCAL H3 PAIR {pair['index']:02d}: {pair['left']['uid']} -> {pair['right']['uid']}")
             print("seed:", payload["seed"])
+            print("EXECUTABLE H3 CONTROLS:\n" + json.dumps(executable_controls, indent=2, ensure_ascii=False))
             print("prompt:\n" + payload["h3_prompt"])
             command = [
                 sys.executable, "-m", "comfy_cli", "--workspace", COMFYUI_ROOT,
                 "run", "--workflow", str(workflow_path), "--wait", "--no-notify",
                 "--where", "local", "--host", "127.0.0.1", "--port", str(H3_COMFY_PORT),
-                "--timeout", "900",
+                "--timeout", str(H3_JOB_TIMEOUT_SECONDS),
             ]
             return_code, command_log = stream_command(command)
             if return_code != 0:
