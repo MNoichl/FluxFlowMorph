@@ -1456,6 +1456,7 @@ cells = [
             import gc
             import hashlib
             import imageio_ffmpeg
+            from IPython.display import Markdown, Video, display
 
             def flashvsr_sha256_file(path):
                 digest = hashlib.sha256()
