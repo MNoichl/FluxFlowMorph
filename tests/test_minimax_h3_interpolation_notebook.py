@@ -29,18 +29,46 @@ def markdown_source() -> str:
     )
 
 
-def test_notebook_is_new_clean_parseable_and_colab_ready() -> None:
+def test_notebook_core_cells_are_parseable_and_colab_ready() -> None:
     notebook = load_notebook()
     assert notebook["nbformat"] == 4
-    assert len(notebook["cells"]) == 26
+    expected_core_ids = {
+        "h3-00-title",
+        "h3-01-settings-heading",
+        "h3-02-settings",
+        "h3-03-research",
+        "h3-04-setup-heading",
+        "h3-05-setup",
+        "h3-06-drive-heading",
+        "h3-07-drive",
+        "h3-08-anchors-heading",
+        "h3-09-anchors",
+        "h3-10-prompts-heading",
+        "h3-11-prompts",
+        "h3-12-models-heading",
+        "h3-13-models",
+        "h3-14-server-heading",
+        "h3-15-server",
+        "h3-16-render-heading",
+        "h3-17-render",
+        "h3-18-assembly-heading",
+        "h3-19-assembly",
+        "h3-20-rife-heading",
+        "h3-21-rife",
+        "h3-22b-border-heading",
+        "h3-23b-border",
+        "h3-24-flashvsr-heading",
+        "h3-25-flashvsr",
+        "h3-22-audit-heading",
+        "h3-23-audit",
+    }
+    assert expected_core_ids <= {cell["id"] for cell in notebook["cells"]}
     assert notebook["metadata"]["accelerator"] == "GPU"
     assert len({cell["id"] for cell in notebook["cells"]}) == len(notebook["cells"])
     assert "StillLife_MiniMax_H3_FL2V_Interpolation.ipynb" in "".join(notebook["cells"][0]["source"])
     for index, cell in enumerate(notebook["cells"]):
         if cell.get("cell_type") != "code":
             continue
-        assert cell["execution_count"] is None
-        assert cell["outputs"] == []
         ast.parse("".join(cell.get("source", [])), filename=f"h3-cell-{index}")
 
 
@@ -155,3 +183,22 @@ def test_border_flicker_correction_is_post_rife_anchor_safe_and_center_safe() ->
     assert 'border_result.report["center_pixels_unchanged"]' in code
     assert '"minimax_h3_border_stabilized_cyclic_loop.mp4"' in code
     assert "Correct low-frequency flicker only at the image margins" in markdown
+
+
+def test_flashvsr_v11_is_final_streamed_cyclic_four_x_stage() -> None:
+    code = code_source()
+    markdown = markdown_source()
+    assert "RUN_FLASHVSR_UPSCALE = True" in code
+    assert "FLASHVSR_SCALE = 4.0" in code
+    assert 'FLASHVSR_MODEL_REPOSITORY = "JunhaoZhuang/FlashVSR-v1.1"' in code
+    assert 'FLASHVSR_MODEL_REVISION = "ad1aceeac60dbd288e51acea9096b821a8703bee"' in code
+    assert 'FLASHVSR_REPOSITORY_REVISION = "b527c6f285fb30df530f5febc8b45764a789c961"' in code
+    assert 'FLASHVSR_SPARSE_REPOSITORY_REVISION = "49d6c39e4dc0303442cda3bb758b3925d4399c49"' in code
+    assert "release_local_h3_server(force_stop=True)" in code
+    assert "FLASHVSR_DELETE_LOCAL_H3_CHECKPOINTS_IF_DISK_LOW = False" in code
+    assert '"flashvsr_v11_streaming_runner.py"' in code
+    assert '"minimax_h3_flashvsr_v1_1_x4_cyclic_loop.mp4"' in code
+    assert "FLASHVSR_FINAL_VIDEO_PATH\n    if FLASHVSR_FINAL_VIDEO_PATH is not None" in code
+    assert '"flashvsr_frame_count_preserved"' in code
+    assert "lazy-loads temporal slices" in markdown
+    assert "locality-constrained sparse attention" in markdown

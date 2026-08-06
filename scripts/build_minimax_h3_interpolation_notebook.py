@@ -151,6 +151,37 @@ cells = [
         BORDER_FEATHER_FRACTION = 0.040
         BORDER_CORRECTION_STRENGTH = 0.65
         BORDER_MAX_RGB_SHIFT = 0.025
+
+        # Optional final spatial super-resolution. The official v1.1 tiny-long path is
+        # streamed in a separate process after H3/RIFE have released the GPU.
+        RUN_FLASHVSR_UPSCALE = True
+        FLASHVSR_SCALE = 4.0  # The official project strongly recommends its trained 4x setting.
+        FLASHVSR_REPOSITORY_URL = "https://github.com/OpenImagingLab/FlashVSR.git"
+        FLASHVSR_REPOSITORY_REVISION = "b527c6f285fb30df530f5febc8b45764a789c961"
+        FLASHVSR_ROOT = "/content/FlashVSR"
+        FLASHVSR_MODEL_REPOSITORY = "JunhaoZhuang/FlashVSR-v1.1"
+        FLASHVSR_MODEL_REVISION = "ad1aceeac60dbd288e51acea9096b821a8703bee"
+        FLASHVSR_WEIGHTS_ROOT = "/content/FlashVSR-v1.1"
+        FLASHVSR_SPARSE_REPOSITORY_URL = "https://github.com/mit-han-lab/Block-Sparse-Attention.git"
+        FLASHVSR_SPARSE_REPOSITORY_REVISION = "49d6c39e4dc0303442cda3bb758b3925d4399c49"
+        FLASHVSR_SPARSE_ROOT = "/content/Block-Sparse-Attention"
+        FLASHVSR_VENV = "/content/flashvsr_venv"
+        FLASHVSR_USE_OFFICIAL_TORCH = None  # None: official torch on A100/A800/H200, runtime torch elsewhere.
+        FLASHVSR_BUILD_MAX_JOBS = 2
+        FLASHVSR_REBUILD_ENVIRONMENT = False
+        FLASHVSR_REUSE_EXISTING_VIDEO = True
+        FLASHVSR_SEED = 0
+        FLASHVSR_SPARSE_RATIO = 2.0
+        FLASHVSR_LOCAL_RANGE = 11  # 11 is steadier; 9 can be a little sharper.
+        FLASHVSR_COLOR_FIX = True
+        FLASHVSR_CYCLIC_WARMUP_FRAMES = 16
+        FLASHVSR_CRF = 16
+        FLASHVSR_FFMPEG_PRESET = "medium"
+        FLASHVSR_MIN_FREE_DISK_GIB = 24.0
+        FLASHVSR_MIN_FREE_CUDA_GIB = 20.0
+        FLASHVSR_HANDOFF_MAX_TORCH_GIB = 1.0
+        FLASHVSR_DELETE_LOCAL_H3_CHECKPOINTS_IF_DISK_LOW = False
+
         VIDEO_CRF = 16
         DISPLAY_VIDEO_WIDTH = 768
         KEEP_LOCAL_WORK_FRAMES = False
@@ -1147,7 +1178,7 @@ cells = [
         import zipfile
         import numpy as np
 
-        def release_local_h3_server():
+        def release_local_h3_server(force_stop=False):
             try:
                 request = urllib.request.Request(
                     H3_SERVER_URL + "/free",
@@ -1159,7 +1190,7 @@ cells = [
             except Exception as error:
                 print("ComfyUI unload warning:", error)
             process = globals().get("H3_COMFY_PROCESS")
-            if STOP_COMFY_WHEN_FINISHED and process is not None and process.poll() is None:
+            if (force_stop or STOP_COMFY_WHEN_FINISHED) and process is not None and process.poll() is None:
                 process.terminate()
                 try:
                     process.wait(timeout=30)
@@ -1389,9 +1420,409 @@ cells = [
         '''
     ),
     markdown(
+        "h3-24-flashvsr-heading",
+        r"""
+        ## 13. Optionally finish with streamed FlashVSR v1.1 4x super-resolution
+
+        This is a spatial finishing stage: it keeps the same frames, frame rate, duration, and
+        cyclic ordering. The default 4x setting turns the 768x768 loop into 3072x3072. It uses
+        the official v1.1 tiny-long model and required locality-constrained sparse attention;
+        the FlashVSR authors warn that dense-attention substitutes can degrade high-resolution
+        detail. Their public implementation recommends 4x and reports about 17 fps at
+        768x1408 on one A100, although this long 3072-square result will be slower and larger.
+
+        The stock long-video example retains the complete 4x input and output in memory. This
+        notebook instead lazy-loads temporal slices and streams decoded RGB frames directly to
+        FFmpeg. Sixteen cyclic warm-up frames from the end are processed and then trimmed, so
+        the causal model reaches the opening frame with loop context. The result contains the
+        exact same number of unique frames as its input.
+
+        Before setup or inference, ComfyUI is forcibly unloaded and stopped when this notebook
+        owns its process. FlashVSR then runs in a separate environment/subprocess because its
+        sparse extension is compiled against Torch. H3 checkpoints remain on disk for cheap
+        reruns; the opt-in deletion switch is used only if local disk is genuinely short.
+
+        References: [official FlashVSR repository](https://github.com/OpenImagingLab/FlashVSR),
+        [v1.1 model card](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1), and
+        [official Block-Sparse Attention backend](https://github.com/mit-han-lab/Block-Sparse-Attention).
+        """,
+    ),
+    code(
+        "h3-25-flashvsr",
+        r'''
+        FLASHVSR_FINAL_VIDEO_PATH = None
+        FLASHVSR_REPORT = None
+        if RUN_FLASHVSR_UPSCALE:
+            release_local_h3_server(force_stop=True)
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            retained_gib = torch.cuda.memory_allocated() / 1024**3
+            free_cuda_gib, total_cuda_gib = (
+                value / 1024**3 for value in torch.cuda.mem_get_info()
+            )
+            try:
+                active_cuda = subprocess.check_output([
+                    "nvidia-smi", "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ], text=True).strip()
+            except Exception:
+                active_cuda = "unavailable"
+            print({
+                "flashvsr_gpu_handoff_torch_allocated_gib": round(retained_gib, 3),
+                "flashvsr_gpu_handoff_free_gib": round(free_cuda_gib, 3),
+                "flashvsr_gpu_handoff_total_gib": round(total_cuda_gib, 3),
+                "active_cuda_processes_pid_mib": active_cuda or "none",
+            })
+            if retained_gib > FLASHVSR_HANDOFF_MAX_TORCH_GIB:
+                raise RuntimeError(
+                    f"The notebook process still owns {retained_gib:.2f} GiB of CUDA memory. "
+                    "Rerun this cell once after H3 has stopped, or restart the kernel and resume "
+                    "from the saved final frame sequence before loading FlashVSR."
+                )
+            if free_cuda_gib < FLASHVSR_MIN_FREE_CUDA_GIB:
+                raise RuntimeError(
+                    f"Only {free_cuda_gib:.2f} GiB of {total_cuda_gib:.2f} GiB CUDA memory is "
+                    "free after the H3 handoff. The active-process report above identifies any "
+                    "remaining GPU owner; release it or restart the runtime before FlashVSR."
+                )
+
+            if BORDER_STABILIZED_PATHS:
+                flashvsr_input_paths = list(BORDER_STABILIZED_PATHS)
+                flashvsr_input_fps = border_fps
+                flashvsr_input_video = BORDER_FINAL_VIDEO_PATH
+                flashvsr_input_stage = "border_stabilized"
+            elif RUN_RIFE_POSTPROCESS:
+                flashvsr_input_paths = list(RIFE_DENSE_PATHS)
+                flashvsr_input_fps = RIFE_FINAL_FPS
+                flashvsr_input_video = RIFE_FINAL_VIDEO_PATH
+                flashvsr_input_stage = "rife_x2"
+            else:
+                flashvsr_input_paths = list(H3_NATIVE_FRAME_PATHS)
+                flashvsr_input_fps = H3_FPS
+                flashvsr_input_video = H3_NATIVE_VIDEO_PATH
+                flashvsr_input_stage = "native_h3"
+            if not flashvsr_input_paths:
+                raise RuntimeError("FlashVSR input frame sequence is empty")
+            if flashvsr_input_video is None or not Path(flashvsr_input_video).is_file():
+                raise RuntimeError("FlashVSR source video is missing")
+            flashvsr_source_frames_available = all(
+                Path(path).is_file() for path in flashvsr_input_paths
+            )
+
+            flashvsr_payload = {
+                "source_stage": flashvsr_input_stage,
+                "source_video_sha256": sha256_file(flashvsr_input_video),
+                "source_frame_count": len(flashvsr_input_paths),
+                "fps": flashvsr_input_fps,
+                "scale": FLASHVSR_SCALE,
+                "seed": FLASHVSR_SEED,
+                "sparse_ratio": FLASHVSR_SPARSE_RATIO,
+                "local_range": FLASHVSR_LOCAL_RANGE,
+                "color_fix": FLASHVSR_COLOR_FIX,
+                "cyclic_warmup_frames": FLASHVSR_CYCLIC_WARMUP_FRAMES,
+                "crf": FLASHVSR_CRF,
+                "repository_revision": FLASHVSR_REPOSITORY_REVISION,
+                "model_revision": FLASHVSR_MODEL_REVISION,
+                "sparse_repository_revision": FLASHVSR_SPARSE_REPOSITORY_REVISION,
+                "runner_sha256": sha256_file(
+                    Path(PROJECT_ROOT) / "scripts" / "flashvsr_v11_streaming_runner.py"
+                ),
+            }
+            flashvsr_fingerprint = stable_h3_fingerprint(flashvsr_payload)
+            FLASHVSR_FINAL_VIDEO_PATH = (
+                RUN_DIRECTORY / "video" / "minimax_h3_flashvsr_v1_1_x4_cyclic_loop.mp4"
+            )
+            flashvsr_report_path = RUN_DIRECTORY / "metadata" / "flashvsr_v1_1_report.json"
+            reuse_flashvsr = False
+            if (
+                FLASHVSR_REUSE_EXISTING_VIDEO
+                and FLASHVSR_FINAL_VIDEO_PATH.is_file()
+                and FLASHVSR_FINAL_VIDEO_PATH.stat().st_size > 0
+                and flashvsr_report_path.is_file()
+            ):
+                try:
+                    prior_flashvsr = json.loads(flashvsr_report_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    prior_flashvsr = {}
+                reuse_flashvsr = (
+                    prior_flashvsr.get("complete") is True
+                    and prior_flashvsr.get("fingerprint") == flashvsr_fingerprint
+                    and prior_flashvsr.get("output_unique_frames") == len(flashvsr_input_paths)
+                )
+
+            if reuse_flashvsr:
+                FLASHVSR_REPORT = prior_flashvsr
+                print("Reusing matching FlashVSR output:", FLASHVSR_FINAL_VIDEO_PATH)
+            else:
+                free_disk_gib = shutil.disk_usage("/content").free / 1024**3
+                if (
+                    free_disk_gib < FLASHVSR_MIN_FREE_DISK_GIB
+                    and FLASHVSR_DELETE_LOCAL_H3_CHECKPOINTS_IF_DISK_LOW
+                ):
+                    h3_local_files = [
+                        Path(COMFYUI_ROOT) / "models" / "diffusion_models" / H3_DIFFUSION_MODEL,
+                        Path(COMFYUI_ROOT) / "models" / "text_encoders" / H3_TEXT_ENCODER,
+                        Path(COMFYUI_ROOT) / "models" / "vae" / H3_VIDEO_VAE,
+                        Path(COMFYUI_ROOT) / "models" / "vae" / H3_AUDIO_VAE,
+                    ]
+                    removed_gib = 0.0
+                    for candidate in h3_local_files:
+                        if candidate.is_file():
+                            removed_gib += candidate.stat().st_size / 1024**3
+                            candidate.unlink()
+                    free_disk_gib = shutil.disk_usage("/content").free / 1024**3
+                    print({
+                        "deleted_ephemeral_h3_checkpoints_gib": round(removed_gib, 2),
+                        "free_local_disk_gib": round(free_disk_gib, 2),
+                        "recoverable_by_rerunning_h3_model_download": True,
+                    })
+                if free_disk_gib < FLASHVSR_MIN_FREE_DISK_GIB:
+                    raise RuntimeError(
+                        f"FlashVSR setup needs about {FLASHVSR_MIN_FREE_DISK_GIB:.0f} GiB of local "
+                        f"headroom, but only {free_disk_gib:.1f} GiB is free. H3 is already unloaded; "
+                        "set FLASHVSR_DELETE_LOCAL_H3_CHECKPOINTS_IF_DISK_LOW=True only if you accept "
+                        "redownloading those ephemeral checkpoints for a future H3 rerun."
+                    )
+
+                flashvsr_root = Path(FLASHVSR_ROOT)
+                if not (flashvsr_root / ".git").is_dir():
+                    subprocess.check_call([
+                        "git", "clone", "--filter=blob:none",
+                        FLASHVSR_REPOSITORY_URL, FLASHVSR_ROOT,
+                    ])
+                subprocess.check_call([
+                    "git", "-C", FLASHVSR_ROOT, "fetch", "--depth", "1",
+                    "origin", FLASHVSR_REPOSITORY_REVISION,
+                ])
+                subprocess.check_call([
+                    "git", "-C", FLASHVSR_ROOT, "checkout", "--detach",
+                    FLASHVSR_REPOSITORY_REVISION,
+                ])
+                installed_flashvsr_revision = subprocess.check_output([
+                    "git", "-C", FLASHVSR_ROOT, "rev-parse", "HEAD",
+                ], text=True).strip()
+                if installed_flashvsr_revision != FLASHVSR_REPOSITORY_REVISION:
+                    raise RuntimeError("FlashVSR did not resolve to its pinned revision")
+
+                sparse_root = Path(FLASHVSR_SPARSE_ROOT)
+                if not (sparse_root / ".git").is_dir():
+                    subprocess.check_call([
+                        "git", "clone", "--filter=blob:none",
+                        FLASHVSR_SPARSE_REPOSITORY_URL, FLASHVSR_SPARSE_ROOT,
+                    ])
+                subprocess.check_call([
+                    "git", "-C", FLASHVSR_SPARSE_ROOT, "fetch", "--depth", "1",
+                    "origin", FLASHVSR_SPARSE_REPOSITORY_REVISION,
+                ])
+                subprocess.check_call([
+                    "git", "-C", FLASHVSR_SPARSE_ROOT, "checkout", "--detach",
+                    FLASHVSR_SPARSE_REPOSITORY_REVISION,
+                ])
+                installed_sparse_revision = subprocess.check_output([
+                    "git", "-C", FLASHVSR_SPARSE_ROOT, "rev-parse", "HEAD",
+                ], text=True).strip()
+                if installed_sparse_revision != FLASHVSR_SPARSE_REPOSITORY_REVISION:
+                    raise RuntimeError("Block-Sparse Attention did not resolve to its pinned revision")
+
+                supported_official_torch_gpu = any(
+                    token in gpu_name.upper() for token in ("A100", "A800", "H200")
+                )
+                use_official_torch = (
+                    supported_official_torch_gpu
+                    if FLASHVSR_USE_OFFICIAL_TORCH is None
+                    else bool(FLASHVSR_USE_OFFICIAL_TORCH)
+                )
+                flashvsr_environment_spec = {
+                    "flashvsr_revision": FLASHVSR_REPOSITORY_REVISION,
+                    "sparse_revision": FLASHVSR_SPARSE_REPOSITORY_REVISION,
+                    "torch_mode": "official_2.6.0_cu124" if use_official_torch else "colab_runtime",
+                    "runtime_torch": torch.__version__,
+                    "python": [sys.version_info.major, sys.version_info.minor],
+                }
+                venv_root = Path(FLASHVSR_VENV)
+                venv_python = venv_root / "bin" / "python"
+                environment_marker = venv_root / "flowmorph_flashvsr_environment.json"
+                try:
+                    installed_environment_spec = json.loads(
+                        environment_marker.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    installed_environment_spec = None
+                environment_ready = (
+                    not FLASHVSR_REBUILD_ENVIRONMENT
+                    and venv_python.is_file()
+                    and installed_environment_spec == flashvsr_environment_spec
+                )
+                if environment_ready:
+                    check = subprocess.run([
+                        str(venv_python), "-c",
+                        "import torch, block_sparse_attn; assert torch.cuda.is_available()",
+                    ])
+                    environment_ready = check.returncode == 0
+                if not environment_ready:
+                    if venv_root.exists():
+                        if venv_root.resolve().parent != Path("/content"):
+                            raise RuntimeError(f"Refusing to replace unexpected venv: {venv_root}")
+                        shutil.rmtree(venv_root)
+                    venv_command = [sys.executable, "-m", "venv"]
+                    if not use_official_torch:
+                        venv_command.append("--system-site-packages")
+                    subprocess.check_call([*venv_command, str(venv_root)])
+                    subprocess.check_call([
+                        str(venv_python), "-m", "pip", "install", "-q", "--upgrade",
+                        "pip", "setuptools", "wheel", "packaging", "ninja",
+                    ])
+                    requirements_path = flashvsr_root / "requirements.txt"
+                    if use_official_torch:
+                        subprocess.check_call([
+                            str(venv_python), "-m", "pip", "install", "-q",
+                            "--extra-index-url", "https://download.pytorch.org/whl/cu124",
+                            "-r", str(requirements_path),
+                        ])
+                    else:
+                        filtered_requirements = Path(LOCAL_ASSET_ROOT) / "flashvsr_requirements_no_torch.txt"
+                        filtered_lines = [
+                            line for line in requirements_path.read_text(encoding="utf-8").splitlines()
+                            if not line.strip().lower().startswith(("torch==", "torchvision==", "torchaudio=="))
+                        ]
+                        filtered_requirements.write_text(
+                            "\n".join(filtered_lines) + "\n", encoding="utf-8"
+                        )
+                        subprocess.check_call([
+                            str(venv_python), "-m", "pip", "install", "-q",
+                            "-r", str(filtered_requirements),
+                        ])
+                    subprocess.check_call([
+                        str(venv_python), "-m", "pip", "install", "-q", "--no-deps",
+                        "-e", str(flashvsr_root),
+                    ])
+                    build_environment = dict(os.environ)
+                    build_environment["MAX_JOBS"] = str(FLASHVSR_BUILD_MAX_JOBS)
+                    subprocess.check_call(
+                        [str(venv_python), "setup.py", "install"],
+                        cwd=str(sparse_root),
+                        env=build_environment,
+                    )
+                    subprocess.check_call([
+                        str(venv_python), "-c",
+                        "import torch, block_sparse_attn; assert torch.cuda.is_available()",
+                    ])
+                    environment_marker.write_text(
+                        json.dumps(flashvsr_environment_spec, indent=2) + "\n", encoding="utf-8"
+                    )
+
+                from huggingface_hub import hf_hub_download
+                weights_root = Path(FLASHVSR_WEIGHTS_ROOT)
+                weights_root.mkdir(parents=True, exist_ok=True)
+                flashvsr_weight_files = (
+                    "LQ_proj_in.ckpt",
+                    "TCDecoder.ckpt",
+                    "diffusion_pytorch_model_streaming_dmd.safetensors",
+                )
+                for filename in flashvsr_weight_files:
+                    resolved = Path(hf_hub_download(
+                        repo_id=FLASHVSR_MODEL_REPOSITORY,
+                        filename=filename,
+                        revision=FLASHVSR_MODEL_REVISION,
+                        cache_dir=HF_CACHE_DIR,
+                    )).resolve()
+                    destination = weights_root / filename
+                    if destination.is_symlink() or destination.exists():
+                        if destination.resolve() != resolved:
+                            destination.unlink()
+                    if not destination.exists():
+                        destination.symlink_to(resolved)
+
+                work_root.mkdir(parents=True, exist_ok=True)
+                if not flashvsr_source_frames_available:
+                    print(
+                        "Local finishing PNGs were already cleaned; decoding the preserved "
+                        "source video for FlashVSR."
+                    )
+                    recovered_directory = work_root / "flashvsr_recovered_source"
+                    if recovered_directory.exists():
+                        shutil.rmtree(recovered_directory)
+                    recovered_directory.mkdir(parents=True)
+                    subprocess.check_call([
+                        ffmpeg, "-y", "-i", str(flashvsr_input_video),
+                        "-vsync", "0", "-start_number", "0",
+                        str(recovered_directory / "%07d.png"),
+                    ])
+                    recovered_paths = sorted(
+                        recovered_directory.glob("*.png"), key=lambda path: int(path.stem)
+                    )
+                    if len(recovered_paths) != len(flashvsr_input_paths):
+                        raise RuntimeError(
+                            f"Recovered {len(recovered_paths)} source frames; expected "
+                            f"{len(flashvsr_input_paths)}"
+                        )
+                    flashvsr_input_paths = recovered_paths
+                flashvsr_manifest_path = work_root / "flashvsr_input_manifest.json"
+                flashvsr_manifest_path.write_text(json.dumps({
+                    "frames": [str(Path(path).resolve()) for path in flashvsr_input_paths],
+                    "fps": flashvsr_input_fps,
+                    "cyclic": True,
+                    "terminal_duplicate_present": False,
+                }, indent=2) + "\n", encoding="utf-8")
+                runner = Path(PROJECT_ROOT) / "scripts" / "flashvsr_v11_streaming_runner.py"
+                command = [
+                    str(venv_python), "-u", str(runner),
+                    "--repo", FLASHVSR_ROOT,
+                    "--weights", FLASHVSR_WEIGHTS_ROOT,
+                    "--manifest", str(flashvsr_manifest_path),
+                    "--output", str(FLASHVSR_FINAL_VIDEO_PATH),
+                    "--report", str(flashvsr_report_path),
+                    "--ffmpeg", str(ffmpeg),
+                    "--scale", str(FLASHVSR_SCALE),
+                    "--seed", str(FLASHVSR_SEED),
+                    "--sparse-ratio", str(FLASHVSR_SPARSE_RATIO),
+                    "--local-range", str(FLASHVSR_LOCAL_RANGE),
+                    "--warmup-frames", str(FLASHVSR_CYCLIC_WARMUP_FRAMES),
+                    "--crf", str(FLASHVSR_CRF),
+                    "--preset", FLASHVSR_FFMPEG_PRESET,
+                ]
+                if not FLASHVSR_COLOR_FIX:
+                    command.append("--no-color-fix")
+                return_code, flashvsr_log = stream_command(command)
+                if return_code != 0:
+                    raise RuntimeError("FlashVSR failed:\n" + flashvsr_log[-12000:])
+                FLASHVSR_REPORT = json.loads(flashvsr_report_path.read_text(encoding="utf-8"))
+                if FLASHVSR_REPORT.get("output_unique_frames") != len(flashvsr_input_paths):
+                    raise RuntimeError("FlashVSR changed the frame count")
+                FLASHVSR_REPORT.update({
+                    "fingerprint": flashvsr_fingerprint,
+                    "input_stage": flashvsr_input_stage,
+                    "source_video": str(flashvsr_input_video),
+                    "flashvsr_repository_revision": FLASHVSR_REPOSITORY_REVISION,
+                    "flashvsr_model_repository": FLASHVSR_MODEL_REPOSITORY,
+                    "flashvsr_model_revision": FLASHVSR_MODEL_REVISION,
+                    "block_sparse_attention_revision": FLASHVSR_SPARSE_REPOSITORY_REVISION,
+                    "environment": flashvsr_environment_spec,
+                })
+                flashvsr_report_path.write_text(
+                    json.dumps(FLASHVSR_REPORT, indent=2) + "\n", encoding="utf-8"
+                )
+
+            if not FLASHVSR_FINAL_VIDEO_PATH.is_file() or FLASHVSR_FINAL_VIDEO_PATH.stat().st_size == 0:
+                raise RuntimeError("FlashVSR output is missing or empty")
+            print(json.dumps(FLASHVSR_REPORT, indent=2))
+            display(Markdown("### FlashVSR v1.1 4x cyclic loop"))
+            display(Video(
+                str(FLASHVSR_FINAL_VIDEO_PATH), embed=False, width=DISPLAY_VIDEO_WIDTH,
+                html_attributes="controls loop muted playsinline",
+            ))
+        else:
+            print("FlashVSR disabled; retaining the preceding 768-pixel video.")
+        '''
+    ),
+    markdown(
         "h3-22-audit-heading",
         r"""
-        ## 13. Persist the final audit and optionally release the Colab runtime
+        ## 14. Persist the final audit and optionally release the Colab runtime
 
         Runtime unassignment is explicit and off by default. The source FLUX run is never
         modified. Local decoded PNGs may be removed only after both persistent videos and all
@@ -1401,12 +1832,16 @@ cells = [
     code(
         "h3-23-audit",
         r'''
-        if not RUN_RIFE_POSTPROCESS and STOP_COMFY_WHEN_FINISHED:
+        if not RUN_RIFE_POSTPROCESS and not RUN_FLASHVSR_UPSCALE and STOP_COMFY_WHEN_FINISHED:
             release_local_h3_server()
         final_video = (
-            BORDER_FINAL_VIDEO_PATH
-            if BORDER_FINAL_VIDEO_PATH is not None
-            else (RIFE_FINAL_VIDEO_PATH if RUN_RIFE_POSTPROCESS else H3_NATIVE_VIDEO_PATH)
+            FLASHVSR_FINAL_VIDEO_PATH
+            if FLASHVSR_FINAL_VIDEO_PATH is not None
+            else (
+                BORDER_FINAL_VIDEO_PATH
+                if BORDER_FINAL_VIDEO_PATH is not None
+                else (RIFE_FINAL_VIDEO_PATH if RUN_RIFE_POSTPROCESS else H3_NATIVE_VIDEO_PATH)
+            )
         )
         if final_video is None or not Path(final_video).is_file() or Path(final_video).stat().st_size == 0:
             raise RuntimeError("Final H3 video is missing or empty")
@@ -1435,6 +1870,21 @@ cells = [
             "border_center_pixels_unchanged": (
                 BORDER_STABILIZATION_REPORT["center_pixels_unchanged"]
                 if BORDER_STABILIZATION_REPORT is not None else None
+            ),
+            "flashvsr_enabled": RUN_FLASHVSR_UPSCALE,
+            "flashvsr_video": (
+                str(FLASHVSR_FINAL_VIDEO_PATH) if FLASHVSR_FINAL_VIDEO_PATH is not None else None
+            ),
+            "flashvsr_scale": (
+                FLASHVSR_REPORT.get("scale_requested") if FLASHVSR_REPORT is not None else None
+            ),
+            "flashvsr_output_resolution": (
+                FLASHVSR_REPORT.get("output_resolution") if FLASHVSR_REPORT is not None else None
+            ),
+            "flashvsr_frame_count_preserved": (
+                FLASHVSR_REPORT.get("output_unique_frames")
+                == FLASHVSR_REPORT.get("input_unique_frames")
+                if FLASHVSR_REPORT is not None else None
             ),
             "final_video": str(final_video),
             "source_run_modified": False,
