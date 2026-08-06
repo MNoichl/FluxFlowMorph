@@ -1732,6 +1732,7 @@ cells = [
                     else bool(FLASHVSR_USE_OFFICIAL_TORCH)
                 )
                 flashvsr_environment_spec = {
+                    "setup_version": 2,
                     "flashvsr_revision": FLASHVSR_REPOSITORY_REVISION,
                     "sparse_revision": FLASHVSR_SPARSE_REPOSITORY_REVISION,
                     "torch_mode": "official_2.6.0_cu124" if use_official_torch else "colab_runtime",
@@ -1758,39 +1759,57 @@ cells = [
                         "import torch, block_sparse_attn; assert torch.cuda.is_available()",
                     ])
                     environment_ready = check.returncode == 0
-                if not environment_ready:
-                    if venv_root.exists():
-                        if venv_root.resolve().parent != Path("/content"):
-                            raise RuntimeError(f"Refusing to replace unexpected venv: {venv_root}")
-                        shutil.rmtree(venv_root)
-                    venv_command = [sys.executable, "-m", "venv"]
-                    if not use_official_torch:
-                        venv_command.append("--system-site-packages")
-                    venv_result = subprocess.run(
-                        [*venv_command, str(venv_root)],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
+                partial_environment_reusable = False
+                if (
+                    not environment_ready
+                    and not FLASHVSR_REBUILD_ENVIRONMENT
+                    and venv_python.is_file()
+                ):
+                    expected_torch_check = (
+                        "assert torch.__version__.startswith('2.6.0')"
+                        if use_official_torch
+                        else f"assert torch.__version__ == {torch.__version__!r}"
                     )
-                    if venv_result.returncode != 0:
-                        print(
-                            "stdlib venv creation failed; falling back to virtualenv:\n"
-                            + venv_result.stdout
-                        )
+                    partial_check = subprocess.run([
+                        str(venv_python), "-c", f"import torch; {expected_torch_check}",
+                    ])
+                    partial_environment_reusable = partial_check.returncode == 0
+                    if partial_environment_reusable:
+                        print("Resuming the compatible partial FlashVSR environment.")
+                if not environment_ready:
+                    if not partial_environment_reusable:
                         if venv_root.exists():
                             if venv_root.resolve().parent != Path("/content"):
-                                raise RuntimeError(
-                                    f"Refusing to replace unexpected partial venv: {venv_root}"
-                                )
+                                raise RuntimeError(f"Refusing to replace unexpected venv: {venv_root}")
                             shutil.rmtree(venv_root)
-                        subprocess.check_call([
-                            sys.executable, "-m", "pip", "install", "-q",
-                            "virtualenv>=20.26,<21",
-                        ])
-                        virtualenv_command = [sys.executable, "-m", "virtualenv"]
+                        venv_command = [sys.executable, "-m", "venv"]
                         if not use_official_torch:
-                            virtualenv_command.append("--system-site-packages")
-                        subprocess.check_call([*virtualenv_command, str(venv_root)])
+                            venv_command.append("--system-site-packages")
+                        venv_result = subprocess.run(
+                            [*venv_command, str(venv_root)],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                        )
+                        if venv_result.returncode != 0:
+                            print(
+                                "stdlib venv creation failed; falling back to virtualenv:\n"
+                                + venv_result.stdout
+                            )
+                            if venv_root.exists():
+                                if venv_root.resolve().parent != Path("/content"):
+                                    raise RuntimeError(
+                                        f"Refusing to replace unexpected partial venv: {venv_root}"
+                                    )
+                                shutil.rmtree(venv_root)
+                            subprocess.check_call([
+                                sys.executable, "-m", "pip", "install", "-q",
+                                "virtualenv>=20.26,<21",
+                            ])
+                            virtualenv_command = [sys.executable, "-m", "virtualenv"]
+                            if not use_official_torch:
+                                virtualenv_command.append("--system-site-packages")
+                            subprocess.check_call([*virtualenv_command, str(venv_root)])
                     subprocess.check_call([
                         str(venv_python), "-m", "pip", "install", "-q", "--upgrade",
                         "pip", "setuptools", "wheel", "packaging", "ninja",
@@ -1815,12 +1834,13 @@ cells = [
                             str(venv_python), "-m", "pip", "install", "-q",
                             "-r", str(filtered_requirements),
                         ])
-                    subprocess.check_call([
-                        str(venv_python), "-m", "pip", "install", "-q", "--no-deps",
-                        "-e", str(flashvsr_root),
-                    ])
                     build_environment = dict(os.environ)
                     build_environment["MAX_JOBS"] = str(FLASHVSR_BUILD_MAX_JOBS)
+                    build_environment["NVCC_THREADS"] = str(FLASHVSR_BUILD_MAX_JOBS)
+                    cuda_major, cuda_minor = torch.cuda.get_device_capability(0)
+                    build_environment["BLOCK_SPARSE_ATTN_CUDA_ARCHS"] = (
+                        f"{cuda_major}{cuda_minor}"
+                    )
                     subprocess.check_call(
                         [str(venv_python), "setup.py", "install"],
                         cwd=str(sparse_root),

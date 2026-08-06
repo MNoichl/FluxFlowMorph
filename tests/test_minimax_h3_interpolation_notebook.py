@@ -209,5 +209,9 @@ def test_flashvsr_v11_is_final_streamed_cyclic_four_x_stage() -> None:
     assert "Local finishing PNGs were already cleaned" in code
     assert "stdlib venv creation failed; falling back to virtualenv" in code
     assert '"virtualenv>=20.26,<21"' in code
+    assert '"setup_version": 2' in code
+    assert "Resuming the compatible partial FlashVSR environment." in code
+    assert '"-e", str(flashvsr_root)' not in code
+    assert 'build_environment["BLOCK_SPARSE_ATTN_CUDA_ARCHS"]' in code
     assert "lazy-loads temporal slices" in markdown
     assert "locality-constrained sparse attention" in markdown
