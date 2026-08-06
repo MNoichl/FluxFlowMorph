@@ -171,6 +171,7 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     prompt = build_default_h3_prompt(
         duration_seconds=6.0,
         motion_directive="RIJKSOIL, " + DEFAULT_H3_MOTION_DIRECTIVE,
+        trigger="RIJKSOIL",
     )
     assert DEFAULT_H3_MOTION_DIRECTIVE.startswith("The objects")
     assert "RIJKSOIL" not in prompt
@@ -185,6 +186,7 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
         "RIJKSOIL, the sparse sphere at #Image1 slowly changes its silhouette and surface into the faceted "
         "vessel at #Image2 while every object follows the shortest stable path through the shot.",
         duration_seconds=6.0,
+        trigger="RIJKSOIL",
     )
     assert "RIJKSOIL" not in openai_prompt
     assert "<Picture 1>" in openai_prompt and "<Picture 2>" in openai_prompt
@@ -196,7 +198,7 @@ def test_official_ui_workflow_is_patched_with_two_images_and_direct_dimensions()
         _minimal_official_template(),
         first_image="run_pair_first.png",
         last_image="run_pair_last.png",
-        prompt="continuous sparse-object transformation",
+        prompt="RIJKSOIL, continuous sparse-object transformation",
         width=768,
         height=768,
         duration_seconds=6.0,

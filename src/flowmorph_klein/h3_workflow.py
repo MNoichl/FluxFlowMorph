@@ -153,9 +153,11 @@ def build_default_h3_prompt(
     *,
     duration_seconds: float,
     motion_directive: str = DEFAULT_H3_MOTION_DIRECTIVE,
+    trigger: str | None = None,
 ) -> str:
-    """Wrap the user's motion instruction in MiniMax's official FL2VA syntax."""
+    """Wrap the motion instruction in FL2VA syntax; ignore legacy FLUX trigger arguments."""
 
+    _ = trigger  # Backward compatibility for an already-open pre-fix notebook.
     clean_directive = strip_h3_source_only_tokens(motion_directive)
     clean_directive = re.sub(r"#Image1\b", "<Picture 1>", clean_directive, flags=re.IGNORECASE)
     clean_directive = re.sub(r"#Image2\b", "<Picture 2>", clean_directive, flags=re.IGNORECASE)
@@ -183,9 +185,11 @@ def wrap_openai_h3_motion(
     motion_description: str,
     *,
     duration_seconds: float,
+    trigger: str | None = None,
 ) -> str:
-    """Apply fixed endpoint/audio constraints around an image-aware OpenAI proposal."""
+    """Apply fixed constraints; ignore legacy upstream-FLUX trigger arguments."""
 
+    _ = trigger  # Backward compatibility for an already-open pre-fix notebook.
     clean = strip_h3_source_only_tokens(motion_description)
     if len(clean) < 80:
         raise ValueError("OpenAI motion description is unexpectedly short")
@@ -287,6 +291,7 @@ def patch_h3_ui_workflow(
         raise ValueError("seed must be in [0, 2**63)")
     if not first_image or not last_image:
         raise ValueError("both ComfyUI input image names are required")
+    prompt = strip_h3_source_only_tokens(prompt)
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
 
