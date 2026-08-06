@@ -1,0 +1,1325 @@
+"""Build the standalone local MiniMax H3 interpolation Colab notebook."""
+
+from __future__ import annotations
+
+import json
+import textwrap
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "notebooks" / "StillLife_MiniMax_H3_FL2V_Interpolation.ipynb"
+
+
+def lines(source: str) -> list[str]:
+    value = textwrap.dedent(source).strip("\n") + "\n"
+    return value.splitlines(keepends=True)
+
+
+def markdown(cell_id: str, source: str) -> dict:
+    return {"cell_type": "markdown", "id": cell_id, "metadata": {}, "source": lines(source)}
+
+
+def code(cell_id: str, source: str) -> dict:
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "id": cell_id,
+        "metadata": {},
+        "outputs": [],
+        "source": lines(source),
+    }
+
+
+cells = [
+    markdown(
+        "h3-00-title",
+        r"""
+        # Still-life loop — local MiniMax H3 first/last-frame interpolation
+
+        [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MNoichl/FluxFlowMorph/blob/agent/chimera-flux-flat-morph/notebooks/StillLife_MiniMax_H3_FL2V_Interpolation.ipynb)
+
+        This is a separate downstream notebook. It does **not** regenerate FLUX anchors or
+        alter any CHIMERA run. It reads the ordered anchor images and their authored prompts
+        from one completed `base_manifest.json`, renders every adjacent pair (including the
+        last-to-first closure) with the open MiniMax H3 FL2VA weights on the Colab GPU, and
+        writes a new resumable run beneath `minimax_h3_interpolations` on Drive.
+
+        The default uses the supplied locked-camera morph instruction. An optional
+        `openai_per_pair` mode sends both endpoint images and both saved endpoint prompts to
+        the Responses API, caches one structured motion plan per pair, and prints the exact H3
+        prompt before local rendering. OpenAI is used only for prompt writing; H3 inference is
+        always self-hosted in this runtime.
+        """,
+    ),
+    markdown(
+        "h3-01-settings-heading",
+        r"""
+        ## 1. Editable source, H3, prompt, and finishing settings
+
+        `SOURCE_RUN_DIRECTORY=None` discovers the newest completed prompt-only CHIMERA run.
+        Replace it with an exact Drive directory to pin a particular set of FLUX anchors.
+        A100 40/80 GB is the recommended Colab target. L4 24 GB selects ComfyUI low-VRAM
+        offload automatically and is expected to be substantially slower.
+        """,
+    ),
+    code(
+        "h3-02-settings",
+        r'''
+        PROJECT_ROOT = "/content/FlowMorphKlein9B"
+        REPOSITORY_URL = "https://github.com/MNoichl/FluxFlowMorph.git"
+        REPOSITORY_REF = "agent/chimera-flux-flat-morph"
+
+        MOUNT_DRIVE = True
+        DRIVE_PROJECT_BASE = "/content/drive/MyDrive/FluxFlowMorphArt"
+        SOURCE_PROJECT_NAME = "science_path_prompt_only_chimera"
+        SOURCE_RUN_DIRECTORY = None  # Or an exact completed FLUX/CHIMERA run directory.
+        H3_PROJECT_NAME = "minimax_h3_interpolations"
+        RESUME_H3_RUN_DIRECTORY = None
+        LOCAL_ASSET_ROOT = "/content/minimax_h3_interpolation"
+        HF_CACHE_DIR = "/content/hf_cache"
+
+        # Local H3/ComfyUI stack, pinned to the researched open-weight release.
+        COMFYUI_ROOT = "/content/ComfyUI"
+        COMFYUI_REPOSITORY = "https://github.com/Comfy-Org/ComfyUI.git"
+        COMFYUI_REVISION = "2eb609766a749e3104485979615e062e401bab97"
+        COMFY_CLI_VERSION = "1.15.0"
+        H3_TEMPLATE_REVISION = "5097de61ef09fe75466716ac0b200515f5ea078f"
+        H3_TEMPLATE_URL = (
+            "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/"
+            f"{H3_TEMPLATE_REVISION}/templates/video_minimax_h3_i2v.json"
+        )
+        H3_MODEL_REPOSITORY = "Comfy-Org/MiniMax-H3"
+        H3_MODEL_REVISION = "eb8a16107c595128b3a578f82d2ce2f75920c355"
+        H3_DIFFUSION_MODEL = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+        H3_TEXT_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+        H3_VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
+        H3_AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
+        H3_COMFY_PORT = 8188
+
+        H3_WIDTH = 768
+        H3_HEIGHT = 768
+        H3_DURATION_SECONDS = 4.0
+        H3_FPS = 24
+        H3_BASE_SEED = None  # OS entropy on a new run; persisted on Drive.
+        H3_REUSE_EXISTING_CLIPS = True
+        RUN_ONE_PAIR_TEST = True
+        H3_ONE_PAIR_TEST_INDEX = 0
+        RUN_FULL_H3_SEQUENCE = True
+        H3_KEEP_NATIVE_AUDIO_IN_PAIR_CLIPS = True  # Final loop is silent for clean joins.
+
+        # Exact supplied starting instruction. The wrapper converts #Image1/#Image2 to
+        # the <Picture 1>/<Picture 2> syntax used by the official local H3 prompting guide.
+        H3_BASE_MOTION_PROMPT = (
+            "The objects in #Image1 morphing into #Image2 . No camera movement, no panning, "
+            "no exchange, no cuts. Only objects changing shape, form texture and color. "
+            "No alpha blending. Objects moving as little as possible."
+        )
+        H3_LORA_TRIGGER = "RIJKSOIL"
+        H3_PROMPT_MODE = "template"  # "template" or "openai_per_pair"
+        H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE = False
+
+        # Optional image-aware OpenAI prompt writer. H3 itself never uses an API.
+        OPENAI_KEY_FILENAME = "openaiapikey.txt"
+        OPENAI_MODEL = "gpt-5.6"
+        OPENAI_REASONING_EFFORT = "medium"
+        OPENAI_IMAGE_DETAIL = "high"
+        OPENAI_MAX_OUTPUT_TOKENS = 3000
+        OPENAI_MAX_ATTEMPTS = 3
+        VISION_IMAGE_MAX_SIDE = 1024
+        VISION_JPEG_QUALITY = 90
+
+        # Native H3 clip assembly and one optional inexpensive RIFE x2 pass.
+        RUN_RIFE_POSTPROCESS = True
+        RIFE_REPOSITORY_URL = "https://github.com/hzwer/Practical-RIFE.git"
+        RIFE_REPOSITORY_REVISION = "17d8c7a1005b37f4c97bfee04e316aaec7fdc536"
+        RIFE_ROOT = "/content/Practical-RIFE"
+        RIFE_MODEL_REPOSITORY = "Bash2X/RIFE-Models"
+        RIFE_MODEL_REVISION = "feaf6d11238b4a1e9f015a5d18c18df152affd20"
+        RIFE_MODEL_FILENAME = "RIFE_v4.25.zip"
+        RIFE_MULTIPLIER = 2
+        RIFE_SCALE = 1.0
+        RIFE_BATCH_SIZE = 4
+        RIFE_USE_FP16 = True
+        RIFE_RETRY_WITH_FP32 = True
+        VIDEO_CRF = 16
+        DISPLAY_VIDEO_WIDTH = 768
+        KEEP_LOCAL_WORK_FRAMES = False
+        STOP_COMFY_WHEN_FINISHED = True
+        UNASSIGN_RUNTIME_WHEN_FINISHED = False
+        '''
+    ),
+    markdown(
+        "h3-03-research",
+        r"""
+        ## 2. Why this local stack
+
+        MiniMax released H3's open Base weights with native text/image/video/audio support.
+        `H3-Base-FL2VA` accepts zero, one, or two images; two images are its first/last-frame
+        mode. The open release produces 4–15 second, 24 fps video with a native 768-pixel
+        short edge. MiniMax's hosted Context-IR prompt preprocessor and 2K regeneration model
+        are not open, so this notebook uses the published Base prompting format and the native
+        resolution rather than pretending those hosted stages are local.
+
+        The official reproducible SGLang serving recipe targets four GPUs. For a single Colab
+        GPU, the practical supported path is current ComfyUI plus Comfy-Org's official pruned
+        INT8 FL2VA transformer and NVFP4 Qwen3-VL encoder. Their combined downloads are about
+        40 GB, so the model cell performs a local-disk preflight. ComfyUI remains running while
+        all H3 pairs render, allowing its smart model cache/offload to avoid cold-starting every
+        pair. Only after H3 completes is that memory released for RIFE.
+
+        Primary references: [MiniMax H3 model card](https://huggingface.co/MiniMaxAI/MiniMax-H3),
+        [official H3 prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md),
+        [Comfy-Org H3 weights](https://huggingface.co/Comfy-Org/MiniMax-H3), and
+        [official ComfyUI H3 workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_i2v.json).
+        """,
+    ),
+    markdown(
+        "h3-04-setup-heading",
+        r"""
+        ## 3. GPU, fresh repository checkout, and pinned local H3 runtime
+
+        Rerunning this cell fetches the current requested repository branch and detaches at its
+        newest remote commit. It never embeds a portable fallback. ComfyUI itself stays pinned
+        to the H3-compatible revision above so a later frontend change cannot silently alter
+        the workflow during a resumed run.
+        """,
+    ),
+    code(
+        "h3-05-setup",
+        r'''
+        import importlib
+        import json
+        import os
+        import platform
+        import shutil
+        import subprocess
+        import sys
+        import time
+        import urllib.request
+        from pathlib import Path
+
+        print({"python": sys.version, "platform": platform.platform()})
+        try:
+            import torch
+        except ImportError as error:
+            raise RuntimeError("PyTorch is missing; select a Colab GPU runtime.") from error
+        if not torch.cuda.is_available():
+            raise RuntimeError("A CUDA GPU runtime is required for local MiniMax H3.")
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_vram_gib = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print({"gpu": gpu_name, "vram_gib": round(gpu_vram_gib, 2), "cuda": torch.version.cuda})
+        if gpu_vram_gib < 22:
+            raise RuntimeError("H3 FL2VA needs at least a 24 GB-class GPU; choose L4, A100, or larger.")
+        if gpu_vram_gib < 35:
+            print("L4-class runtime detected: low-VRAM offload will be used; expect slower H3 rendering.")
+
+        project_path = Path(PROJECT_ROOT)
+        if not (project_path / ".git").is_dir():
+            subprocess.check_call([
+                "git", "clone", "--depth", "1", "--branch", REPOSITORY_REF,
+                "--single-branch", REPOSITORY_URL, PROJECT_ROOT,
+            ])
+        else:
+            subprocess.check_call([
+                "git", "-C", PROJECT_ROOT, "fetch", "--depth", "1", "origin", REPOSITORY_REF,
+            ])
+            subprocess.check_call([
+                "git", "-C", PROJECT_ROOT, "checkout", "--detach", "FETCH_HEAD",
+            ])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-e", PROJECT_ROOT])
+
+        required = {
+            "openai": "openai>=2,<3",
+            "huggingface_hub": "huggingface-hub>=0.34,<1",
+            "imageio_ffmpeg": "imageio-ffmpeg>=0.5,<1",
+            "pydantic": "pydantic>=2.10,<3",
+        }
+        missing = []
+        for module_name, requirement in required.items():
+            try:
+                importlib.import_module(module_name)
+            except ImportError:
+                missing.append(requirement)
+        if missing:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "-q", f"comfy-cli=={COMFY_CLI_VERSION}"
+        ])
+
+        comfy_root = Path(COMFYUI_ROOT)
+        if not (comfy_root / ".git").is_dir():
+            subprocess.check_call([
+                "git", "clone", "--filter=blob:none", COMFYUI_REPOSITORY, COMFYUI_ROOT,
+            ])
+        subprocess.check_call([
+            "git", "-C", COMFYUI_ROOT, "fetch", "--depth", "1", "origin", COMFYUI_REVISION,
+        ])
+        subprocess.check_call([
+            "git", "-C", COMFYUI_ROOT, "checkout", "--detach", COMFYUI_REVISION,
+        ])
+        installed_comfy_revision = subprocess.check_output(
+            ["git", "-C", COMFYUI_ROOT, "rev-parse", "HEAD"], text=True
+        ).strip()
+        if installed_comfy_revision != COMFYUI_REVISION:
+            raise RuntimeError("ComfyUI did not resolve to the pinned H3 revision")
+        if not (comfy_root / "comfy_extras" / "nodes_minimax_h3.py").is_file():
+            raise RuntimeError("Pinned ComfyUI checkout does not contain MiniMax H3 nodes")
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "-q", "-r", str(comfy_root / "requirements.txt")
+        ])
+
+        template_path = Path(LOCAL_ASSET_ROOT) / "official_video_minimax_h3_i2v.json"
+        template_path.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(H3_TEMPLATE_URL, template_path)
+        template_payload = json.loads(template_path.read_text(encoding="utf-8"))
+        if len(template_payload.get("definitions", {}).get("subgraphs", [])) != 1:
+            raise RuntimeError("Downloaded H3 template does not contain the expected subgraph")
+
+        package_source = str(project_path / "src")
+        if package_source not in sys.path:
+            sys.path.insert(0, package_source)
+        importlib.invalidate_caches()
+        for module_name in tuple(sys.modules):
+            if module_name == "flowmorph_klein" or module_name.startswith("flowmorph_klein."):
+                del sys.modules[module_name]
+        from flowmorph_klein.h3_workflow import (
+            build_default_h3_prompt,
+            cyclic_h3_pairs,
+            load_h3_anchor_records,
+            patch_h3_ui_workflow,
+            snap_h3_frame_count,
+            stable_h3_fingerprint,
+            validate_h3_canvas,
+            wrap_openai_h3_motion,
+        )
+
+        validate_h3_canvas(H3_WIDTH, H3_HEIGHT)
+        H3_FRAME_COUNT = snap_h3_frame_count(H3_DURATION_SECONDS, fps=H3_FPS)
+        project_commit = subprocess.check_output(
+            ["git", "-C", PROJECT_ROOT, "rev-parse", "HEAD"], text=True
+        ).strip()
+        print({
+            "repository_commit": project_commit,
+            "comfyui_commit": installed_comfy_revision,
+            "h3_frame_count_per_pair": H3_FRAME_COUNT,
+            "actual_pair_seconds_before_terminal_dedup": round(H3_FRAME_COUNT / H3_FPS, 4),
+        })
+        '''
+    ),
+    markdown(
+        "h3-06-drive-heading",
+        r"""
+        ## 4. Mount Drive, choose the source run, and reserve a separate H3 run
+
+        The source manifest is read-only. Every H3 prompt plan, patched workflow, pair clip,
+        and final video goes into the new directory printed by this cell. A random run seed is
+        created once and persisted, so a disconnected session can resume deterministically.
+        """,
+    ),
+    code(
+        "h3-07-drive",
+        r'''
+        import re
+        import secrets
+        from datetime import datetime, timezone
+
+        if not MOUNT_DRIVE:
+            raise RuntimeError("This notebook expects Google Drive persistence.")
+        try:
+            from google.colab import drive
+        except ImportError as error:
+            raise RuntimeError("Run this notebook in a Colab kernel (VS Code Colab is fine).") from error
+        drive.mount("/content/drive")
+        drive_base = Path(DRIVE_PROJECT_BASE)
+        drive_base.mkdir(parents=True, exist_ok=True)
+
+        def completed_source_runs():
+            project_directory = drive_base / SOURCE_PROJECT_NAME
+            if not project_directory.is_dir():
+                return []
+            candidates = []
+            for candidate in project_directory.iterdir():
+                manifest = candidate / "metadata" / "base_manifest.json"
+                if not candidate.is_dir() or not manifest.is_file():
+                    continue
+                try:
+                    payload = json.loads(manifest.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if payload.get("complete") is True and len(payload.get("records", [])) >= 2:
+                    candidates.append(candidate)
+            return sorted(candidates, key=lambda path: (path.stat().st_mtime, path.name))
+
+        if SOURCE_RUN_DIRECTORY is None:
+            available_sources = completed_source_runs()
+            if not available_sources:
+                raise FileNotFoundError(
+                    f"No completed source run found under {drive_base / SOURCE_PROJECT_NAME}"
+                )
+            SOURCE_RUN = available_sources[-1]
+            source_selection = "latest_completed"
+        else:
+            SOURCE_RUN = Path(SOURCE_RUN_DIRECTORY).expanduser()
+            source_selection = "explicit"
+        if not SOURCE_RUN.is_dir():
+            raise FileNotFoundError(f"SOURCE_RUN_DIRECTORY does not exist: {SOURCE_RUN}")
+
+        def reserve_h3_run(parent, source_name):
+            source_root = Path(parent) / H3_PROJECT_NAME / source_name
+            source_root.mkdir(parents=True, exist_ok=True)
+            prefix = "h3_fl2va_"
+            numbers = []
+            for candidate in source_root.iterdir():
+                token = candidate.name[len(prefix):].split("_", 1)[0] if candidate.name.startswith(prefix) else ""
+                if candidate.is_dir() and token.isdigit():
+                    numbers.append(int(token))
+            number = max(numbers, default=0) + 1
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            while True:
+                candidate = source_root / f"{prefix}{number:04d}_{stamp}"
+                try:
+                    candidate.mkdir(parents=False, exist_ok=False)
+                    return candidate
+                except FileExistsError:
+                    number += 1
+
+        if RESUME_H3_RUN_DIRECTORY is not None:
+            RUN_DIRECTORY = Path(RESUME_H3_RUN_DIRECTORY).expanduser()
+            if not RUN_DIRECTORY.is_dir():
+                raise FileNotFoundError(f"RESUME_H3_RUN_DIRECTORY does not exist: {RUN_DIRECTORY}")
+        else:
+            RUN_DIRECTORY = reserve_h3_run(drive_base, SOURCE_RUN.name)
+        for child in ("clips", "metadata", "prompts", "workflows", "video", "diagnostics"):
+            (RUN_DIRECTORY / child).mkdir(parents=True, exist_ok=True)
+        Path(HF_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
+        seed_path = RUN_DIRECTORY / "metadata" / "run_seed.json"
+        configured_h3_seed = H3_BASE_SEED
+        if seed_path.is_file():
+            H3_BASE_SEED = int(json.loads(seed_path.read_text(encoding="utf-8"))["h3_base_seed"])
+            seed_source = "persisted"
+        else:
+            H3_BASE_SEED = (
+                int(configured_h3_seed)
+                if configured_h3_seed is not None
+                else secrets.randbelow(2**63 - 10000)
+            )
+            seed_path.write_text(
+                json.dumps({
+                    "h3_base_seed": H3_BASE_SEED,
+                    "source": "configured" if configured_h3_seed is not None else "os_entropy",
+                }, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            seed_source = "configured" if configured_h3_seed is not None else "os_entropy"
+        if not 0 <= H3_BASE_SEED < 2**63:
+            raise ValueError("H3_BASE_SEED is outside [0, 2**63)")
+
+        OPENAI_CLIENT = None
+        OPENAI_KEY_PATH = None
+        if H3_PROMPT_MODE == "openai_per_pair":
+            from openai import OpenAI
+            OPENAI_KEY_PATH = drive_base / OPENAI_KEY_FILENAME
+            if not OPENAI_KEY_PATH.is_file():
+                raise FileNotFoundError(
+                    f"Create {OPENAI_KEY_PATH} with only the OpenAI API key, then rerun this cell."
+                )
+            api_key = OPENAI_KEY_PATH.read_text(encoding="utf-8").strip()
+            if len(api_key) < 20 or any(character.isspace() for character in api_key):
+                raise ValueError("OpenAI key file is empty or malformed")
+            OPENAI_CLIENT = OpenAI(api_key=api_key)
+            del api_key
+        elif H3_PROMPT_MODE != "template":
+            raise ValueError("H3_PROMPT_MODE must be 'template' or 'openai_per_pair'")
+
+        run_identity = {
+            "project": H3_PROJECT_NAME,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "source_run": str(SOURCE_RUN),
+            "source_selection": source_selection,
+            "run_directory": str(RUN_DIRECTORY),
+            "repository_commit": project_commit,
+            "comfyui_revision": COMFYUI_REVISION,
+            "h3_model_revision": H3_MODEL_REVISION,
+            "h3_prompt_mode": H3_PROMPT_MODE,
+            "h3_base_seed": H3_BASE_SEED,
+            "openai_model": OPENAI_MODEL if OPENAI_CLIENT is not None else None,
+            "openai_key_value_recorded": False,
+        }
+        (RUN_DIRECTORY / "metadata" / "run_identity.json").write_text(
+            json.dumps(run_identity, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        print({
+            "source_run": str(SOURCE_RUN),
+            "source_selection": source_selection,
+            "h3_run": str(RUN_DIRECTORY),
+            "seed": H3_BASE_SEED,
+            "seed_source": seed_source,
+            "prompt_mode": H3_PROMPT_MODE,
+        })
+        '''
+    ),
+    markdown(
+        "h3-08-anchors-heading",
+        r"""
+        ## 5. Load and inspect the FLUX anchors and saved prompts
+
+        Ordering comes exclusively from the selected run's `base_manifest.json`; the notebook
+        does not guess from filenames. The final anchor is paired back to the first. Paths from
+        an older Colab mount are recovered by filename inside the selected source run.
+        """,
+    ),
+    code(
+        "h3-09-anchors",
+        r'''
+        from PIL import Image, ImageDraw, ImageFont
+        from IPython.display import Markdown, display
+
+        BASE_RECORDS = load_h3_anchor_records(SOURCE_RUN)
+        H3_PAIRS = cyclic_h3_pairs(BASE_RECORDS)
+
+        thumbnails = []
+        thumb_size = 256
+        for record in BASE_RECORDS:
+            with Image.open(record["resolved_path"]) as opened:
+                image = opened.convert("RGB")
+                image.thumbnail((thumb_size, thumb_size))
+                canvas = Image.new("RGB", (thumb_size, thumb_size + 42), "#181818")
+                canvas.paste(image, ((thumb_size - image.width) // 2, (thumb_size - image.height) // 2))
+            draw = ImageDraw.Draw(canvas)
+            draw.text((8, thumb_size + 10), f"{record['source_index']:02d}  {record['uid']}", fill="white")
+            thumbnails.append(canvas)
+        columns = min(4, len(thumbnails))
+        rows = (len(thumbnails) + columns - 1) // columns
+        sheet = Image.new("RGB", (columns * thumb_size, rows * (thumb_size + 42)), "#080808")
+        for index, thumbnail in enumerate(thumbnails):
+            sheet.paste(thumbnail, ((index % columns) * thumb_size, (index // columns) * (thumb_size + 42)))
+        display(Markdown(f"### {len(BASE_RECORDS)} source anchors from `{SOURCE_RUN.name}`"))
+        display(sheet)
+
+        for record in BASE_RECORDS:
+            print("\n" + "=" * 100)
+            print(f"ANCHOR {record['source_index']:02d}: {record['uid']}")
+            print("image:", record["resolved_path"])
+            print("saved prompt:")
+            print(record["authored_prompt"])
+        print("\nCyclic pair order:")
+        for pair in H3_PAIRS:
+            print(f"  {pair['index']:02d}: {pair['left']['uid']} -> {pair['right']['uid']}")
+        '''
+    ),
+    markdown(
+        "h3-10-prompts-heading",
+        r"""
+        ## 6. Build, cache, and print one H3 prompt per pair
+
+        In `template` mode the exact supplied instruction is wrapped in MiniMax's local FL2VA
+        picture/timestamp syntax and `RIJKSOIL` is kept exactly once. In `openai_per_pair` mode,
+        GPT sees both actual paintings and both immutable authored prompts, then returns only a
+        concise visual motion plan. Fixed code adds the trigger, timing, locked-camera, silence,
+        endpoint, and no-new-object constraints afterward. Cached plans are fingerprinted by
+        the images, endpoint prompts, settings, and model.
+        """,
+    ),
+    code(
+        "h3-11-prompts",
+        r'''
+        import base64
+        import hashlib
+        import io
+        from pydantic import BaseModel, Field
+
+        class H3MotionProposal(BaseModel):
+            visual_correspondence: str = Field(min_length=40, max_length=1200)
+            motion_description: str = Field(min_length=80, max_length=1800)
+
+        H3_OAI_SYSTEM_PROMPT = f"""
+        You are writing one visual motion description for the open MiniMax H3 first/last-frame
+        video model. Inspect both attached endpoint paintings and both authored FLUX prompts.
+        The output will be wrapped in fixed production constraints by code.
+
+        Requirements for motion_description:
+        - Describe one continuous, locked-off shot from <Picture 1> to <Picture 2>.
+        - Map the major visible forms by screen position, silhouette, scale, material, and color.
+        - Make each mapped form transform continuously along the shortest plausible path.
+        - Preserve the observed object density and negative space. Never invent an object absent
+          from both pictures; sparse scenes must remain sparse.
+        - No camera movement, cuts, pans, zooms, dissolves, alpha blends, object swaps, captions,
+          production commentary, dialogue, or sound.
+        - Mention <Picture 1> and <Picture 2> literally.
+        - Do not include the trigger word {H3_LORA_TRIGGER}; code adds it exactly once.
+        - Return only the structured fields.
+        """.strip()
+
+        def sha256_file(path):
+            digest = hashlib.sha256()
+            with Path(path).open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        def image_data_url(path):
+            with Image.open(path) as opened:
+                image = opened.convert("RGB")
+                image.thumbnail((VISION_IMAGE_MAX_SIDE, VISION_IMAGE_MAX_SIDE))
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=VISION_JPEG_QUALITY, optimize=True)
+            return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+        def openai_motion_for_pair(pair):
+            user_text = (
+                f"Picture 1 authored prompt:\n{pair['left']['authored_prompt']}\n\n"
+                f"Picture 2 authored prompt:\n{pair['right']['authored_prompt']}\n\n"
+                f"Requested duration: {H3_DURATION_SECONDS:.2f} seconds."
+            )
+            last_error = None
+            for attempt in range(1, OPENAI_MAX_ATTEMPTS + 1):
+                try:
+                    response = OPENAI_CLIENT.responses.parse(
+                        model=OPENAI_MODEL,
+                        reasoning={"effort": OPENAI_REASONING_EFFORT},
+                        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+                        input=[
+                            {"role": "system", "content": H3_OAI_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": user_text},
+                                    {
+                                        "type": "input_image",
+                                        "image_url": image_data_url(pair["left"]["resolved_path"]),
+                                        "detail": OPENAI_IMAGE_DETAIL,
+                                    },
+                                    {
+                                        "type": "input_image",
+                                        "image_url": image_data_url(pair["right"]["resolved_path"]),
+                                        "detail": OPENAI_IMAGE_DETAIL,
+                                    },
+                                ],
+                            },
+                        ],
+                        text_format=H3MotionProposal,
+                    )
+                    proposal = response.output_parsed
+                    if proposal is None:
+                        raise RuntimeError("OpenAI returned no parsed motion proposal")
+                    return proposal, response.id
+                except Exception as error:
+                    last_error = error
+                    print(f"OpenAI pair {pair['index']:02d} attempt {attempt} failed: {error}")
+                    if attempt < OPENAI_MAX_ATTEMPTS:
+                        time.sleep(2**attempt)
+            raise RuntimeError(f"OpenAI prompt generation failed: {last_error}")
+
+        PAIR_PROMPT_PLANS = {}
+        for pair in H3_PAIRS:
+            prompt_path = RUN_DIRECTORY / "prompts" / f"{pair['index']:04d}_{pair['left']['uid']}_to_{pair['right']['uid']}.json"
+            prompt_basis = {
+                "mode": H3_PROMPT_MODE,
+                "openai_model": OPENAI_MODEL if H3_PROMPT_MODE == "openai_per_pair" else None,
+                "left_sha256": sha256_file(pair["left"]["resolved_path"]),
+                "right_sha256": sha256_file(pair["right"]["resolved_path"]),
+                "left_prompt": pair["left"]["authored_prompt"],
+                "right_prompt": pair["right"]["authored_prompt"],
+                "base_motion_prompt": H3_BASE_MOTION_PROMPT,
+                "trigger": H3_LORA_TRIGGER,
+                "duration_seconds": H3_DURATION_SECONDS,
+                "include_endpoint_prompts": H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE,
+            }
+            fingerprint = stable_h3_fingerprint(prompt_basis)
+            cached = None
+            if prompt_path.is_file():
+                try:
+                    candidate = json.loads(prompt_path.read_text(encoding="utf-8"))
+                    if candidate.get("fingerprint") == fingerprint:
+                        cached = candidate
+                except (OSError, json.JSONDecodeError):
+                    pass
+            if cached is not None:
+                plan = cached
+                plan_source = "cached"
+            elif H3_PROMPT_MODE == "template":
+                h3_prompt = build_default_h3_prompt(
+                    duration_seconds=H3_DURATION_SECONDS,
+                    trigger=H3_LORA_TRIGGER,
+                    motion_directive=H3_BASE_MOTION_PROMPT,
+                )
+                if H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE:
+                    h3_prompt += (
+                        "\n\nAuthored visual intent for <Picture 1>: "
+                        + pair["left"]["authored_prompt"]
+                        + "\nAuthored visual intent for <Picture 2>: "
+                        + pair["right"]["authored_prompt"]
+                    )
+                plan = {
+                    "fingerprint": fingerprint,
+                    "pair_id": pair["pair_id"],
+                    "mode": H3_PROMPT_MODE,
+                    "h3_prompt": h3_prompt,
+                    "visual_correspondence": None,
+                    "openai_response_id": None,
+                    "basis": prompt_basis,
+                }
+                plan_source = "generated_template"
+            else:
+                proposal, response_id = openai_motion_for_pair(pair)
+                plan = {
+                    "fingerprint": fingerprint,
+                    "pair_id": pair["pair_id"],
+                    "mode": H3_PROMPT_MODE,
+                    "h3_prompt": wrap_openai_h3_motion(
+                        proposal.motion_description,
+                        duration_seconds=H3_DURATION_SECONDS,
+                        trigger=H3_LORA_TRIGGER,
+                    ),
+                    "visual_correspondence": proposal.visual_correspondence,
+                    "openai_response_id": response_id,
+                    "basis": prompt_basis,
+                }
+                plan_source = "generated_openai"
+            prompt_path.write_text(
+                json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            PAIR_PROMPT_PLANS[pair["index"]] = plan
+            print("\n" + "=" * 110)
+            print(
+                f"PAIR {pair['index']:02d}: {pair['left']['uid']} -> {pair['right']['uid']} "
+                f"[{plan_source}]"
+            )
+            print("LEFT AUTHORED PROMPT:\n" + pair["left"]["authored_prompt"])
+            print("RIGHT AUTHORED PROMPT:\n" + pair["right"]["authored_prompt"])
+            if plan.get("visual_correspondence"):
+                print("VISUAL CORRESPONDENCE:\n" + plan["visual_correspondence"])
+            print("FINAL LOCAL H3 PROMPT:\n" + plan["h3_prompt"])
+        '''
+    ),
+    markdown(
+        "h3-12-models-heading",
+        r"""
+        ## 7. Download the released H3 checkpoints into local ComfyUI storage
+
+        This downloads roughly 40 GB once per Colab VM: the pruned INT8 FL2VA transformer,
+        NVFP4 Qwen3-VL encoder, FP16 video VAE, and audio VAE selected by the official workflow.
+        Files stay on fast ephemeral storage for inference; clips and metadata go straight to
+        Drive. The 2K regenerator is deliberately absent because MiniMax has not open-sourced it.
+        """,
+    ),
+    code(
+        "h3-13-models",
+        r'''
+        from huggingface_hub import hf_hub_download
+
+        MODEL_FILES = [
+            ("diffusion_models/" + H3_DIFFUSION_MODEL, 19.0),
+            ("text_encoders/" + H3_TEXT_ENCODER, 14.0),
+            ("vae/" + H3_VIDEO_VAE, 4.5),
+            ("vae/" + H3_AUDIO_VAE, 0.5),
+        ]
+        free_disk_gib = shutil.disk_usage("/content").free / 1024**3
+        existing_gib = 0.0
+        for relative_name, _ in MODEL_FILES:
+            candidate = Path(COMFYUI_ROOT) / "models" / relative_name
+            if candidate.is_file():
+                existing_gib += candidate.stat().st_size / 1024**3
+        required_remaining_gib = max(0.0, 40.0 - existing_gib)
+        if free_disk_gib < required_remaining_gib + 20.0:
+            raise RuntimeError(
+                f"Only {free_disk_gib:.1f} GiB local disk is free; the remaining H3 download "
+                f"plus working headroom needs about {required_remaining_gib + 20.0:.1f} GiB."
+            )
+        print({
+            "free_local_disk_gib": round(free_disk_gib, 2),
+            "already_present_h3_gib": round(existing_gib, 2),
+            "estimated_remaining_h3_gib": round(required_remaining_gib, 2),
+        })
+
+        resolved_model_paths = {}
+        for relative_name, minimum_gib in MODEL_FILES:
+            print("Resolving", relative_name, flush=True)
+            resolved = Path(hf_hub_download(
+                repo_id=H3_MODEL_REPOSITORY,
+                filename=relative_name,
+                revision=H3_MODEL_REVISION,
+                local_dir=Path(COMFYUI_ROOT) / "models",
+                cache_dir=HF_CACHE_DIR,
+            ))
+            if not resolved.is_file() or resolved.stat().st_size / 1024**3 < minimum_gib:
+                raise RuntimeError(f"H3 model file is incomplete: {resolved}")
+            resolved_model_paths[relative_name] = str(resolved)
+        print("All released H3 checkpoints are complete:")
+        for relative_name, path in resolved_model_paths.items():
+            print(f"  {relative_name}: {Path(path).stat().st_size / 1024**3:.2f} GiB")
+        '''
+    ),
+    markdown(
+        "h3-14-server-heading",
+        r"""
+        ## 8. Start one persistent, local-only ComfyUI H3 server
+
+        The server binds only to `127.0.0.1`; API/partner nodes are disabled. L4-class cards use
+        low-VRAM offload. A100 and larger use ComfyUI's default dynamic smart-memory policy.
+        The same process serves every pair so model components can remain cached between jobs.
+        """,
+    ),
+    code(
+        "h3-15-server",
+        r'''
+        import urllib.error
+
+        H3_SERVER_URL = f"http://127.0.0.1:{H3_COMFY_PORT}"
+        COMFY_LOG_PATH = Path(LOCAL_ASSET_ROOT) / "comfy_h3_server.log"
+
+        def comfy_server_ready():
+            try:
+                with urllib.request.urlopen(H3_SERVER_URL + "/system_stats", timeout=2) as response:
+                    return response.status == 200
+            except (OSError, urllib.error.URLError):
+                return False
+
+        H3_COMFY_PROCESS = globals().get("H3_COMFY_PROCESS")
+        if not comfy_server_ready():
+            launch = [
+                sys.executable, str(Path(COMFYUI_ROOT) / "main.py"),
+                "--listen", "127.0.0.1", "--port", str(H3_COMFY_PORT),
+                "--disable-api-nodes", "--disable-metadata", "--preview-method", "none",
+                "--reserve-vram", "3" if gpu_vram_gib >= 35 else "2",
+            ]
+            if gpu_vram_gib < 35:
+                launch.append("--lowvram")
+            environment = dict(os.environ)
+            environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            COMFY_LOG_HANDLE = COMFY_LOG_PATH.open("w", encoding="utf-8")
+            H3_COMFY_PROCESS = subprocess.Popen(
+                launch,
+                cwd=COMFYUI_ROOT,
+                stdout=COMFY_LOG_HANDLE,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                text=True,
+            )
+            deadline = time.time() + 600
+            while time.time() < deadline and not comfy_server_ready():
+                if H3_COMFY_PROCESS.poll() is not None:
+                    tail = COMFY_LOG_PATH.read_text(encoding="utf-8", errors="replace")[-10000:]
+                    raise RuntimeError("ComfyUI exited during startup:\n" + tail)
+                time.sleep(3)
+            if not comfy_server_ready():
+                raise TimeoutError("ComfyUI did not become ready within ten minutes")
+            server_source = "started_now"
+        else:
+            server_source = "already_running"
+        print({
+            "server": H3_SERVER_URL,
+            "source": server_source,
+            "pid": getattr(H3_COMFY_PROCESS, "pid", None),
+            "log": str(COMFY_LOG_PATH),
+            "memory_mode": "lowvram" if gpu_vram_gib < 35 else "dynamic_default",
+        })
+        '''
+    ),
+    markdown(
+        "h3-16-render-heading",
+        r"""
+        ## 9. Render one test pair, then the complete resumable cyclic set
+
+        Each job copies two source images to local ComfyUI input storage, patches the pinned
+        official UI workflow, converts it to the API graph client-side, and executes locally.
+        Pair manifests include all inputs and a fingerprint; a disconnected rerun reuses only
+        clips whose exact source images, prompts, checkpoints, seed, size, and duration match.
+        H3 jobs are intentionally serial because one 33B video model already saturates the GPU.
+        """,
+    ),
+    code(
+        "h3-17-render",
+        r'''
+        import glob
+
+        H3_TEMPLATE = json.loads(template_path.read_text(encoding="utf-8"))
+        COMFY_INPUT = Path(COMFYUI_ROOT) / "input"
+        COMFY_OUTPUT = Path(COMFYUI_ROOT) / "output"
+        COMFY_INPUT.mkdir(parents=True, exist_ok=True)
+        COMFY_OUTPUT.mkdir(parents=True, exist_ok=True)
+
+        def safe_name(value):
+            return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._") or "pair"
+
+        def h3_job_payload(pair):
+            prompt_plan = PAIR_PROMPT_PLANS[pair["index"]]
+            return {
+                "pair_id": pair["pair_id"],
+                "left_uid": pair["left"]["uid"],
+                "right_uid": pair["right"]["uid"],
+                "left_sha256": sha256_file(pair["left"]["resolved_path"]),
+                "right_sha256": sha256_file(pair["right"]["resolved_path"]),
+                "prompt_fingerprint": prompt_plan["fingerprint"],
+                "h3_prompt": prompt_plan["h3_prompt"],
+                "seed": H3_BASE_SEED + pair["index"],
+                "width": H3_WIDTH,
+                "height": H3_HEIGHT,
+                "duration_seconds": H3_DURATION_SECONDS,
+                "frame_count": H3_FRAME_COUNT,
+                "fps": H3_FPS,
+                "comfyui_revision": COMFYUI_REVISION,
+                "template_revision": H3_TEMPLATE_REVISION,
+                "model_repository": H3_MODEL_REPOSITORY,
+                "model_revision": H3_MODEL_REVISION,
+                "diffusion_model": H3_DIFFUSION_MODEL,
+                "text_encoder": H3_TEXT_ENCODER,
+                "video_vae": H3_VIDEO_VAE,
+                "audio_vae": H3_AUDIO_VAE,
+            }
+
+        def stream_command(command):
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            output_lines = []
+            assert process.stdout is not None
+            for line in process.stdout:
+                output_lines.append(line)
+                print(line, end="", flush=True)
+            return process.wait(), "".join(output_lines)
+
+        def render_h3_pair(pair):
+            payload = h3_job_payload(pair)
+            fingerprint = stable_h3_fingerprint(payload)
+            pair_slug = safe_name(pair["pair_id"])
+            clip_path = RUN_DIRECTORY / "clips" / f"{pair['index']:04d}_{pair_slug}.mp4"
+            manifest_path = RUN_DIRECTORY / "metadata" / f"h3_pair_{pair['index']:04d}.json"
+            if H3_REUSE_EXISTING_CLIPS and clip_path.is_file() and manifest_path.is_file():
+                try:
+                    prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    prior = {}
+                if prior.get("fingerprint") == fingerprint and prior.get("complete") is True:
+                    print(f"Reusing pair {pair['index']:02d}: {clip_path.name}")
+                    return {**prior, "clip_path": str(clip_path), "reused": True}
+
+            first_name = f"h3_{RUN_DIRECTORY.name}_{pair['index']:04d}_first.png"
+            last_name = f"h3_{RUN_DIRECTORY.name}_{pair['index']:04d}_last.png"
+            for source, name in (
+                (pair["left"]["resolved_path"], first_name),
+                (pair["right"]["resolved_path"], last_name),
+            ):
+                with Image.open(source) as opened:
+                    opened.convert("RGB").save(COMFY_INPUT / name, format="PNG", compress_level=4)
+
+            output_prefix = f"h3_{RUN_DIRECTORY.name}/{pair['index']:04d}_{pair_slug}"
+            workflow = patch_h3_ui_workflow(
+                H3_TEMPLATE,
+                first_image=first_name,
+                last_image=last_name,
+                prompt=payload["h3_prompt"],
+                width=H3_WIDTH,
+                height=H3_HEIGHT,
+                duration_seconds=H3_DURATION_SECONDS,
+                seed=payload["seed"],
+                output_prefix=output_prefix,
+                diffusion_model=H3_DIFFUSION_MODEL,
+                text_encoder=H3_TEXT_ENCODER,
+                video_vae=H3_VIDEO_VAE,
+                audio_vae=H3_AUDIO_VAE,
+            )
+            workflow_path = RUN_DIRECTORY / "workflows" / f"pair_{pair['index']:04d}.json"
+            workflow_path.write_text(
+                json.dumps(workflow, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            print("\n" + "=" * 110)
+            print(f"LOCAL H3 PAIR {pair['index']:02d}: {pair['left']['uid']} -> {pair['right']['uid']}")
+            print("seed:", payload["seed"])
+            print("prompt:\n" + payload["h3_prompt"])
+            command = [
+                sys.executable, "-m", "comfy_cli", "--workspace", COMFYUI_ROOT,
+                "run", "--workflow", str(workflow_path), "--wait", "--no-notify",
+                "--where", "local", "--host", "127.0.0.1", "--port", str(H3_COMFY_PORT),
+                "--timeout", "900",
+            ]
+            return_code, command_log = stream_command(command)
+            if return_code != 0:
+                server_tail = COMFY_LOG_PATH.read_text(encoding="utf-8", errors="replace")[-12000:]
+                raise RuntimeError(
+                    f"H3 pair {pair['index']} failed with exit code {return_code}.\n"
+                    f"CLI tail:\n{command_log[-8000:]}\nComfyUI tail:\n{server_tail}"
+                )
+            output_directory = COMFY_OUTPUT / f"h3_{RUN_DIRECTORY.name}"
+            candidates = sorted(
+                output_directory.glob(f"{pair['index']:04d}_{pair_slug}*.mp4"),
+                key=lambda path: (path.stat().st_mtime_ns, path.name),
+            )
+            if not candidates:
+                raise RuntimeError(f"ComfyUI completed but no H3 clip matched {output_prefix}")
+            shutil.copy2(candidates[-1], clip_path)
+            if not clip_path.is_file() or clip_path.stat().st_size == 0:
+                raise RuntimeError(f"Persistent H3 clip is empty: {clip_path}")
+            record = {
+                "complete": True,
+                "fingerprint": fingerprint,
+                "clip_path": str(clip_path),
+                "workflow_path": str(workflow_path),
+                "payload": payload,
+                "source_comfy_output": str(candidates[-1]),
+                "native_audio_kept_in_pair_clip": H3_KEEP_NATIVE_AUDIO_IN_PAIR_CLIPS,
+                "reused": False,
+            }
+            manifest_path.write_text(
+                json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            return record
+
+        H3_CLIP_RECORDS = {}
+        if RUN_ONE_PAIR_TEST:
+            test_index = H3_ONE_PAIR_TEST_INDEX % len(H3_PAIRS)
+            H3_CLIP_RECORDS[test_index] = render_h3_pair(H3_PAIRS[test_index])
+            display(Markdown(f"### H3 one-pair gate: pair {test_index:02d}"))
+            from IPython.display import Video
+            display(Video(
+                H3_CLIP_RECORDS[test_index]["clip_path"],
+                embed=False,
+                width=DISPLAY_VIDEO_WIDTH,
+                html_attributes="controls loop muted playsinline",
+            ))
+        if RUN_FULL_H3_SEQUENCE:
+            for pair in H3_PAIRS:
+                H3_CLIP_RECORDS[pair["index"]] = render_h3_pair(pair)
+        if len(H3_CLIP_RECORDS) != len(H3_PAIRS):
+            raise RuntimeError("Full H3 assembly requires one complete clip for every cyclic pair")
+        print(f"All {len(H3_CLIP_RECORDS)} cyclic H3 pair clips are persistent on Drive.")
+        '''
+    ),
+    markdown(
+        "h3-18-assembly-heading",
+        r"""
+        ## 10. Assemble a duplicate-free native H3 loop
+
+        Clips are decoded losslessly to local PNGs. Each clip's first and last images are
+        replaced with exact resized source anchors; the terminal frame is then omitted because
+        it is the opening frame of the next pair. This eliminates duplicated endpoint pauses and
+        makes every join — including the wrap — deterministic. Native H3 audio is stripped from
+        the loop because independent pair soundtracks cannot form a clean continuous cycle.
+        """,
+    ),
+    code(
+        "h3-19-assembly",
+        r'''
+        import imageio_ffmpeg
+        from PIL import ImageOps
+
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        work_root = Path(LOCAL_ASSET_ROOT) / "runs" / RUN_DIRECTORY.name
+        raw_frame_directory = work_root / "h3_native_frames"
+        if raw_frame_directory.exists():
+            shutil.rmtree(raw_frame_directory)
+        raw_frame_directory.mkdir(parents=True)
+
+        native_index = 0
+        clip_frame_counts = []
+        for pair in H3_PAIRS:
+            clip_path = Path(H3_CLIP_RECORDS[pair["index"]]["clip_path"])
+            pair_frames = work_root / f"decoded_pair_{pair['index']:04d}"
+            if pair_frames.exists():
+                shutil.rmtree(pair_frames)
+            pair_frames.mkdir(parents=True)
+            subprocess.check_call([
+                ffmpeg, "-y", "-i", str(clip_path), "-map", "0:v:0", "-vsync", "0",
+                str(pair_frames / "%07d.png"),
+            ])
+            frames = sorted(pair_frames.glob("*.png"), key=lambda path: int(path.stem))
+            if len(frames) < 3:
+                raise RuntimeError(f"H3 clip {clip_path} decoded to only {len(frames)} frames")
+
+            for endpoint_path, destination in (
+                (pair["left"]["resolved_path"], frames[0]),
+                (pair["right"]["resolved_path"], frames[-1]),
+            ):
+                with Image.open(endpoint_path) as opened:
+                    exact = ImageOps.fit(
+                        opened.convert("RGB"), (H3_WIDTH, H3_HEIGHT), method=Image.Resampling.LANCZOS
+                    )
+                    exact.save(destination, format="PNG", compress_level=4)
+            for frame in frames[:-1]:
+                shutil.copy2(frame, raw_frame_directory / f"{native_index:07d}.png")
+                native_index += 1
+            clip_frame_counts.append(len(frames))
+
+        H3_NATIVE_FRAME_PATHS = sorted(raw_frame_directory.glob("*.png"), key=lambda path: int(path.stem))
+        expected_unique = sum(count - 1 for count in clip_frame_counts)
+        if len(H3_NATIVE_FRAME_PATHS) != expected_unique:
+            raise RuntimeError("Native H3 frame assembly count mismatch")
+        H3_NATIVE_VIDEO_PATH = RUN_DIRECTORY / "video" / "minimax_h3_native_cyclic_loop.mp4"
+        subprocess.check_call([
+            ffmpeg, "-y", "-framerate", str(H3_FPS),
+            "-i", str(raw_frame_directory / "%07d.png"),
+            "-an", "-c:v", "libx264", "-preset", "slow", "-crf", str(VIDEO_CRF),
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(H3_NATIVE_VIDEO_PATH),
+        ])
+        assembly_report = {
+            "method": "H3 pair clips -> exact source endpoints -> omit each terminal duplicate -> silent H.264",
+            "cyclic": True,
+            "pair_count": len(H3_PAIRS),
+            "decoded_frames_per_pair": clip_frame_counts,
+            "native_unique_frames": len(H3_NATIVE_FRAME_PATHS),
+            "fps": H3_FPS,
+            "duration_seconds": len(H3_NATIVE_FRAME_PATHS) / H3_FPS,
+            "terminal_duplicate_in_video": False,
+            "generated_pair_audio_in_final_loop": False,
+            "video": str(H3_NATIVE_VIDEO_PATH),
+        }
+        (RUN_DIRECTORY / "metadata" / "native_assembly.json").write_text(
+            json.dumps(assembly_report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        print(assembly_report)
+        display(Markdown("### Native H3 cyclic loop"))
+        display(Video(
+            str(H3_NATIVE_VIDEO_PATH), embed=False, width=DISPLAY_VIDEO_WIDTH,
+            html_attributes="controls loop muted playsinline",
+        ))
+        '''
+    ),
+    markdown(
+        "h3-20-rife-heading",
+        r"""
+        ## 11. Release H3, then optionally run one pinned RIFE x2 pass
+
+        RIFE is applied only after the expensive H3 sequence exists. It doubles temporal density
+        without changing duration and explicitly processes the last-to-first edge. ComfyUI's H3
+        models are unloaded first so the independent RIFE subprocess starts with free VRAM.
+        """,
+    ),
+    code(
+        "h3-21-rife",
+        r'''
+        import gc
+        import zipfile
+        import numpy as np
+
+        def release_local_h3_server():
+            try:
+                request = urllib.request.Request(
+                    H3_SERVER_URL + "/free",
+                    data=json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(request, timeout=30).read()
+            except Exception as error:
+                print("ComfyUI unload warning:", error)
+            process = globals().get("H3_COMFY_PROCESS")
+            if STOP_COMFY_WHEN_FINISHED and process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            print({
+                "torch_allocated_gib": round(torch.cuda.memory_allocated() / 1024**3, 3),
+                "torch_reserved_gib": round(torch.cuda.memory_reserved() / 1024**3, 3),
+            })
+
+        if RUN_RIFE_POSTPROCESS:
+            release_local_h3_server()
+            rife_root = Path(RIFE_ROOT)
+            if not (rife_root / ".git").is_dir():
+                subprocess.check_call([
+                    "git", "clone", "--filter=blob:none", RIFE_REPOSITORY_URL, RIFE_ROOT,
+                ])
+            subprocess.check_call([
+                "git", "-C", RIFE_ROOT, "fetch", "--depth", "1", "origin", RIFE_REPOSITORY_REVISION,
+            ])
+            subprocess.check_call([
+                "git", "-C", RIFE_ROOT, "checkout", "--detach", RIFE_REPOSITORY_REVISION,
+            ])
+            installed_rife_revision = subprocess.check_output(
+                ["git", "-C", RIFE_ROOT, "rev-parse", "HEAD"], text=True
+            ).strip()
+            if installed_rife_revision != RIFE_REPOSITORY_REVISION:
+                raise RuntimeError("Practical-RIFE did not resolve to its pinned revision")
+
+            archive = Path(hf_hub_download(
+                repo_id=RIFE_MODEL_REPOSITORY,
+                filename=RIFE_MODEL_FILENAME,
+                revision=RIFE_MODEL_REVISION,
+                cache_dir=HF_CACHE_DIR,
+            ))
+            model_root = Path(HF_CACHE_DIR) / "flowmorph_rife_models" / archive.stem
+            if not list(model_root.rglob("flownet.pkl")):
+                model_root.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(archive) as handle:
+                    for member in handle.infolist():
+                        destination = (model_root / member.filename).resolve()
+                        if model_root.resolve() not in destination.parents and destination != model_root.resolve():
+                            raise RuntimeError(f"Unsafe path in RIFE archive: {member.filename}")
+                    handle.extractall(model_root)
+            flownet_candidates = list(model_root.rglob("flownet.pkl"))
+            if len(flownet_candidates) != 1:
+                raise RuntimeError(f"Expected one RIFE flownet.pkl, found {flownet_candidates}")
+            RIFE_MODEL_DIRECTORY = flownet_candidates[0].parent
+
+            rife_work = work_root / "rife_x2"
+            if rife_work.exists():
+                shutil.rmtree(rife_work)
+            rife_input = rife_work / "closed_input"
+            rife_dense = rife_work / "dense"
+            rife_input.mkdir(parents=True)
+            for index, source in enumerate(H3_NATIVE_FRAME_PATHS):
+                shutil.copy2(source, rife_input / f"{index:07d}.png")
+            shutil.copy2(H3_NATIVE_FRAME_PATHS[0], rife_input / f"{len(H3_NATIVE_FRAME_PATHS):07d}.png")
+
+            runner = Path(PROJECT_ROOT) / "scripts" / "rife_pair_sequence_runner.py"
+            command = [
+                sys.executable, "-u", str(runner), "--repo", RIFE_ROOT,
+                "--model", str(RIFE_MODEL_DIRECTORY), "--input", str(rife_input),
+                "--output", str(rife_dense), "--multi", str(RIFE_MULTIPLIER),
+                "--scale", str(RIFE_SCALE), "--batch-size", str(RIFE_BATCH_SIZE),
+            ]
+            if RIFE_USE_FP16:
+                command.append("--fp16")
+            return_code, rife_log = stream_command(command)
+            if return_code != 0 and "--fp16" in command and RIFE_RETRY_WITH_FP32:
+                print("RIFE fp16 failed; retrying once in fp32.")
+                if rife_dense.exists():
+                    shutil.rmtree(rife_dense)
+                retry = [item for item in command if item != "--fp16"]
+                return_code, rife_log = stream_command(retry)
+            if return_code != 0:
+                raise RuntimeError("RIFE failed:\n" + rife_log[-10000:])
+
+            dense_with_duplicate = sorted(rife_dense.glob("*.png"), key=lambda path: int(path.stem))
+            expected_dense = len(H3_NATIVE_FRAME_PATHS) * RIFE_MULTIPLIER + 1
+            if len(dense_with_duplicate) != expected_dense:
+                raise RuntimeError(
+                    f"RIFE wrote {len(dense_with_duplicate)} frames; expected {expected_dense}"
+                )
+            with Image.open(dense_with_duplicate[0]) as opened:
+                first_array = np.asarray(opened.convert("RGB"))
+            with Image.open(dense_with_duplicate[-1]) as opened:
+                last_array = np.asarray(opened.convert("RGB"))
+            if not np.array_equal(first_array, last_array):
+                raise RuntimeError("RIFE terminal image is not pixel-identical to the opening image")
+            RIFE_DENSE_PATHS = dense_with_duplicate[:-1]
+            RIFE_FINAL_FPS = H3_FPS * RIFE_MULTIPLIER
+            RIFE_FINAL_VIDEO_PATH = RUN_DIRECTORY / "video" / "minimax_h3_rife_x2_cyclic_loop.mp4"
+            subprocess.check_call([
+                ffmpeg, "-y", "-framerate", str(RIFE_FINAL_FPS),
+                "-i", str(rife_dense / "%07d.png"),
+                "-frames:v", str(len(RIFE_DENSE_PATHS)),
+                "-an", "-c:v", "libx264", "-preset", "slow", "-crf", str(VIDEO_CRF),
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(RIFE_FINAL_VIDEO_PATH),
+            ])
+            rife_report = {
+                "method": "duplicate-free native H3 frames -> explicitly closed Practical-RIFE x2 -> H.264",
+                "rife_repository_revision": RIFE_REPOSITORY_REVISION,
+                "rife_model_revision": RIFE_MODEL_REVISION,
+                "multiplier": RIFE_MULTIPLIER,
+                "input_unique_frames": len(H3_NATIVE_FRAME_PATHS),
+                "output_unique_frames": len(RIFE_DENSE_PATHS),
+                "fps": RIFE_FINAL_FPS,
+                "duration_seconds": len(RIFE_DENSE_PATHS) / RIFE_FINAL_FPS,
+                "terminal_duplicate_in_video": False,
+                "video": str(RIFE_FINAL_VIDEO_PATH),
+            }
+            (RUN_DIRECTORY / "metadata" / "rife_report.json").write_text(
+                json.dumps(rife_report, indent=2) + "\n", encoding="utf-8"
+            )
+            display(Markdown("### H3 + RIFE x2 cyclic loop"))
+            display(Video(
+                str(RIFE_FINAL_VIDEO_PATH), embed=False, width=DISPLAY_VIDEO_WIDTH,
+                html_attributes="controls loop muted playsinline",
+            ))
+            print(rife_report)
+        else:
+            RIFE_FINAL_VIDEO_PATH = None
+            print("RIFE disabled; the native 24 fps H3 loop remains the final output.")
+        '''
+    ),
+    markdown(
+        "h3-22-audit-heading",
+        r"""
+        ## 12. Persist the final audit and optionally release the Colab runtime
+
+        Runtime unassignment is explicit and off by default. The source FLUX run is never
+        modified. Local decoded PNGs may be removed only after both persistent videos and all
+        pair manifests are complete.
+        """,
+    ),
+    code(
+        "h3-23-audit",
+        r'''
+        if not RUN_RIFE_POSTPROCESS and STOP_COMFY_WHEN_FINISHED:
+            release_local_h3_server()
+        final_video = RIFE_FINAL_VIDEO_PATH if RUN_RIFE_POSTPROCESS else H3_NATIVE_VIDEO_PATH
+        if final_video is None or not Path(final_video).is_file() or Path(final_video).stat().st_size == 0:
+            raise RuntimeError("Final H3 video is missing or empty")
+        final_audit = {
+            "complete": True,
+            "source_run": str(SOURCE_RUN),
+            "run_directory": str(RUN_DIRECTORY),
+            "anchor_count": len(BASE_RECORDS),
+            "cyclic_pair_count": len(H3_PAIRS),
+            "all_pair_clips_complete": len(H3_CLIP_RECORDS) == len(H3_PAIRS),
+            "prompt_mode": H3_PROMPT_MODE,
+            "prompts_printed_in_notebook": True,
+            "openai_used_only_for_prompt_planning": H3_PROMPT_MODE == "openai_per_pair",
+            "h3_inference": "local_open_weights",
+            "h3_api_used": False,
+            "native_video": str(H3_NATIVE_VIDEO_PATH),
+            "rife_video": str(RIFE_FINAL_VIDEO_PATH) if RIFE_FINAL_VIDEO_PATH is not None else None,
+            "final_video": str(final_video),
+            "source_run_modified": False,
+        }
+        (RUN_DIRECTORY / "metadata" / "final_audit.json").write_text(
+            json.dumps(final_audit, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(final_audit, indent=2))
+        print("Final video:", final_video)
+
+        if not KEEP_LOCAL_WORK_FRAMES and work_root.is_dir():
+            expected_parent = (Path(LOCAL_ASSET_ROOT) / "runs").resolve()
+            if work_root.resolve().parent != expected_parent:
+                raise RuntimeError(f"Refusing to remove unexpected work directory: {work_root}")
+            shutil.rmtree(work_root)
+            print("Removed generated local PNG work frames after persistent export.")
+
+        if UNASSIGN_RUNTIME_WHEN_FINISHED:
+            from google.colab import runtime
+            runtime.unassign()
+        else:
+            print("Runtime left assigned. Set UNASSIGN_RUNTIME_WHEN_FINISHED=True to release it here.")
+        '''
+    ),
+]
+
+
+notebook = {
+    "cells": cells,
+    "metadata": {
+        "accelerator": "GPU",
+        "colab": {"gpuType": "A100", "provenance": []},
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "version": "3"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
+
+
+def main() -> None:
+    if OUTPUT.exists():
+        raise FileExistsError(f"Refusing to overwrite existing notebook: {OUTPUT}")
+    OUTPUT.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(OUTPUT)
+
+
+if __name__ == "__main__":
+    main()
