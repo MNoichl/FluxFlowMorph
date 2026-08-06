@@ -1453,7 +1453,41 @@ cells = [
         FLASHVSR_FINAL_VIDEO_PATH = None
         FLASHVSR_REPORT = None
         if RUN_FLASHVSR_UPSCALE:
-            release_local_h3_server(force_stop=True)
+            import gc
+            import hashlib
+            import imageio_ffmpeg
+
+            def flashvsr_sha256_file(path):
+                digest = hashlib.sha256()
+                with Path(path).open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                return digest.hexdigest()
+
+            def flashvsr_fingerprint(payload):
+                canonical = json.dumps(
+                    payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8")
+                return hashlib.sha256(canonical).hexdigest()
+
+            def flashvsr_stream_command(command):
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                output_lines = []
+                assert process.stdout is not None
+                for line in process.stdout:
+                    output_lines.append(line)
+                    print(line, end="", flush=True)
+                return process.wait(), "".join(output_lines)
+
+            release_h3 = globals().get("release_local_h3_server")
+            if callable(release_h3):
+                release_h3(force_stop=True)
             gc.collect()
             torch.cuda.empty_cache()
             try:
@@ -1490,21 +1524,71 @@ cells = [
                     "remaining GPU owner; release it or restart the runtime before FlashVSR."
                 )
 
-            if BORDER_STABILIZED_PATHS:
-                flashvsr_input_paths = list(BORDER_STABILIZED_PATHS)
+            work_root = Path(LOCAL_ASSET_ROOT) / "runs" / RUN_DIRECTORY.name
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            border_paths = globals().get("BORDER_STABILIZED_PATHS")
+            rife_paths = globals().get("RIFE_DENSE_PATHS")
+            native_paths = globals().get("H3_NATIVE_FRAME_PATHS")
+            if border_paths:
+                flashvsr_input_paths = list(border_paths)
                 flashvsr_input_fps = border_fps
                 flashvsr_input_video = BORDER_FINAL_VIDEO_PATH
                 flashvsr_input_stage = "border_stabilized"
-            elif RUN_RIFE_POSTPROCESS:
-                flashvsr_input_paths = list(RIFE_DENSE_PATHS)
+            elif rife_paths:
+                flashvsr_input_paths = list(rife_paths)
                 flashvsr_input_fps = RIFE_FINAL_FPS
                 flashvsr_input_video = RIFE_FINAL_VIDEO_PATH
                 flashvsr_input_stage = "rife_x2"
-            else:
-                flashvsr_input_paths = list(H3_NATIVE_FRAME_PATHS)
+            elif native_paths:
+                flashvsr_input_paths = list(native_paths)
                 flashvsr_input_fps = H3_FPS
                 flashvsr_input_video = H3_NATIVE_VIDEO_PATH
                 flashvsr_input_stage = "native_h3"
+            else:
+                persistent_candidates = (
+                    (
+                        "border_stabilized",
+                        RUN_DIRECTORY / "video" / "minimax_h3_border_stabilized_cyclic_loop.mp4",
+                        RUN_DIRECTORY / "metadata" / "border_stabilization.json",
+                        "frame_count",
+                    ),
+                    (
+                        "rife_x2",
+                        RUN_DIRECTORY / "video" / "minimax_h3_rife_x2_cyclic_loop.mp4",
+                        RUN_DIRECTORY / "metadata" / "rife_report.json",
+                        "output_unique_frames",
+                    ),
+                    (
+                        "native_h3",
+                        RUN_DIRECTORY / "video" / "minimax_h3_native_cyclic_loop.mp4",
+                        RUN_DIRECTORY / "metadata" / "native_assembly.json",
+                        "native_unique_frames",
+                    ),
+                )
+                for stage, video_path, metadata_path, count_key in persistent_candidates:
+                    if not video_path.is_file() or not metadata_path.is_file():
+                        continue
+                    try:
+                        source_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                        recovered_count = int(source_metadata[count_key])
+                        recovered_fps = float(source_metadata["fps"])
+                    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                        continue
+                    if recovered_count > 0 and recovered_fps > 0:
+                        flashvsr_input_paths = [
+                            work_root / "source_frames_not_loaded" / f"{index:07d}.png"
+                            for index in range(recovered_count)
+                        ]
+                        flashvsr_input_fps = recovered_fps
+                        flashvsr_input_video = video_path
+                        flashvsr_input_stage = stage
+                        print(f"Recovered persistent FlashVSR source metadata from {metadata_path.name}")
+                        break
+                else:
+                    raise RuntimeError(
+                        "No in-memory finishing frames or completed persistent H3 video/report "
+                        "were found in RUN_DIRECTORY."
+                    )
             if not flashvsr_input_paths:
                 raise RuntimeError("FlashVSR input frame sequence is empty")
             if flashvsr_input_video is None or not Path(flashvsr_input_video).is_file():
@@ -1515,7 +1599,7 @@ cells = [
 
             flashvsr_payload = {
                 "source_stage": flashvsr_input_stage,
-                "source_video_sha256": sha256_file(flashvsr_input_video),
+                "source_video_sha256": flashvsr_sha256_file(flashvsr_input_video),
                 "source_frame_count": len(flashvsr_input_paths),
                 "fps": flashvsr_input_fps,
                 "scale": FLASHVSR_SCALE,
@@ -1528,11 +1612,11 @@ cells = [
                 "repository_revision": FLASHVSR_REPOSITORY_REVISION,
                 "model_revision": FLASHVSR_MODEL_REVISION,
                 "sparse_repository_revision": FLASHVSR_SPARSE_REPOSITORY_REVISION,
-                "runner_sha256": sha256_file(
+                "runner_sha256": flashvsr_sha256_file(
                     Path(PROJECT_ROOT) / "scripts" / "flashvsr_v11_streaming_runner.py"
                 ),
             }
-            flashvsr_fingerprint = stable_h3_fingerprint(flashvsr_payload)
+            flashvsr_fingerprint_value = flashvsr_fingerprint(flashvsr_payload)
             FLASHVSR_FINAL_VIDEO_PATH = (
                 RUN_DIRECTORY / "video" / "minimax_h3_flashvsr_v1_1_x4_cyclic_loop.mp4"
             )
@@ -1550,7 +1634,7 @@ cells = [
                     prior_flashvsr = {}
                 reuse_flashvsr = (
                     prior_flashvsr.get("complete") is True
-                    and prior_flashvsr.get("fingerprint") == flashvsr_fingerprint
+                    and prior_flashvsr.get("fingerprint") == flashvsr_fingerprint_value
                     and prior_flashvsr.get("output_unique_frames") == len(flashvsr_input_paths)
                 )
 
@@ -1787,14 +1871,14 @@ cells = [
                 ]
                 if not FLASHVSR_COLOR_FIX:
                     command.append("--no-color-fix")
-                return_code, flashvsr_log = stream_command(command)
+                return_code, flashvsr_log = flashvsr_stream_command(command)
                 if return_code != 0:
                     raise RuntimeError("FlashVSR failed:\n" + flashvsr_log[-12000:])
                 FLASHVSR_REPORT = json.loads(flashvsr_report_path.read_text(encoding="utf-8"))
                 if FLASHVSR_REPORT.get("output_unique_frames") != len(flashvsr_input_paths):
                     raise RuntimeError("FlashVSR changed the frame count")
                 FLASHVSR_REPORT.update({
-                    "fingerprint": flashvsr_fingerprint,
+                    "fingerprint": flashvsr_fingerprint_value,
                     "input_stage": flashvsr_input_stage,
                     "source_video": str(flashvsr_input_video),
                     "flashvsr_repository_revision": FLASHVSR_REPOSITORY_REVISION,
