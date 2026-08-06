@@ -1766,7 +1766,31 @@ cells = [
                     venv_command = [sys.executable, "-m", "venv"]
                     if not use_official_torch:
                         venv_command.append("--system-site-packages")
-                    subprocess.check_call([*venv_command, str(venv_root)])
+                    venv_result = subprocess.run(
+                        [*venv_command, str(venv_root)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    if venv_result.returncode != 0:
+                        print(
+                            "stdlib venv creation failed; falling back to virtualenv:\n"
+                            + venv_result.stdout
+                        )
+                        if venv_root.exists():
+                            if venv_root.resolve().parent != Path("/content"):
+                                raise RuntimeError(
+                                    f"Refusing to replace unexpected partial venv: {venv_root}"
+                                )
+                            shutil.rmtree(venv_root)
+                        subprocess.check_call([
+                            sys.executable, "-m", "pip", "install", "-q",
+                            "virtualenv>=20.26,<21",
+                        ])
+                        virtualenv_command = [sys.executable, "-m", "virtualenv"]
+                        if not use_official_torch:
+                            virtualenv_command.append("--system-site-packages")
+                        subprocess.check_call([*virtualenv_command, str(venv_root)])
                     subprocess.check_call([
                         str(venv_python), "-m", "pip", "install", "-q", "--upgrade",
                         "pip", "setuptools", "wheel", "packaging", "ninja",
