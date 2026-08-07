@@ -102,7 +102,7 @@ cells = [
         H3_FPS = 24
         H3_JOB_TIMEOUT_SECONDS = 1800
         H3_ENFORCE_SOURCE_ASPECT = True
-        H3_WORKFLOW_PATCH_VERSION = 7
+        H3_WORKFLOW_PATCH_VERSION = 8
         # The released Qwen3-VL encoder advertises 262,144 positions. Keep generated six-second
         # prompts far below that and reserve ample space for both image-conditioning blocks.
         H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144
@@ -130,7 +130,7 @@ cells = [
 
         # Image-aware OpenAI prompt writer. This text is intentionally editable and printed by
         # the prompt cell. It follows MiniMax's official FL2VA guide and h3-prompt-writing skill.
-        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v3"
+        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v4"
         H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r"""
         You write a structured motion plan for MiniMax H3-Base-FL2VA using two endpoint images.
         Inspect Picture 1, Picture 2, and both authored image prompts. The images are the visual
@@ -172,7 +172,7 @@ cells = [
           characters, actions, typography, dialogue, sound, production commentary, or unreferenced
           objects. Do not name or propose cinematic transition effects.
         - RIJKSOIL is an upstream FLUX LoRA trigger and must never appear in the H3 plan.
-        - Aim for 1,600-2,200 characters and never exceed 2,400 characters, including [Shot 1].
+        - Aim for 1,400-1,800 characters and never exceed 2,400 characters, including [Shot 1].
           Finish every thought and end with a complete sentence; never stop at a character or
           token boundary. The object-correspondence fields are separate and do not count toward
           this description's character range.
@@ -723,7 +723,6 @@ cells = [
             )
             integrated_multimodal_description: str = Field(
                 min_length=OPENAI_H3_DESCRIPTION_MIN_CHARS,
-                max_length=OPENAI_H3_DESCRIPTION_MAX_CHARS,
             )
 
         def validate_openai_motion_proposal(proposal):
@@ -831,10 +830,12 @@ cells = [
                         attempt_content.append({
                             "type": "input_text",
                             "text": (
-                                "The previous draft was rejected. Return a complete, compact JSON "
-                                "proposal now: 4-10 grouped correspondences, an integrated "
-                                "description aiming for 1,600-2,200 characters and never exceeding "
-                                "2,400, and a fully punctuated final sentence."
+                                f"The previous draft was rejected for this exact reason: {last_error}. "
+                                "Return a corrected, complete, compact JSON proposal now: 4-10 "
+                                "grouped correspondences, an integrated description aiming for "
+                                "1,400-1,800 characters and never exceeding 2,400, and a fully "
+                                "punctuated final sentence. Finish naturally well before the hard "
+                                "ceiling; do not stop at a character boundary."
                             ),
                         })
                     response = OPENAI_CLIENT.responses.parse(
@@ -870,6 +871,13 @@ cells = [
                     proposal = response.output_parsed
                     if proposal is None:
                         raise RuntimeError("OpenAI returned no parsed motion proposal")
+                    description = proposal.integrated_multimodal_description.strip()
+                    print({
+                        "openai_pair": pair["index"],
+                        "attempt": attempt,
+                        "description_characters": len(description),
+                        "description_tail": description[-180:],
+                    })
                     validate_openai_motion_proposal(proposal)
                     return proposal, response.id
                 except Exception as error:
@@ -891,7 +899,7 @@ cells = [
                 "prompt_guide_version": H3_OPENAI_PROMPT_GUIDE_VERSION,
                 "prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
                 "disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS,
-                "structured_output_schema": "compact_correspondences+complete_description-v3",
+                "structured_output_schema": "compact-correspondences+app-validated-description-v4",
                 "openai_max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
                 "openai_reasoning_effort": OPENAI_REASONING_EFFORT,
                 "description_min_chars": OPENAI_H3_DESCRIPTION_MIN_CHARS,
