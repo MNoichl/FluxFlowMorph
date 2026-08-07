@@ -255,28 +255,32 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
         motion_directive="RIJKSOIL, " + DEFAULT_H3_MOTION_DIRECTIVE,
         trigger="RIJKSOIL",
     )
-    assert DEFAULT_H3_MOTION_DIRECTIVE.startswith("The objects")
+    assert DEFAULT_H3_MOTION_DIRECTIVE.startswith("A static locked-off view")
     assert "RIJKSOIL" not in prompt
     assert "<Picture 1>" in prompt and "<Picture 2>" in prompt
-    assert "no camera movement" in prompt.lower()
-    assert "No objects may enter" in prompt
-    assert "title cards" in prompt
-    assert "no dissolving into particles" in prompt
-    assert "do not invent intermediate" in prompt
-    assert "overall_soundscape: Silence" in prompt
+    assert "Picture 1 (from Shot 1) aligns with the 0.00-second mark" in prompt
+    assert "Picture 2 (from Shot 1) aligns with the 6.00-second mark" in prompt
+    assert "Static Shot with unchanged framing, lens, and viewpoint" in prompt
+    assert "opaque, solid, continuous, and sharply resolved" in prompt
+    assert "progressively narrow" in prompt
+    assert "overall_soundscape: N/A" in prompt
     assert strip_h3_source_only_tokens("RIJKSOIL, a sparse scene") == "a sparse scene"
 
     openai_prompt = wrap_openai_h3_motion(
-        "RIJKSOIL, the sparse sphere at #Image1 slowly changes its silhouette and surface into the faceted "
-        "vessel at #Image2 while every object follows the shortest stable path through the shot.",
+        "integrated_multimodal_description: [Shot 1] RIJKSOIL, the sparse sphere in Picture 1 "
+        "changes through small local silhouette and surface adjustments into the faceted vessel "
+        "in Picture 2 while the background and tabletop remain registered and every visible form "
+        "follows its shortest coherent path through the static shot.",
         duration_seconds=6.0,
         trigger="RIJKSOIL",
     )
     assert "RIJKSOIL" not in openai_prompt
-    assert "<Picture 1>" in openai_prompt and "<Picture 2>" in openai_prompt
-    assert "newly invented objects" in openai_prompt
-    assert "no crumbling" in openai_prompt
-    assert "no invented intermediate" in openai_prompt
+    assert openai_prompt.count("integrated_multimodal_description:") == 1
+    assert openai_prompt.count("[Shot 1]") == 1
+    assert "Picture 1" in openai_prompt and "Picture 2" in openai_prompt
+    assert "small local silhouette and surface adjustments" in openai_prompt
+    assert "Static Shot with unchanged framing, lens, and viewpoint" in openai_prompt
+    assert "overall_soundscape: N/A" in openai_prompt
 
 
 def test_official_ui_workflow_is_patched_with_two_images_and_direct_dimensions() -> None:

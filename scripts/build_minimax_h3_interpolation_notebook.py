@@ -45,11 +45,10 @@ cells = [
         last-to-first closure) with the open MiniMax H3 FL2VA weights on the Colab GPU, and
         writes a new resumable run beneath `minimax_h3_interpolations` on Drive.
 
-        The default uses the supplied locked-camera morph instruction. An optional
-        `openai_per_pair` mode sends both endpoint images and both saved endpoint prompts to
-        the Responses API, caches one structured motion plan per pair, and prints the exact H3
-        prompt before local rendering. OpenAI is used only for prompt writing; H3 inference is
-        always self-hosted in this runtime.
+        The default `openai_per_pair` mode sends both endpoint images and both saved prompts to
+        the Responses API, caches one structured positive-correspondence plan per pair, and prints
+        the editable writer instructions, correspondence map, and exact H3 prompt before local
+        rendering. H3 inference itself is always local.
         """,
     ),
     markdown(
@@ -103,7 +102,7 @@ cells = [
         H3_FPS = 24
         H3_JOB_TIMEOUT_SECONDS = 1800
         H3_ENFORCE_SOURCE_ASPECT = True
-        H3_WORKFLOW_PATCH_VERSION = 3
+        H3_WORKFLOW_PATCH_VERSION = 4
         H3_BASE_SEED = None  # OS entropy on a new run; persisted on Drive.
         H3_REUSE_EXISTING_CLIPS = True
         RUN_ONE_PAIR_TEST = True
@@ -111,23 +110,78 @@ cells = [
         RUN_FULL_H3_SEQUENCE = True
         H3_KEEP_NATIVE_AUDIO_IN_PAIR_CLIPS = True  # Final loop is silent for clean joins.
 
-        # Exact supplied starting instruction. The wrapper converts #Image1/#Image2 to
-        # the <Picture 1>/<Picture 2> syntax used by the official local H3 prompting guide.
+        # Positive correspondence language avoids priming H3 with a named transition effect.
         H3_BASE_MOTION_PROMPT = (
-            "The objects in #Image1 morphing into #Image2 . No camera movement, no panning, "
-            "no exchange, no cuts. Only objects changing shape, form texture and color. "
-            "No alpha blending. Objects moving as little as possible."
-            " No object dissolves into particles, dust, droplets, fragments, smoke, or swarms."
-            " Objects remain coherent solid surfaces and introduce no new intermediate textures."
+            "A static locked-off view begins exactly at #Image1. Every visible object remains "
+            "opaque, solid, and sharply resolved while its existing boundary continuously "
+            "deforms along the shortest path into the corresponding object at the same screen "
+            "position in #Image2. Shape, material, texture, and color change through small "
+            "coherent updates until the view settles exactly at #Image2."
         )
-        H3_PROMPT_MODE = "template"  # "template" or "openai_per_pair"
+        H3_PROMPT_MODE = "openai_per_pair"  # Or "template" for no prompt-planning API call.
         H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE = False
 
-        # Optional image-aware OpenAI prompt writer. H3 itself never uses an API.
+        # Image-aware OpenAI prompt writer. This text is intentionally editable and printed by
+        # the prompt cell. It follows MiniMax's official FL2VA guide and h3-prompt-writing skill.
+        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v1"
+        H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r"""
+        You write a structured motion plan for MiniMax H3-Base-FL2VA using two endpoint images.
+        Inspect Picture 1, Picture 2, and both authored image prompts. The images are the visual
+        ground truth; the authored prompts clarify intended subject matter but cannot override
+        visible composition.
+
+        Follow MiniMax's official FL2VA method:
+        - Plan exactly one [Shot 1]. It is a Static Shot with unchanged framing, lens, viewpoint,
+          crop, background plane, tabletop horizon, and illumination direction.
+        - Use this chronology: first-frame state -> observable intermediate changes -> progressively
+          narrowing differences -> exact last-frame state.
+        - Do not merely describe two static images. Explain the visible path connecting them.
+
+        Build positive object correspondence before writing the motion description:
+        - Account for every major visible form in Picture 1 and Picture 2, including the background,
+          support surface, large objects, and compositionally important small objects.
+        - Match forms primarily by screen region, silhouette, scale, visual role, material, and
+          color. Semantic names are secondary. Keep motion local and choose the shortest coherent
+          path compatible with both endpoints.
+        - For each mapping, state the source form and location, target form and location, and the
+          continuous geometric/material changes connecting them. If counts differ, describe opaque
+          neighboring forms joining through a continuous neck or one solid form separating through
+          a growing indentation; retain continuous surfaces throughout.
+        - Keep the quantity of visible material, negative-space layout, and object density on a
+          gradual endpoint-to-endpoint path. A sparse pair remains sparse.
+
+        Write integrated_multimodal_description as production-ready natural English:
+        - Begin with [Shot 1], the observed visual style, and the exact Picture 1 composition.
+        - Describe early, middle, and late observable states. Every sentence must concern visible
+          composition, boundary motion, material, texture, color, lighting, or spatial relation.
+        - Existing boundaries advance through small local increments. Forms remain opaque, solid,
+          spatially attached, sharply resolved, and continuously identifiable with their mapping.
+        - Surface detail develops only toward detail actually visible in Picture 2.
+        - End by settling into the exact silhouettes, positions, spacing, lighting, and composition
+          of Picture 2.
+        - Use the literal labels Picture 1 and Picture 2. Do not add shots, cuts, camera motion,
+          characters, actions, typography, dialogue, sound, production commentary, or unreferenced
+          objects. Do not name or propose cinematic transition effects.
+        - RIJKSOIL is an upstream FLUX LoRA trigger and must never appear in the H3 plan.
+
+        Return only the requested structured fields. Do not include the FL2VA alignment header,
+        field labels, overall_soundscape, or non_diegetic_music; fixed code adds those exactly.
+        """.strip()
+        H3_DISALLOWED_GENERATED_TRANSITION_TERMS = (
+            "dissolv",
+            "crossfade",
+            "wipe",
+            "particle cloud",
+            "powder cloud",
+            "smoke cloud",
+            "slideshow",
+        )
+
+        # OpenAI is used only to plan prompts; H3 itself remains local and open-weight.
         OPENAI_KEY_FILENAME = "openaiapikey.txt"
         OPENAI_MODEL = "gpt-5.6"
         OPENAI_REASONING_EFFORT = "medium"
-        OPENAI_IMAGE_DETAIL = "high"
+        OPENAI_IMAGE_DETAIL = "original"
         OPENAI_MAX_OUTPUT_TOKENS = 3000
         OPENAI_MAX_ATTEMPTS = 3
         VISION_IMAGE_MAX_SIDE = 1024
@@ -205,8 +259,15 @@ cells = [
         all H3 pairs render, allowing its smart model cache/offload to avoid cold-starting every
         pair. Only after H3 completes is that memory released for RIFE.
 
+        The OpenAI writer follows the base guide's FL2VA three-field format, single-shot bias,
+        and `first state → observable changes → narrowing differences → last state` sequence.
+        The Ref2VA guide is used only for its useful label-consistency and explicit visual-state
+        discipline; its six-section output format is intentionally not sent to the FL2VA model.
+
         Primary references: [MiniMax H3 model card](https://huggingface.co/MiniMaxAI/MiniMax-H3),
-        [official H3 prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md),
+        [official base/FL2VA prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md),
+        [official Ref2VA prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md),
+        [official H3 prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing),
         [Comfy-Org H3 weights](https://huggingface.co/Comfy-Org/MiniMax-H3), and
         [official ComfyUI H3 workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_i2v.json).
         """,
@@ -482,6 +543,8 @@ cells = [
 
         OPENAI_CLIENT = None
         OPENAI_KEY_PATH = None
+        if H3_PROMPT_MODE not in {"template", "openai_per_pair"}:
+            raise ValueError("H3_PROMPT_MODE must be 'template' or 'openai_per_pair'")
         if H3_PROMPT_MODE == "openai_per_pair":
             from openai import OpenAI
             OPENAI_KEY_PATH = drive_base / OPENAI_KEY_FILENAME
@@ -494,9 +557,6 @@ cells = [
                 raise ValueError("OpenAI key file is empty or malformed")
             OPENAI_CLIENT = OpenAI(api_key=api_key)
             del api_key
-        elif H3_PROMPT_MODE != "template":
-            raise ValueError("H3_PROMPT_MODE must be 'template' or 'openai_per_pair'")
-
         run_identity = {
             "project": H3_PROJECT_NAME,
             "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -595,13 +655,14 @@ cells = [
         r"""
         ## 6. Build, cache, and print one H3 prompt per pair
 
-        In `template` mode the exact supplied instruction is wrapped in MiniMax's local FL2VA
-        picture/timestamp syntax. The FLUX-only `RIJKSOIL` LoRA token is never sent to H3.
-        In `openai_per_pair` mode,
-        GPT sees both actual paintings and both immutable authored prompts, then returns only a
-        concise visual motion plan. Fixed code adds timing, locked-camera, silence,
-        endpoint, and no-new-object constraints afterward. Cached plans are fingerprinted by
-        the images, endpoint prompts, settings, and model.
+        In the default `openai_per_pair` mode, GPT sees both actual endpoint images and both
+        immutable saved prompts, then writes an explicit screen-position correspondence map and
+        chronological motion path. The editable `H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS` in the
+        settings cell follows MiniMax's official FL2VA sequence: first-frame state, observable
+        intermediate changes, progressively narrowing differences, and exact last-frame state.
+        Fixed code adds the official alignment header and three-field H3 format. The writer
+        instructions, every correspondence map, and every final transition prompt are printed.
+        The FLUX-only `RIJKSOIL` LoRA token is never sent to H3.
         """,
     ),
     code(
@@ -612,32 +673,54 @@ cells = [
         import io
         from pydantic import BaseModel, Field
 
+        class H3ObjectCorrespondence(BaseModel):
+            source_form_and_region: str = Field(min_length=15, max_length=500)
+            target_form_and_region: str = Field(min_length=15, max_length=500)
+            continuous_path: str = Field(min_length=25, max_length=800)
+
         class H3MotionProposal(BaseModel):
-            visual_correspondence: str = Field(min_length=40, max_length=1200)
-            motion_description: str = Field(min_length=80, max_length=1800)
+            object_correspondences: list[H3ObjectCorrespondence] = Field(
+                min_length=2, max_length=24
+            )
+            integrated_multimodal_description: str = Field(min_length=180, max_length=3000)
 
-        H3_OAI_SYSTEM_PROMPT = """
-        You are writing one visual motion description for the open MiniMax H3 first/last-frame
-        video model. Inspect both attached endpoint paintings and both authored FLUX prompts.
-        The output will be wrapped in fixed production constraints by code.
-
-        Requirements for motion_description:
-        - Describe one continuous, locked-off shot from <Picture 1> to <Picture 2>.
-        - Map the major visible forms by screen position, silhouette, scale, material, and color.
-        - Make each mapped form transform continuously along the shortest plausible path.
-        - Preserve the observed object density and negative space. Never invent an object absent
-          from both pictures; sparse scenes must remain sparse.
-        - Every object remains a coherent continuous surface. Never dissolve or break an object
-          into particles, dust, grains, droplets, smoke, sparks, fragments, shards, bubbles, or
-          swarms. No crumbling, shattering, shedding, scattering, or explosive breakup.
-        - Surface detail may change only toward detail visibly present in Picture 2. Do not invent
-          intermediate patterns, grain, glitter, cracks, fur, scales, ornament, or material texture.
-        - No camera movement, cuts, pans, zooms, dissolves, alpha blends, object swaps, captions,
-          production commentary, dialogue, or sound.
-        - Mention <Picture 1> and <Picture 2> literally.
-        - RIJKSOIL is an upstream FLUX LoRA token. Never include it in the H3 description.
-        - Return only the structured fields.
-        """.strip()
+        def validate_openai_motion_proposal(proposal):
+            description = proposal.integrated_multimodal_description.strip()
+            required = ("[Shot 1]", "Picture 1", "Picture 2", "Static Shot")
+            missing = [item for item in required if item.lower() not in description.lower()]
+            if missing:
+                raise ValueError(f"OpenAI H3 description is missing required FL2VA anchors: {missing}")
+            if not description.lower().startswith("[shot 1]") or description.lower().count("[shot 1]") != 1:
+                raise ValueError("OpenAI H3 description must contain exactly one opening [Shot 1]")
+            forbidden_structure = (
+                "[Shot 2]",
+                "integrated_multimodal_description:",
+                "overall_soundscape:",
+                "non_diegetic_music:",
+            )
+            leaked_structure = [
+                item for item in forbidden_structure if item.lower() in description.lower()
+            ]
+            if leaked_structure:
+                raise ValueError(f"OpenAI H3 description leaked fixed prompt structure: {leaked_structure}")
+            proposal_text = " ".join(
+                [description]
+                + [
+                    " ".join((item.source_form_and_region, item.target_form_and_region, item.continuous_path))
+                    for item in proposal.object_correspondences
+                ]
+            )
+            if "RIJKSOIL" in proposal_text.upper():
+                raise ValueError("OpenAI H3 proposal leaked the upstream FLUX LoRA token")
+            named_effects = [
+                term
+                for term in H3_DISALLOWED_GENERATED_TRANSITION_TERMS
+                if term.lower() in description.lower()
+            ]
+            if named_effects:
+                raise ValueError(
+                    f"OpenAI H3 description named disallowed transition effects: {named_effects}"
+                )
 
         def sha256_file(path):
             digest = hashlib.sha256()
@@ -655,11 +738,42 @@ cells = [
             return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
         def openai_motion_for_pair(pair):
-            user_text = (
-                f"Picture 1 authored prompt:\n{strip_h3_source_only_tokens(pair['left']['authored_prompt'])}\n\n"
-                f"Picture 2 authored prompt:\n{strip_h3_source_only_tokens(pair['right']['authored_prompt'])}\n\n"
-                f"Requested duration: {H3_DURATION_SECONDS:.2f} seconds."
-            )
+            user_content = [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Create the positive object-correspondence plan and one production-ready "
+                        "FL2VA integrated multimodal description for this pair. "
+                        f"The target duration is exactly {H3_DURATION_SECONDS:.2f} seconds."
+                    ),
+                },
+                {"type": "input_text", "text": "Picture 1 — exact first frame:"},
+                {
+                    "type": "input_image",
+                    "image_url": image_data_url(pair["left"]["resolved_path"]),
+                    "detail": OPENAI_IMAGE_DETAIL,
+                },
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Picture 1 authored image prompt (semantic context only):\n"
+                        + strip_h3_source_only_tokens(pair["left"]["authored_prompt"])
+                    ),
+                },
+                {"type": "input_text", "text": "Picture 2 — exact last frame:"},
+                {
+                    "type": "input_image",
+                    "image_url": image_data_url(pair["right"]["resolved_path"]),
+                    "detail": OPENAI_IMAGE_DETAIL,
+                },
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Picture 2 authored image prompt (semantic context only):\n"
+                        + strip_h3_source_only_tokens(pair["right"]["authored_prompt"])
+                    ),
+                },
+            ]
             last_error = None
             for attempt in range(1, OPENAI_MAX_ATTEMPTS + 1):
                 try:
@@ -668,29 +782,18 @@ cells = [
                         reasoning={"effort": OPENAI_REASONING_EFFORT},
                         max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
                         input=[
-                            {"role": "system", "content": H3_OAI_SYSTEM_PROMPT},
                             {
-                                "role": "user",
-                                "content": [
-                                    {"type": "input_text", "text": user_text},
-                                    {
-                                        "type": "input_image",
-                                        "image_url": image_data_url(pair["left"]["resolved_path"]),
-                                        "detail": OPENAI_IMAGE_DETAIL,
-                                    },
-                                    {
-                                        "type": "input_image",
-                                        "image_url": image_data_url(pair["right"]["resolved_path"]),
-                                        "detail": OPENAI_IMAGE_DETAIL,
-                                    },
-                                ],
+                                "role": "system",
+                                "content": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
                             },
+                            {"role": "user", "content": user_content},
                         ],
                         text_format=H3MotionProposal,
                     )
                     proposal = response.output_parsed
                     if proposal is None:
                         raise RuntimeError("OpenAI returned no parsed motion proposal")
+                    validate_openai_motion_proposal(proposal)
                     return proposal, response.id
                 except Exception as error:
                     last_error = error
@@ -699,12 +802,19 @@ cells = [
                         time.sleep(2**attempt)
             raise RuntimeError(f"OpenAI prompt generation failed: {last_error}")
 
+        print("OPENAI H3 PROMPT-WRITER INSTRUCTIONS (editable in the settings cell):")
+        print(H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS)
+
         PAIR_PROMPT_PLANS = {}
         for pair in H3_PAIRS:
             prompt_path = RUN_DIRECTORY / "prompts" / f"{pair['index']:04d}_{pair['left']['uid']}_to_{pair['right']['uid']}.json"
             prompt_basis = {
                 "mode": H3_PROMPT_MODE,
                 "openai_model": OPENAI_MODEL if H3_PROMPT_MODE == "openai_per_pair" else None,
+                "prompt_guide_version": H3_OPENAI_PROMPT_GUIDE_VERSION,
+                "prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
+                "disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS,
+                "structured_output_schema": "object_correspondences+integrated_description-v1",
                 "left_sha256": sha256_file(pair["left"]["resolved_path"]),
                 "right_sha256": sha256_file(pair["right"]["resolved_path"]),
                 "left_prompt": pair["left"]["authored_prompt"],
@@ -743,7 +853,7 @@ cells = [
                     "pair_id": pair["pair_id"],
                     "mode": H3_PROMPT_MODE,
                     "h3_prompt": h3_prompt,
-                    "visual_correspondence": None,
+                    "object_correspondences": None,
                     "openai_response_id": None,
                     "basis": prompt_basis,
                 }
@@ -755,10 +865,12 @@ cells = [
                     "pair_id": pair["pair_id"],
                     "mode": H3_PROMPT_MODE,
                     "h3_prompt": wrap_openai_h3_motion(
-                        proposal.motion_description,
+                        proposal.integrated_multimodal_description,
                         duration_seconds=H3_DURATION_SECONDS,
                     ),
-                    "visual_correspondence": proposal.visual_correspondence,
+                    "object_correspondences": [
+                        item.model_dump(mode="json") for item in proposal.object_correspondences
+                    ],
                     "openai_response_id": response_id,
                     "basis": prompt_basis,
                 }
@@ -774,9 +886,13 @@ cells = [
             )
             print("LEFT AUTHORED PROMPT:\n" + pair["left"]["authored_prompt"])
             print("RIGHT AUTHORED PROMPT:\n" + pair["right"]["authored_prompt"])
-            if plan.get("visual_correspondence"):
-                print("VISUAL CORRESPONDENCE:\n" + plan["visual_correspondence"])
-            print("FINAL LOCAL H3 PROMPT:\n" + plan["h3_prompt"])
+            if plan.get("object_correspondences"):
+                print("POSITIVE OBJECT CORRESPONDENCE MAP:")
+                for mapping_index, mapping in enumerate(plan["object_correspondences"], start=1):
+                    print(f"  {mapping_index:02d}. SOURCE: {mapping['source_form_and_region']}")
+                    print(f"      TARGET: {mapping['target_form_and_region']}")
+                    print(f"      PATH:   {mapping['continuous_path']}")
+            print("GENERATED TRANSITION PROMPT SENT TO LOCAL H3:\n" + plan["h3_prompt"])
         '''
     ),
     markdown(

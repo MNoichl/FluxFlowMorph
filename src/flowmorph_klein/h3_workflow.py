@@ -12,9 +12,11 @@ from typing import Any
 
 
 DEFAULT_H3_MOTION_DIRECTIVE = (
-    "The objects in #Image1 morphing into #Image2 . No camera movement, no panning, "
-    "no exchange, no cuts. Only objects changing shape, form texture and color. "
-    "No alpha blending. Objects moving as little as possible."
+    "A static locked-off view begins exactly at #Image1. Every visible object remains opaque, "
+    "solid, and sharply resolved while its existing boundary continuously deforms along the "
+    "shortest path into the corresponding object at the same screen position in #Image2. "
+    "Shape, material, texture, and color change through small coherent updates until the view "
+    "settles exactly at #Image2."
 )
 
 SOURCE_ONLY_PROMPT_TOKENS = ("RIJKSOIL",)
@@ -250,23 +252,17 @@ def build_default_h3_prompt(
         raise ValueError("motion directive must refer to both #Image1 and #Image2")
     return (
         "How the reference pictures align with the target video — "
-        f"<Picture 1> aligns with the 0.00-second mark; <Picture 2> aligns with the "
-        f"{float(duration_seconds):.2f}-second mark.\n\n"
+        f"Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; "
+        f"Picture 2 (from Shot 1) aligns with the {float(duration_seconds):.2f}-second "
+        "mark of the target video.\n\n"
         "integrated_multimodal_description: [Shot 1] "
-        f"{clean_directive} This is one continuous locked-off deformation. Every visible form "
-        "stays near its screen position and progressively changes geometry, material, texture, "
-        "and color into its corresponding form. The opening composition must exactly match "
-        "<Picture 1>, and the final composition must settle exactly into <Picture 2>. Preserve "
-        "the background, tabletop, lighting, object density, and negative space throughout. "
-        "No objects may enter, leave, duplicate, disappear and reappear, or be newly invented. "
-        "Every object must remain one coherent continuous surface: no dissolving into particles, "
-        "dust, grains, droplets, smoke, sparks, fragments, shards, bubbles, or swarms; no crumbling, "
-        "shattering, shedding, scattering, or explosive breakup. Surface detail may change only "
-        "continuously toward detail visibly present in <Picture 2>; do not invent intermediate "
-        "patterns, grain, glitter, cracks, fur, scales, ornament, or new material textures. "
-        "No people, typography, logos, captions, credits, or title cards unless already visible "
-        "in both reference pictures.\n\n"
-        "overall_soundscape: Silence; no dialogue, music, or sound effects.\n"
+        f"{clean_directive} The camera holds a Static Shot with unchanged framing, lens, and "
+        "viewpoint. Every visible form remains opaque, solid, continuous, and sharply resolved "
+        "while its boundary advances through small local changes toward its corresponding form. "
+        "The background, tabletop, illumination, object density, and negative space evolve "
+        "continuously, and all visible differences progressively narrow until the exact Picture 2 "
+        "composition is reached. Surface detail develops only toward detail visible in Picture 2."
+        "\n\noverall_soundscape: N/A\n"
         "non_diegetic_music: N/A"
     )
 
@@ -283,28 +279,26 @@ def wrap_openai_h3_motion(
     clean = strip_h3_source_only_tokens(motion_description)
     if len(clean) < 80:
         raise ValueError("OpenAI motion description is unexpectedly short")
-    clean = re.sub(r"#Image1\b", "<Picture 1>", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"#Image2\b", "<Picture 2>", clean, flags=re.IGNORECASE)
-    if "<Picture 1>" not in clean:
-        clean = "Beginning exactly at <Picture 1>, " + clean
-    if "<Picture 2>" not in clean:
-        clean += " The forms settle exactly into <Picture 2>."
+    clean = re.sub(r"#Image1\b|<Picture 1>", "Picture 1", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"#Image2\b|<Picture 2>", "Picture 2", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"^integrated_multimodal_description:\s*", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"^\[Shot 1\]\s*", "", clean, flags=re.IGNORECASE)
+    if "Picture 1" not in clean:
+        clean = "Beginning exactly from Picture 1, " + clean
+    if "Picture 2" not in clean:
+        clean += " The forms settle exactly into Picture 2."
     return (
         "How the reference pictures align with the target video — "
-        f"<Picture 1> aligns with the 0.00-second mark; <Picture 2> aligns with the "
-        f"{float(duration_seconds):.2f}-second mark.\n\n"
+        f"Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; "
+        f"Picture 2 (from Shot 1) aligns with the {float(duration_seconds):.2f}-second "
+        "mark of the target video.\n\n"
         f"integrated_multimodal_description: [Shot 1] {clean} "
-        "One continuous locked-off shot; no camera movement, cuts, dissolves, alpha blending, "
-        "or newly invented objects. Preserve the background, tabletop, lighting, object density, "
-        "and negative space. No objects enter, leave, duplicate, disappear and reappear, or move "
-        "farther than necessary. Every object remains one coherent continuous surface: no "
-        "dissolving into particles, dust, grains, droplets, smoke, sparks, fragments, shards, "
-        "bubbles, or swarms; no crumbling, shattering, shedding, scattering, or explosive breakup. "
-        "Surface detail changes only continuously toward detail visible in <Picture 2>; no invented "
-        "intermediate patterns, grain, glitter, cracks, fur, scales, ornament, or material textures. "
-        "No people, typography, logos, captions, credits, or title cards "
-        "unless already visible in both reference pictures.\n\n"
-        "overall_soundscape: Silence; no dialogue, music, or sound effects.\n"
+        "The camera holds a Static Shot with unchanged framing, lens, and viewpoint. Every visible "
+        "form remains opaque, solid, continuous, and sharply resolved while its boundary advances "
+        "through small local changes toward the mapped target form. The background, tabletop, "
+        "illumination, object density, and negative space evolve continuously. All remaining "
+        "differences progressively narrow until the exact Picture 2 composition is reached.\n\n"
+        "overall_soundscape: N/A\n"
         "non_diegetic_music: N/A"
     )
 

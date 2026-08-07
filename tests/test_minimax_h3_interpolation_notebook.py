@@ -103,29 +103,37 @@ def test_source_run_images_and_authored_prompts_are_loaded_read_only() -> None:
     assert 'H3_PROJECT_NAME = "minimax_h3_interpolations"' in code
 
 
-def test_supplied_prompt_is_default_and_openai_option_sees_both_images_and_prompts() -> None:
+def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visible() -> None:
     code = code_source()
-    assert (
-        '"The objects in #Image1 morphing into #Image2 . No camera movement, no panning, "'
-        in code
-    )
-    assert 'H3_PROMPT_MODE = "template"' in code
+    assert 'H3_PROMPT_MODE = "openai_per_pair"' in code
     assert 'H3_LORA_TRIGGER' not in code
     assert 'H3_DURATION_SECONDS = 6.0' in code
     assert 'H3_JOB_TIMEOUT_SECONDS = 1800' in code
+    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v1"' in code
+    assert "H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r\"\"\"" in code
+    assert "first-frame state -> observable intermediate changes -> progressively" in code
+    assert "Match forms primarily by screen region, silhouette, scale, visual role" in code
+    assert "Do not merely describe two static images" in code
+    assert 'print("OPENAI H3 PROMPT-WRITER INSTRUCTIONS' in code
     assert 'strip_h3_source_only_tokens(pair["left"]["authored_prompt"])' in code
     assert 'strip_h3_source_only_tokens(pair["right"]["authored_prompt"])' in code
     assert 'if "RIJKSOIL" in payload["h3_prompt"]' in code
-    assert "No object dissolves into particles" in code
-    assert "introduce no new intermediate textures" in code
-    assert "No crumbling, shattering, shedding, scattering" in code
     assert 'OPENAI_MODEL = "gpt-5.6"' in code
+    assert 'OPENAI_IMAGE_DETAIL = "original"' in code
     assert "OPENAI_CLIENT.responses.parse(" in code
     assert '"image_url": image_data_url(pair["left"]["resolved_path"])' in code
     assert '"image_url": image_data_url(pair["right"]["resolved_path"])' in code
-    assert 'f"Picture 1 authored prompt:' in code
-    assert 'f"Picture 2 authored prompt:' in code
-    assert 'print("FINAL LOCAL H3 PROMPT:\\n" + plan["h3_prompt"])' in code
+    assert '"Picture 1 authored image prompt (semantic context only):\\n"' in code
+    assert '"Picture 2 authored image prompt (semantic context only):\\n"' in code
+    assert "class H3ObjectCorrespondence(BaseModel):" in code
+    assert "object_correspondences: list[H3ObjectCorrespondence]" in code
+    assert "H3_DISALLOWED_GENERATED_TRANSITION_TERMS = (" in code
+    assert "def validate_openai_motion_proposal(proposal):" in code
+    assert "validate_openai_motion_proposal(proposal)" in code
+    assert '"prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS' in code
+    assert '"disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS' in code
+    assert 'print("POSITIVE OBJECT CORRESPONDENCE MAP:")' in code
+    assert 'print("GENERATED TRANSITION PROMPT SENT TO LOCAL H3:\\n" + plan["h3_prompt"])' in code
     assert '"openai_used_only_for_prompt_planning"' in code
 
 
