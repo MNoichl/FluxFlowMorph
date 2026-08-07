@@ -109,7 +109,7 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert 'H3_LORA_TRIGGER' not in code
     assert 'H3_DURATION_SECONDS = 6.0' in code
     assert 'H3_JOB_TIMEOUT_SECONDS = 1800' in code
-    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v1"' in code
+    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v2"' in code
     assert "H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r\"\"\"" in code
     assert "first-frame state -> observable intermediate changes -> progressively" in code
     assert "Match forms primarily by screen region, silhouette, scale, visual role" in code
@@ -127,12 +127,25 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert '"Picture 2 authored image prompt (semantic context only):\\n"' in code
     assert "class H3ObjectCorrespondence(BaseModel):" in code
     assert "object_correspondences: list[H3ObjectCorrespondence]" in code
+    assert "min_length=4, max_length=10" in code
+    assert "OPENAI_MAX_OUTPUT_TOKENS = 8000" in code
+    assert "OPENAI_H3_DESCRIPTION_MIN_CHARS = 1200" in code
+    assert "OPENAI_H3_DESCRIPTION_MAX_CHARS = 2400" in code
+    assert 'if response.status != "completed":' in code
+    assert "OpenAI H3 description ended mid-sentence" in code
     assert "H3_DISALLOWED_GENERATED_TRANSITION_TERMS = (" in code
     assert "def validate_openai_motion_proposal(proposal):" in code
     assert "validate_openai_motion_proposal(proposal)" in code
     assert '"prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS' in code
     assert '"disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS' in code
     assert 'print("POSITIVE OBJECT CORRESPONDENCE MAP:")' in code
+    assert "H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144" in code
+    assert "H3_IMAGE_CONDITIONING_TOKEN_RESERVE = 8192" in code
+    assert "H3_PROMPT_MAX_TEXT_TOKENS = 2048" in code
+    assert "H3_COMFY_TOKENIZER = MiniMaxH3Tokenizer()" in code
+    assert "validate_h3_prompt_token_budget(" in code
+    assert 'plan["h3_prompt_text_tokens"] = prompt_token_count' in code
+    assert "H3 PROMPT TEXT TOKENS:" in code
     assert 'print("GENERATED TRANSITION PROMPT SENT TO LOCAL H3:\\n" + plan["h3_prompt"])' in code
     assert '"openai_used_only_for_prompt_planning"' in code
 

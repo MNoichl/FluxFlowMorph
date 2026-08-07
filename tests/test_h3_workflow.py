@@ -20,6 +20,7 @@ from flowmorph_klein.h3_workflow import (
     stable_h3_fingerprint,
     strip_h3_source_only_tokens,
     validate_h3_canvas,
+    validate_h3_prompt_token_budget,
     wrap_openai_h3_motion,
 )
 
@@ -281,6 +282,45 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     assert "small local silhouette and surface adjustments" in openai_prompt
     assert "Static Shot with unchanged framing, lens, and viewpoint" in openai_prompt
     assert "overall_soundscape: N/A" in openai_prompt
+
+
+def test_openai_prompt_wrapper_rejects_mid_sentence_truncation() -> None:
+    with pytest.raises(ValueError, match="complete sentence"):
+        wrap_openai_h3_motion(
+            "[Shot 1] Picture 1 changes continuously into Picture 2 while the Static Shot "
+            "keeps all forms registered, and the final glass boundary narrows into the clear-s",
+            duration_seconds=6.0,
+        )
+
+
+def test_h3_prompt_budget_uses_supplied_tokenizer_and_reserves_conditioning() -> None:
+    def tokenizer(text: str, *, add_special_tokens: bool) -> dict[str, list[int]]:
+        assert add_special_tokens is False
+        return {"input_ids": list(range(len(text.split())))}
+
+    assert validate_h3_prompt_token_budget(
+        "one two three",
+        tokenizer=tokenizer,
+        max_text_tokens=4,
+        model_context_tokens=20,
+        reserved_condition_tokens=10,
+    ) == 3
+    with pytest.raises(ValueError, match="operational maximum"):
+        validate_h3_prompt_token_budget(
+            "one two three four five",
+            tokenizer=tokenizer,
+            max_text_tokens=4,
+            model_context_tokens=20,
+            reserved_condition_tokens=10,
+        )
+    with pytest.raises(ValueError, match="exceeds the model context"):
+        validate_h3_prompt_token_budget(
+            "one",
+            tokenizer=tokenizer,
+            max_text_tokens=12,
+            model_context_tokens=20,
+            reserved_condition_tokens=10,
+        )
 
 
 def test_official_ui_workflow_is_patched_with_two_images_and_direct_dimensions() -> None:

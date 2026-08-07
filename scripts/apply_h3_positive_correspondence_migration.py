@@ -8,6 +8,7 @@ byte-for-byte within their existing cell source.
 from __future__ import annotations
 
 import json
+import re
 import runpy
 from copy import deepcopy
 from pathlib import Path
@@ -62,14 +63,17 @@ def replace_prompt_settings(current_source: str, reference_source: str) -> str:
         + prompt_settings_fragment(reference_source)
         + current_source[end:]
     )
-    if "H3_WORKFLOW_PATCH_VERSION = 3" in migrated:
-        migrated = migrated.replace(
-            "H3_WORKFLOW_PATCH_VERSION = 3",
-            "H3_WORKFLOW_PATCH_VERSION = 4",
-            1,
-        )
-    elif "H3_WORKFLOW_PATCH_VERSION = 4" not in migrated:
-        raise RuntimeError("Unexpected H3 workflow patch version")
+    runtime_start = migrated.index("H3_WORKFLOW_PATCH_VERSION =")
+    runtime_end = migrated.index("H3_BASE_SEED =", runtime_start)
+    reference_runtime_start = reference_source.index("H3_WORKFLOW_PATCH_VERSION =")
+    reference_runtime_end = reference_source.index(
+        "H3_BASE_SEED =", reference_runtime_start
+    )
+    migrated = (
+        migrated[:runtime_start]
+        + reference_source[reference_runtime_start:reference_runtime_end]
+        + migrated[runtime_end:]
+    )
     if 'OPENAI_IMAGE_DETAIL = "high"' in migrated:
         migrated = migrated.replace(
             'OPENAI_IMAGE_DETAIL = "high"',
@@ -78,6 +82,26 @@ def replace_prompt_settings(current_source: str, reference_source: str) -> str:
         )
     elif 'OPENAI_IMAGE_DETAIL = "original"' not in migrated:
         raise RuntimeError("Unexpected OpenAI image-detail setting")
+    output_pattern = re.compile(r"^OPENAI_MAX_OUTPUT_TOKENS\s*=.*$", re.MULTILINE)
+    reference_output = output_pattern.search(reference_source)
+    if reference_output is None or len(output_pattern.findall(migrated)) != 1:
+        raise RuntimeError("Unexpected OpenAI output-token setting")
+    migrated = output_pattern.sub(reference_output.group(0), migrated, count=1)
+    description_fragment_start = reference_source.index(
+        "OPENAI_H3_DESCRIPTION_MIN_CHARS ="
+    )
+    description_fragment_end = reference_source.index(
+        "VISION_IMAGE_MAX_SIDE =", description_fragment_start
+    )
+    description_fragment = reference_source[
+        description_fragment_start:description_fragment_end
+    ]
+    if "OPENAI_H3_DESCRIPTION_MIN_CHARS =" not in migrated:
+        migrated = migrated.replace(
+            "OPENAI_MAX_ATTEMPTS = 3\n",
+            "OPENAI_MAX_ATTEMPTS = 3\n" + description_fragment,
+            1,
+        )
     return migrated
 
 

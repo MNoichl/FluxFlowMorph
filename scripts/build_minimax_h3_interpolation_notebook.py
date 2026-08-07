@@ -102,7 +102,12 @@ cells = [
         H3_FPS = 24
         H3_JOB_TIMEOUT_SECONDS = 1800
         H3_ENFORCE_SOURCE_ASPECT = True
-        H3_WORKFLOW_PATCH_VERSION = 4
+        H3_WORKFLOW_PATCH_VERSION = 5
+        # The released Qwen3-VL encoder advertises 262,144 positions. Keep generated six-second
+        # prompts far below that and reserve ample space for both image-conditioning blocks.
+        H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144
+        H3_IMAGE_CONDITIONING_TOKEN_RESERVE = 8192
+        H3_PROMPT_MAX_TEXT_TOKENS = 2048
         H3_BASE_SEED = None  # OS entropy on a new run; persisted on Drive.
         H3_REUSE_EXISTING_CLIPS = True
         RUN_ONE_PAIR_TEST = True
@@ -123,7 +128,7 @@ cells = [
 
         # Image-aware OpenAI prompt writer. This text is intentionally editable and printed by
         # the prompt cell. It follows MiniMax's official FL2VA guide and h3-prompt-writing skill.
-        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v1"
+        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v2"
         H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r"""
         You write a structured motion plan for MiniMax H3-Base-FL2VA using two endpoint images.
         Inspect Picture 1, Picture 2, and both authored image prompts. The images are the visual
@@ -149,6 +154,8 @@ cells = [
           a growing indentation; retain continuous surfaces throughout.
         - Keep the quantity of visible material, negative-space layout, and object density on a
           gradual endpoint-to-endpoint path. A sparse pair remains sparse.
+        - Consolidate related forms into 4-10 concise mappings. Each source and target statement
+          should be one compact sentence; each path should use no more than three sentences.
 
         Write integrated_multimodal_description as production-ready natural English:
         - Begin with [Shot 1], the observed visual style, and the exact Picture 1 composition.
@@ -163,6 +170,8 @@ cells = [
           characters, actions, typography, dialogue, sound, production commentary, or unreferenced
           objects. Do not name or propose cinematic transition effects.
         - RIJKSOIL is an upstream FLUX LoRA trigger and must never appear in the H3 plan.
+        - Keep this field between 1,200 and 2,400 characters, including [Shot 1]. Finish every
+          thought and end with a complete sentence; never stop at a character or token boundary.
 
         Return only the requested structured fields. Do not include the FL2VA alignment header,
         field labels, overall_soundscape, or non_diegetic_music; fixed code adds those exactly.
@@ -182,8 +191,10 @@ cells = [
         OPENAI_MODEL = "gpt-5.6"
         OPENAI_REASONING_EFFORT = "medium"
         OPENAI_IMAGE_DETAIL = "original"
-        OPENAI_MAX_OUTPUT_TOKENS = 3000
+        OPENAI_MAX_OUTPUT_TOKENS = 8000
         OPENAI_MAX_ATTEMPTS = 3
+        OPENAI_H3_DESCRIPTION_MIN_CHARS = 1200
+        OPENAI_H3_DESCRIPTION_MAX_CHARS = 2400
         VISION_IMAGE_MAX_SIDE = 1024
         VISION_JPEG_QUALITY = 90
 
@@ -263,11 +274,18 @@ cells = [
         and `first state → observable changes → narrowing differences → last state` sequence.
         The Ref2VA guide is used only for its useful label-consistency and explicit visual-state
         discipline; its six-section output format is intentionally not sent to the FL2VA model.
+        The released H3 Qwen3-VL tokenizer and text-encoder configuration advertise a 262,144-token
+        context, while pinned ComfyUI performs no implicit prompt truncation. This notebook counts
+        with that exact ComfyUI tokenizer and applies a deliberately conservative 2,048-text-token
+        ceiling plus an 8,192-token reserve for the two visual conditioning blocks.
 
         Primary references: [MiniMax H3 model card](https://huggingface.co/MiniMaxAI/MiniMax-H3),
         [official base/FL2VA prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md),
         [official Ref2VA prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md),
         [official H3 prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing),
+        [official FL2VA text-encoder configuration](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/FL2VA/text_encoder/config.json),
+        [ComfyUI H3 tokenizer implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/text_encoders/minimax.py),
+        [OpenAI Structured Outputs edge-case guidance](https://developers.openai.com/api/docs/guides/structured-outputs#tips-for-your-json-schema),
         [Comfy-Org H3 weights](https://huggingface.co/Comfy-Org/MiniMax-H3), and
         [official ComfyUI H3 workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_i2v.json).
         """,
@@ -392,6 +410,7 @@ cells = [
             stable_h3_fingerprint,
             strip_h3_source_only_tokens,
             validate_h3_canvas,
+            validate_h3_prompt_token_budget,
             wrap_openai_h3_motion,
         )
         from flowmorph_klein.border_stabilization import (
@@ -660,8 +679,10 @@ cells = [
         chronological motion path. The editable `H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS` in the
         settings cell follows MiniMax's official FL2VA sequence: first-frame state, observable
         intermediate changes, progressively narrowing differences, and exact last-frame state.
-        Fixed code adds the official alignment header and three-field H3 format. The writer
-        instructions, every correspondence map, and every final transition prompt are printed.
+        Fixed code rejects incomplete sentences and incomplete API responses, adds the official
+        alignment header and three-field H3 format, then counts the final prompt with ComfyUI's
+        exact H3 tokenizer. The writer instructions, every correspondence map, token count, and
+        every final transition prompt are printed.
         The FLUX-only `RIJKSOIL` LoRA token is never sent to H3.
         """,
     ),
@@ -672,20 +693,48 @@ cells = [
         import hashlib
         import io
         from pydantic import BaseModel, Field
+        from flowmorph_klein.h3_workflow import validate_h3_prompt_token_budget
+
+        comfy_source = str(Path(COMFYUI_ROOT))
+        if comfy_source not in sys.path:
+            sys.path.insert(0, comfy_source)
+        from comfy.text_encoders.minimax import MiniMaxH3Tokenizer
+
+        H3_COMFY_TOKENIZER = MiniMaxH3Tokenizer()
+        H3_QWEN_TOKENIZER = H3_COMFY_TOKENIZER.qwen3vl_32b.tokenizer
+
+        def h3_prompt_text_tokens(prompt):
+            return validate_h3_prompt_token_budget(
+                prompt,
+                tokenizer=H3_QWEN_TOKENIZER,
+                max_text_tokens=H3_PROMPT_MAX_TEXT_TOKENS,
+                model_context_tokens=H3_TEXT_ENCODER_CONTEXT_TOKENS,
+                reserved_condition_tokens=H3_IMAGE_CONDITIONING_TOKEN_RESERVE,
+            )
 
         class H3ObjectCorrespondence(BaseModel):
-            source_form_and_region: str = Field(min_length=15, max_length=500)
-            target_form_and_region: str = Field(min_length=15, max_length=500)
-            continuous_path: str = Field(min_length=25, max_length=800)
+            source_form_and_region: str = Field(min_length=15, max_length=240)
+            target_form_and_region: str = Field(min_length=15, max_length=240)
+            continuous_path: str = Field(min_length=25, max_length=500)
 
         class H3MotionProposal(BaseModel):
             object_correspondences: list[H3ObjectCorrespondence] = Field(
-                min_length=2, max_length=24
+                min_length=4, max_length=10
             )
-            integrated_multimodal_description: str = Field(min_length=180, max_length=3000)
+            integrated_multimodal_description: str = Field(
+                min_length=OPENAI_H3_DESCRIPTION_MIN_CHARS,
+                max_length=OPENAI_H3_DESCRIPTION_MAX_CHARS + 200,
+            )
 
         def validate_openai_motion_proposal(proposal):
             description = proposal.integrated_multimodal_description.strip()
+            if len(description) > OPENAI_H3_DESCRIPTION_MAX_CHARS:
+                raise ValueError(
+                    f"OpenAI H3 description has {len(description)} characters; compact it to "
+                    f"at most {OPENAI_H3_DESCRIPTION_MAX_CHARS}"
+                )
+            if not re.search(r'[.!?]["\u201d\u2019\']?$', description):
+                raise ValueError("OpenAI H3 description ended mid-sentence")
             required = ("[Shot 1]", "Picture 1", "Picture 2", "Static Shot")
             missing = [item for item in required if item.lower() not in description.lower()]
             if missing:
@@ -777,6 +826,16 @@ cells = [
             last_error = None
             for attempt in range(1, OPENAI_MAX_ATTEMPTS + 1):
                 try:
+                    attempt_content = list(user_content)
+                    if attempt > 1:
+                        attempt_content.append({
+                            "type": "input_text",
+                            "text": (
+                                "The previous draft was rejected. Return a complete, compact JSON "
+                                "proposal now: 4-10 grouped correspondences, a 1,200-2,400-character "
+                                "integrated description, and a fully punctuated final sentence."
+                            ),
+                        })
                     response = OPENAI_CLIENT.responses.parse(
                         model=OPENAI_MODEL,
                         reasoning={"effort": OPENAI_REASONING_EFFORT},
@@ -786,10 +845,15 @@ cells = [
                                 "role": "system",
                                 "content": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
                             },
-                            {"role": "user", "content": user_content},
+                            {"role": "user", "content": attempt_content},
                         ],
                         text_format=H3MotionProposal,
                     )
+                    if response.status != "completed":
+                        reason = getattr(getattr(response, "incomplete_details", None), "reason", None)
+                        raise RuntimeError(
+                            f"OpenAI response status was {response.status!r}; incomplete reason={reason!r}"
+                        )
                     proposal = response.output_parsed
                     if proposal is None:
                         raise RuntimeError("OpenAI returned no parsed motion proposal")
@@ -814,7 +878,13 @@ cells = [
                 "prompt_guide_version": H3_OPENAI_PROMPT_GUIDE_VERSION,
                 "prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
                 "disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS,
-                "structured_output_schema": "object_correspondences+integrated_description-v1",
+                "structured_output_schema": "compact_correspondences+complete_description-v2",
+                "openai_max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+                "description_min_chars": OPENAI_H3_DESCRIPTION_MIN_CHARS,
+                "description_max_chars": OPENAI_H3_DESCRIPTION_MAX_CHARS,
+                "h3_prompt_max_text_tokens": H3_PROMPT_MAX_TEXT_TOKENS,
+                "h3_text_encoder_context_tokens": H3_TEXT_ENCODER_CONTEXT_TOKENS,
+                "h3_image_conditioning_token_reserve": H3_IMAGE_CONDITIONING_TOKEN_RESERVE,
                 "left_sha256": sha256_file(pair["left"]["resolved_path"]),
                 "right_sha256": sha256_file(pair["right"]["resolved_path"]),
                 "left_prompt": pair["left"]["authored_prompt"],
@@ -875,6 +945,11 @@ cells = [
                     "basis": prompt_basis,
                 }
                 plan_source = "generated_openai"
+            prompt_token_count = h3_prompt_text_tokens(plan["h3_prompt"])
+            recorded_token_count = plan.get("h3_prompt_text_tokens")
+            if recorded_token_count not in (None, prompt_token_count):
+                raise RuntimeError("Cached H3 prompt token count no longer matches its prompt")
+            plan["h3_prompt_text_tokens"] = prompt_token_count
             prompt_path.write_text(
                 json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
@@ -892,6 +967,10 @@ cells = [
                     print(f"  {mapping_index:02d}. SOURCE: {mapping['source_form_and_region']}")
                     print(f"      TARGET: {mapping['target_form_and_region']}")
                     print(f"      PATH:   {mapping['continuous_path']}")
+            print(
+                f"H3 PROMPT TEXT TOKENS: {prompt_token_count} / "
+                f"{H3_PROMPT_MAX_TEXT_TOKENS} operational maximum"
+            )
             print("GENERATED TRANSITION PROMPT SENT TO LOCAL H3:\n" + plan["h3_prompt"])
         '''
     ),
@@ -1047,6 +1126,9 @@ cells = [
 
         def h3_job_payload(pair):
             prompt_plan = PAIR_PROMPT_PLANS[pair["index"]]
+            prompt_token_count = h3_prompt_text_tokens(prompt_plan["h3_prompt"])
+            if prompt_plan.get("h3_prompt_text_tokens") != prompt_token_count:
+                raise RuntimeError("H3 prompt changed after its exact tokenizer audit")
             return {
                 "pair_id": pair["pair_id"],
                 "left_uid": pair["left"]["uid"],
@@ -1055,6 +1137,8 @@ cells = [
                 "right_sha256": sha256_file(pair["right"]["resolved_path"]),
                 "prompt_fingerprint": prompt_plan["fingerprint"],
                 "h3_prompt": prompt_plan["h3_prompt"],
+                "h3_prompt_text_tokens": prompt_token_count,
+                "h3_prompt_max_text_tokens": H3_PROMPT_MAX_TEXT_TOKENS,
                 "seed": H3_BASE_SEED + pair["index"],
                 "width": H3_WIDTH,
                 "height": H3_HEIGHT,
