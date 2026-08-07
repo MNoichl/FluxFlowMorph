@@ -1,4 +1,4 @@
-"""Narrowly add complete-output and exact-token guards to the H3 notebook.
+"""Narrowly add complete-output and dependency-free prompt guards to the H3 notebook.
 
 Only prompt-related settings, prompt documentation, and the prompt-generation cell may
 change. Every other cell and all unrelated/user-edited settings remain untouched.
@@ -21,6 +21,7 @@ ALLOWED_CELL_IDS = {
     "h3-03-research",
     "h3-10-prompts-heading",
     "h3-11-prompts",
+    "h3-17-render",
 }
 
 
@@ -127,6 +128,14 @@ def main() -> None:
     prompt_cell["source"] = deepcopy(reference_cells["h3-11-prompts"]["source"])
     prompt_cell["execution_count"] = None
     prompt_cell["outputs"] = []
+
+    render_cell = current_cells["h3-17-render"]
+    render_cell["source"] = replace_bounded_fragment(
+        source(render_cell),
+        source(reference_cells["h3-17-render"]),
+        start_marker="def h3_job_payload(pair):",
+        end_marker="def stream_command(command):",
+    ).splitlines(keepends=True)
 
     before_cells = cells_by_id(before)
     for cell_id, cell in current_cells.items():

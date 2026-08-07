@@ -20,7 +20,7 @@ from flowmorph_klein.h3_workflow import (
     stable_h3_fingerprint,
     strip_h3_source_only_tokens,
     validate_h3_canvas,
-    validate_h3_prompt_token_budget,
+    validate_h3_prompt_byte_budget,
     wrap_openai_h3_motion,
 )
 
@@ -293,31 +293,36 @@ def test_openai_prompt_wrapper_rejects_mid_sentence_truncation() -> None:
         )
 
 
-def test_h3_prompt_budget_uses_supplied_tokenizer_and_reserves_conditioning() -> None:
-    def tokenizer(text: str, *, add_special_tokens: bool) -> dict[str, list[int]]:
-        assert add_special_tokens is False
-        return {"input_ids": list(range(len(text.split())))}
-
-    assert validate_h3_prompt_token_budget(
-        "one two three",
-        tokenizer=tokenizer,
-        max_text_tokens=4,
+def test_h3_prompt_budget_uses_utf8_upper_bound_and_reserves_conditioning() -> None:
+    assert validate_h3_prompt_byte_budget(
+        "one",
+        max_utf8_bytes=4,
         model_context_tokens=20,
         reserved_condition_tokens=10,
     ) == 3
     with pytest.raises(ValueError, match="operational maximum"):
-        validate_h3_prompt_token_budget(
-            "one two three four five",
-            tokenizer=tokenizer,
-            max_text_tokens=4,
+        validate_h3_prompt_byte_budget(
+            "three",
+            max_utf8_bytes=4,
             model_context_tokens=20,
             reserved_condition_tokens=10,
         )
-    with pytest.raises(ValueError, match="exceeds the model context"):
-        validate_h3_prompt_token_budget(
+    assert validate_h3_prompt_byte_budget(
+        "é",
+        max_utf8_bytes=4,
+        model_context_tokens=20,
+        reserved_condition_tokens=10,
+    ) == 2
+    assert validate_h3_prompt_byte_budget(
+        " one ",
+        max_utf8_bytes=5,
+        model_context_tokens=20,
+        reserved_condition_tokens=10,
+    ) == 5
+    with pytest.raises(ValueError, match="worst-case prompt budget exceeds"):
+        validate_h3_prompt_byte_budget(
             "one",
-            tokenizer=tokenizer,
-            max_text_tokens=12,
+            max_utf8_bytes=12,
             model_context_tokens=20,
             reserved_condition_tokens=10,
         )

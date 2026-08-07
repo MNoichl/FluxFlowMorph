@@ -141,11 +141,14 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert 'print("POSITIVE OBJECT CORRESPONDENCE MAP:")' in code
     assert "H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144" in code
     assert "H3_IMAGE_CONDITIONING_TOKEN_RESERVE = 8192" in code
-    assert "H3_PROMPT_MAX_TEXT_TOKENS = 2048" in code
-    assert "H3_COMFY_TOKENIZER = MiniMaxH3Tokenizer()" in code
-    assert "validate_h3_prompt_token_budget(" in code
-    assert 'plan["h3_prompt_text_tokens"] = prompt_token_count' in code
-    assert "H3 PROMPT TEXT TOKENS:" in code
+    assert "H3_PROMPT_MAX_UTF8_BYTES = 8192" in code
+    assert "from comfy.text_encoders.minimax import MiniMaxH3Tokenizer" not in code
+    assert "validate_h3_prompt_byte_budget(" in code
+    assert 'plan["h3_prompt_utf8_bytes"] = prompt_byte_count' in code
+    assert "H3 PROMPT UTF-8 BYTES:" in code
+    assert 'prompt_plan.get("h3_prompt_utf8_bytes") != prompt_byte_count' in code
+    assert '"h3_prompt_max_utf8_bytes": H3_PROMPT_MAX_UTF8_BYTES' in code
+    assert "h3_prompt_text_tokens" not in code
     assert 'print("GENERATED TRANSITION PROMPT SENT TO LOCAL H3:\\n" + plan["h3_prompt"])' in code
     assert '"openai_used_only_for_prompt_planning"' in code
 

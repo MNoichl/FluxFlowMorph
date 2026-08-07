@@ -102,12 +102,14 @@ cells = [
         H3_FPS = 24
         H3_JOB_TIMEOUT_SECONDS = 1800
         H3_ENFORCE_SOURCE_ASPECT = True
-        H3_WORKFLOW_PATCH_VERSION = 5
+        H3_WORKFLOW_PATCH_VERSION = 6
         # The released Qwen3-VL encoder advertises 262,144 positions. Keep generated six-second
         # prompts far below that and reserve ample space for both image-conditioning blocks.
         H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144
         H3_IMAGE_CONDITIONING_TOKEN_RESERVE = 8192
-        H3_PROMPT_MAX_TEXT_TOKENS = 2048
+        # Qwen's byte-level BPE cannot emit more text tokens than UTF-8 input bytes.
+        # This conservative bound avoids importing ComfyUI/Transformers into the notebook kernel.
+        H3_PROMPT_MAX_UTF8_BYTES = 8192
         H3_BASE_SEED = None  # OS entropy on a new run; persisted on Drive.
         H3_REUSE_EXISTING_CLIPS = True
         RUN_ONE_PAIR_TEST = True
@@ -410,7 +412,7 @@ cells = [
             stable_h3_fingerprint,
             strip_h3_source_only_tokens,
             validate_h3_canvas,
-            validate_h3_prompt_token_budget,
+            validate_h3_prompt_byte_budget,
             wrap_openai_h3_motion,
         )
         from flowmorph_klein.border_stabilization import (
@@ -681,7 +683,11 @@ cells = [
         intermediate changes, progressively narrowing differences, and exact last-frame state.
         Fixed code rejects incomplete sentences and incomplete API responses, adds the official
         alignment header and three-field H3 format, then counts the final prompt with ComfyUI's
-        exact H3 tokenizer. The writer instructions, every correspondence map, token count, and
+        conservative UTF-8 byte ceiling. Qwen's byte-level BPE cannot produce more text tokens
+        than input bytes, so 8,192 bytes plus the 8,192-token visual reserve stays below 16,384
+        worst-case tokens versus the encoder's 262,144-token context. This avoids importing the
+        ComfyUI/Transformers stack into the notebook kernel. The writer instructions, every
+        correspondence map, prompt byte count, and
         every final transition prompt are printed.
         The FLUX-only `RIJKSOIL` LoRA token is never sent to H3.
         """,
@@ -693,21 +699,12 @@ cells = [
         import hashlib
         import io
         from pydantic import BaseModel, Field
-        from flowmorph_klein.h3_workflow import validate_h3_prompt_token_budget
+        from flowmorph_klein.h3_workflow import validate_h3_prompt_byte_budget
 
-        comfy_source = str(Path(COMFYUI_ROOT))
-        if comfy_source not in sys.path:
-            sys.path.insert(0, comfy_source)
-        from comfy.text_encoders.minimax import MiniMaxH3Tokenizer
-
-        H3_COMFY_TOKENIZER = MiniMaxH3Tokenizer()
-        H3_QWEN_TOKENIZER = H3_COMFY_TOKENIZER.qwen3vl_32b.tokenizer
-
-        def h3_prompt_text_tokens(prompt):
-            return validate_h3_prompt_token_budget(
+        def h3_prompt_utf8_bytes(prompt):
+            return validate_h3_prompt_byte_budget(
                 prompt,
-                tokenizer=H3_QWEN_TOKENIZER,
-                max_text_tokens=H3_PROMPT_MAX_TEXT_TOKENS,
+                max_utf8_bytes=H3_PROMPT_MAX_UTF8_BYTES,
                 model_context_tokens=H3_TEXT_ENCODER_CONTEXT_TOKENS,
                 reserved_condition_tokens=H3_IMAGE_CONDITIONING_TOKEN_RESERVE,
             )
@@ -882,7 +879,7 @@ cells = [
                 "openai_max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
                 "description_min_chars": OPENAI_H3_DESCRIPTION_MIN_CHARS,
                 "description_max_chars": OPENAI_H3_DESCRIPTION_MAX_CHARS,
-                "h3_prompt_max_text_tokens": H3_PROMPT_MAX_TEXT_TOKENS,
+                "h3_prompt_max_utf8_bytes": H3_PROMPT_MAX_UTF8_BYTES,
                 "h3_text_encoder_context_tokens": H3_TEXT_ENCODER_CONTEXT_TOKENS,
                 "h3_image_conditioning_token_reserve": H3_IMAGE_CONDITIONING_TOKEN_RESERVE,
                 "left_sha256": sha256_file(pair["left"]["resolved_path"]),
@@ -945,11 +942,11 @@ cells = [
                     "basis": prompt_basis,
                 }
                 plan_source = "generated_openai"
-            prompt_token_count = h3_prompt_text_tokens(plan["h3_prompt"])
-            recorded_token_count = plan.get("h3_prompt_text_tokens")
-            if recorded_token_count not in (None, prompt_token_count):
-                raise RuntimeError("Cached H3 prompt token count no longer matches its prompt")
-            plan["h3_prompt_text_tokens"] = prompt_token_count
+            prompt_byte_count = h3_prompt_utf8_bytes(plan["h3_prompt"])
+            recorded_byte_count = plan.get("h3_prompt_utf8_bytes")
+            if recorded_byte_count not in (None, prompt_byte_count):
+                raise RuntimeError("Cached H3 prompt byte count no longer matches its prompt")
+            plan["h3_prompt_utf8_bytes"] = prompt_byte_count
             prompt_path.write_text(
                 json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
@@ -968,8 +965,9 @@ cells = [
                     print(f"      TARGET: {mapping['target_form_and_region']}")
                     print(f"      PATH:   {mapping['continuous_path']}")
             print(
-                f"H3 PROMPT TEXT TOKENS: {prompt_token_count} / "
-                f"{H3_PROMPT_MAX_TEXT_TOKENS} operational maximum"
+                f"H3 PROMPT UTF-8 BYTES: {prompt_byte_count} / "
+                f"{H3_PROMPT_MAX_UTF8_BYTES} operational maximum "
+                f"(worst-case text tokens <= {prompt_byte_count})"
             )
             print("GENERATED TRANSITION PROMPT SENT TO LOCAL H3:\n" + plan["h3_prompt"])
         '''
@@ -1126,9 +1124,9 @@ cells = [
 
         def h3_job_payload(pair):
             prompt_plan = PAIR_PROMPT_PLANS[pair["index"]]
-            prompt_token_count = h3_prompt_text_tokens(prompt_plan["h3_prompt"])
-            if prompt_plan.get("h3_prompt_text_tokens") != prompt_token_count:
-                raise RuntimeError("H3 prompt changed after its exact tokenizer audit")
+            prompt_byte_count = h3_prompt_utf8_bytes(prompt_plan["h3_prompt"])
+            if prompt_plan.get("h3_prompt_utf8_bytes") != prompt_byte_count:
+                raise RuntimeError("H3 prompt changed after its UTF-8 byte audit")
             return {
                 "pair_id": pair["pair_id"],
                 "left_uid": pair["left"]["uid"],
@@ -1137,8 +1135,8 @@ cells = [
                 "right_sha256": sha256_file(pair["right"]["resolved_path"]),
                 "prompt_fingerprint": prompt_plan["fingerprint"],
                 "h3_prompt": prompt_plan["h3_prompt"],
-                "h3_prompt_text_tokens": prompt_token_count,
-                "h3_prompt_max_text_tokens": H3_PROMPT_MAX_TEXT_TOKENS,
+                "h3_prompt_utf8_bytes": prompt_byte_count,
+                "h3_prompt_max_utf8_bytes": H3_PROMPT_MAX_UTF8_BYTES,
                 "seed": H3_BASE_SEED + pair["index"],
                 "width": H3_WIDTH,
                 "height": H3_HEIGHT,

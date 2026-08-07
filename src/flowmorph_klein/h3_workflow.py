@@ -306,52 +306,45 @@ def wrap_openai_h3_motion(
     )
 
 
-def validate_h3_prompt_token_budget(
+def validate_h3_prompt_byte_budget(
     prompt: str,
     *,
-    tokenizer: Any,
-    max_text_tokens: int,
+    max_utf8_bytes: int,
     model_context_tokens: int,
     reserved_condition_tokens: int = 0,
 ) -> int:
-    """Count H3 text tokens exactly and enforce conservative/context ceilings.
+    """Enforce a dependency-free upper bound on H3 prompt tokens.
 
-    ``tokenizer`` is the callable Qwen tokenizer used by ComfyUI's
-    ``MiniMaxH3Tokenizer``. The reserved budget accounts for the two visual
-    conditioning blocks and their labels without loading model weights.
+    H3's Qwen tokenizer uses byte-level BPE, so the number of encoded text
+    tokens cannot exceed the number of UTF-8 bytes in the prompt. Limiting
+    bytes therefore gives a conservative token bound without importing the
+    heavyweight ComfyUI/Transformers stack. The reserved budget accounts for
+    the two visual-conditioning blocks and their labels.
     """
 
-    clean = str(prompt).strip()
-    if not clean:
+    prompt_text = str(prompt)
+    if not prompt_text.strip():
         raise ValueError("H3 prompt cannot be blank")
-    if max_text_tokens <= 0 or model_context_tokens <= 0:
-        raise ValueError("H3 token budgets must be positive")
+    if max_utf8_bytes <= 0 or model_context_tokens <= 0:
+        raise ValueError("H3 prompt budgets must be positive")
     if reserved_condition_tokens < 0:
         raise ValueError("reserved H3 conditioning tokens cannot be negative")
-    if max_text_tokens + reserved_condition_tokens > model_context_tokens:
-        raise ValueError("H3 operational token budget exceeds the model context")
+    if max_utf8_bytes + reserved_condition_tokens > model_context_tokens:
+        raise ValueError("H3 worst-case prompt budget exceeds the model context")
 
-    encoded = tokenizer(clean, add_special_tokens=False)
-    input_ids = encoded.get("input_ids") if isinstance(encoded, Mapping) else None
-    if input_ids is None:
-        raise TypeError("H3 tokenizer must return an input_ids field")
-    if input_ids and isinstance(input_ids[0], (list, tuple)):
-        if len(input_ids) != 1:
-            raise ValueError("H3 prompt token validation expects one prompt")
-        input_ids = input_ids[0]
-    token_count = len(input_ids)
-    if token_count > max_text_tokens:
+    byte_count = len(prompt_text.encode("utf-8"))
+    if byte_count > max_utf8_bytes:
         raise ValueError(
-            f"H3 prompt has {token_count} text tokens; operational maximum is "
-            f"{max_text_tokens}"
+            f"H3 prompt has {byte_count} UTF-8 bytes; operational maximum is "
+            f"{max_utf8_bytes}"
         )
-    if token_count + reserved_condition_tokens > model_context_tokens:
+    if byte_count + reserved_condition_tokens > model_context_tokens:
         raise ValueError(
-            f"H3 prompt plus reserved conditioning needs at least "
-            f"{token_count + reserved_condition_tokens} tokens, above the "
+            f"H3 prompt plus reserved conditioning could need up to "
+            f"{byte_count + reserved_condition_tokens} tokens, above the "
             f"{model_context_tokens}-token model context"
         )
-    return token_count
+    return byte_count
 
 
 def _unique_h3_node(nodes: Sequence[Any], node_type: str) -> dict[str, Any]:
