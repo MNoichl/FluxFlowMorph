@@ -213,6 +213,7 @@ def test_flashvsr_v11_is_final_streamed_cyclic_net_two_x_stage() -> None:
     assert '"flashvsr_frame_count_preserved"' in code
     assert 'globals().get("BORDER_STABILIZED_PATHS")' in code
     assert "discover_h3_finishing_source(" in code
+    assert "h3_source_run_root = Path(RUN_DIRECTORY).parent" in code
     assert "preferred_run=RUN_DIRECTORY" in code
     assert '"flashvsr_recovery_selection": recovered_source["selection"]' in code
     assert 'RUN_DIRECTORY = recovered_source["run_directory"]' in code

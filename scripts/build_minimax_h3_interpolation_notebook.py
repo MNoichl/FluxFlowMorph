@@ -1585,15 +1585,15 @@ cells = [
                 flashvsr_input_video = H3_NATIVE_VIDEO_PATH
                 flashvsr_input_stage = "native_h3"
             else:
-                h3_project_root = drive_base / H3_PROJECT_NAME
+                h3_source_run_root = Path(RUN_DIRECTORY).parent
                 recovered_source = discover_h3_finishing_source(
-                    h3_project_root,
+                    h3_source_run_root,
                     preferred_run=RUN_DIRECTORY,
                 )
                 if recovered_source is None:
                     raise RuntimeError(
                         "No in-memory finishing frames or completed persistent H3 video/report "
-                        f"were found in RUN_DIRECTORY or beneath {h3_project_root}."
+                        f"were found in RUN_DIRECTORY or beneath {h3_source_run_root}."
                     )
                 RUN_DIRECTORY = recovered_source["run_directory"]
                 work_root = Path(LOCAL_ASSET_ROOT) / "runs" / RUN_DIRECTORY.name
