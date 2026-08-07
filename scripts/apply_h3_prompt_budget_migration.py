@@ -86,6 +86,9 @@ def replace_settings(current: str, reference: str) -> str:
     migrated = replace_single_setting(
         migrated, reference, "OPENAI_MAX_OUTPUT_TOKENS"
     )
+    migrated = replace_single_setting(
+        migrated, reference, "OPENAI_REASONING_EFFORT"
+    )
     description_settings = bounded_fragment(
         reference,
         "OPENAI_H3_DESCRIPTION_MIN_CHARS =",

@@ -109,7 +109,7 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert 'H3_LORA_TRIGGER' not in code
     assert 'H3_DURATION_SECONDS = 6.0' in code
     assert 'H3_JOB_TIMEOUT_SECONDS = 1800' in code
-    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v2"' in code
+    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v3"' in code
     assert "H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r\"\"\"" in code
     assert "first-frame state -> observable intermediate changes -> progressively" in code
     assert "Match forms primarily by screen region, silhouette, scale, visual role" in code
@@ -128,9 +128,16 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert "class H3ObjectCorrespondence(BaseModel):" in code
     assert "object_correspondences: list[H3ObjectCorrespondence]" in code
     assert "min_length=4, max_length=10" in code
-    assert "OPENAI_MAX_OUTPUT_TOKENS = 8000" in code
+    assert 'OPENAI_REASONING_EFFORT = "high"' in code
+    assert "OPENAI_MAX_OUTPUT_TOKENS = 32768" in code
     assert "OPENAI_H3_DESCRIPTION_MIN_CHARS = 1200" in code
     assert "OPENAI_H3_DESCRIPTION_MAX_CHARS = 2400" in code
+    assert "max_length=OPENAI_H3_DESCRIPTION_MAX_CHARS," in code
+    assert "OPENAI_H3_DESCRIPTION_MAX_CHARS + 200" not in code
+    assert '"output_tokens_including_reasoning": getattr(usage, "output_tokens", None)' in code
+    assert '"reasoning_tokens": getattr(output_details, "reasoning_tokens", None)' in code
+    assert '"openai_reasoning_effort": OPENAI_REASONING_EFFORT' in code
+    assert '"structured_output_schema": "compact_correspondences+complete_description-v3"' in code
     assert 'if response.status != "completed":' in code
     assert "OpenAI H3 description ended mid-sentence" in code
     assert "H3_DISALLOWED_GENERATED_TRANSITION_TERMS = (" in code
@@ -140,6 +147,7 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert '"disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS' in code
     assert 'print("POSITIVE OBJECT CORRESPONDENCE MAP:")' in code
     assert "H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144" in code
+    assert "H3_WORKFLOW_PATCH_VERSION = 7" in code
     assert "H3_IMAGE_CONDITIONING_TOKEN_RESERVE = 8192" in code
     assert "H3_PROMPT_MAX_UTF8_BYTES = 8192" in code
     assert "from comfy.text_encoders.minimax import MiniMaxH3Tokenizer" not in code

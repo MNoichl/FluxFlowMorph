@@ -102,7 +102,7 @@ cells = [
         H3_FPS = 24
         H3_JOB_TIMEOUT_SECONDS = 1800
         H3_ENFORCE_SOURCE_ASPECT = True
-        H3_WORKFLOW_PATCH_VERSION = 6
+        H3_WORKFLOW_PATCH_VERSION = 7
         # The released Qwen3-VL encoder advertises 262,144 positions. Keep generated six-second
         # prompts far below that and reserve ample space for both image-conditioning blocks.
         H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144
@@ -130,7 +130,7 @@ cells = [
 
         # Image-aware OpenAI prompt writer. This text is intentionally editable and printed by
         # the prompt cell. It follows MiniMax's official FL2VA guide and h3-prompt-writing skill.
-        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v2"
+        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v3"
         H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r"""
         You write a structured motion plan for MiniMax H3-Base-FL2VA using two endpoint images.
         Inspect Picture 1, Picture 2, and both authored image prompts. The images are the visual
@@ -172,8 +172,10 @@ cells = [
           characters, actions, typography, dialogue, sound, production commentary, or unreferenced
           objects. Do not name or propose cinematic transition effects.
         - RIJKSOIL is an upstream FLUX LoRA trigger and must never appear in the H3 plan.
-        - Keep this field between 1,200 and 2,400 characters, including [Shot 1]. Finish every
-          thought and end with a complete sentence; never stop at a character or token boundary.
+        - Aim for 1,600-2,200 characters and never exceed 2,400 characters, including [Shot 1].
+          Finish every thought and end with a complete sentence; never stop at a character or
+          token boundary. The object-correspondence fields are separate and do not count toward
+          this description's character range.
 
         Return only the requested structured fields. Do not include the FL2VA alignment header,
         field labels, overall_soundscape, or non_diegetic_music; fixed code adds those exactly.
@@ -191,9 +193,10 @@ cells = [
         # OpenAI is used only to plan prompts; H3 itself remains local and open-weight.
         OPENAI_KEY_FILENAME = "openaiapikey.txt"
         OPENAI_MODEL = "gpt-5.6"
-        OPENAI_REASONING_EFFORT = "medium"
+        OPENAI_REASONING_EFFORT = "high"
         OPENAI_IMAGE_DETAIL = "original"
-        OPENAI_MAX_OUTPUT_TOKENS = 8000
+        # Shared ceiling for hidden reasoning plus the complete structured JSON response.
+        OPENAI_MAX_OUTPUT_TOKENS = 32768
         OPENAI_MAX_ATTEMPTS = 3
         OPENAI_H3_DESCRIPTION_MIN_CHARS = 1200
         OPENAI_H3_DESCRIPTION_MAX_CHARS = 2400
@@ -720,7 +723,7 @@ cells = [
             )
             integrated_multimodal_description: str = Field(
                 min_length=OPENAI_H3_DESCRIPTION_MIN_CHARS,
-                max_length=OPENAI_H3_DESCRIPTION_MAX_CHARS + 200,
+                max_length=OPENAI_H3_DESCRIPTION_MAX_CHARS,
             )
 
         def validate_openai_motion_proposal(proposal):
@@ -829,8 +832,9 @@ cells = [
                             "type": "input_text",
                             "text": (
                                 "The previous draft was rejected. Return a complete, compact JSON "
-                                "proposal now: 4-10 grouped correspondences, a 1,200-2,400-character "
-                                "integrated description, and a fully punctuated final sentence."
+                                "proposal now: 4-10 grouped correspondences, an integrated "
+                                "description aiming for 1,600-2,200 characters and never exceeding "
+                                "2,400, and a fully punctuated final sentence."
                             ),
                         })
                     response = OPENAI_CLIENT.responses.parse(
@@ -846,6 +850,18 @@ cells = [
                         ],
                         text_format=H3MotionProposal,
                     )
+                    usage = getattr(response, "usage", None)
+                    output_details = getattr(usage, "output_tokens_details", None)
+                    print({
+                        "openai_pair": pair["index"],
+                        "attempt": attempt,
+                        "status": response.status,
+                        "reasoning_effort": OPENAI_REASONING_EFFORT,
+                        "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+                        "input_tokens": getattr(usage, "input_tokens", None),
+                        "output_tokens_including_reasoning": getattr(usage, "output_tokens", None),
+                        "reasoning_tokens": getattr(output_details, "reasoning_tokens", None),
+                    })
                     if response.status != "completed":
                         reason = getattr(getattr(response, "incomplete_details", None), "reason", None)
                         raise RuntimeError(
@@ -875,8 +891,9 @@ cells = [
                 "prompt_guide_version": H3_OPENAI_PROMPT_GUIDE_VERSION,
                 "prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
                 "disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS,
-                "structured_output_schema": "compact_correspondences+complete_description-v2",
+                "structured_output_schema": "compact_correspondences+complete_description-v3",
                 "openai_max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+                "openai_reasoning_effort": OPENAI_REASONING_EFFORT,
                 "description_min_chars": OPENAI_H3_DESCRIPTION_MIN_CHARS,
                 "description_max_chars": OPENAI_H3_DESCRIPTION_MAX_CHARS,
                 "h3_prompt_max_utf8_bytes": H3_PROMPT_MAX_UTF8_BYTES,
