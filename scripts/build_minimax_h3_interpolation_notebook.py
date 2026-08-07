@@ -102,7 +102,7 @@ cells = [
         H3_FPS = 24
         H3_JOB_TIMEOUT_SECONDS = 1800
         H3_ENFORCE_SOURCE_ASPECT = True
-        H3_WORKFLOW_PATCH_VERSION = 9
+        H3_WORKFLOW_PATCH_VERSION = 10
         # The released Qwen3-VL encoder advertises 262,144 positions. Keep generated six-second
         # prompts far below that and reserve ample space for both image-conditioning blocks.
         H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144
@@ -122,15 +122,18 @@ cells = [
             "A static locked-off view begins exactly at #Image1. Every visible object remains "
             "opaque, solid, and sharply resolved while its existing boundary continuously "
             "deforms along the shortest path into the corresponding object at the same screen "
-            "position in #Image2. Shape, material, texture, and color change through small "
-            "coherent updates until the view settles exactly at #Image2."
+            "position in #Image2. Each mapped form stays on-screen with a visibly nonzero area; "
+            "nothing enters or exits through a frame edge, shrinks away, or is replaced by a "
+            "separate form enlarging elsewhere. Shape, material, texture, color, and any required "
+            "size change proceed through small coherent updates until the view settles exactly "
+            "at #Image2."
         )
         H3_PROMPT_MODE = "openai_per_pair"  # Or "template" for no prompt-planning API call.
         H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE = False
 
         # Image-aware OpenAI prompt writer. This text is intentionally editable and printed by
         # the prompt cell. It follows MiniMax's official FL2VA guide and h3-prompt-writing skill.
-        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v5"
+        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v6"
         H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r"""
         You write a structured motion plan for MiniMax H3-Base-FL2VA using two endpoint images.
         Inspect Picture 1, Picture 2, and both authored image prompts. The images are the visual
@@ -154,6 +157,15 @@ cells = [
           continuous geometric/material changes connecting them. If counts differ, describe opaque
           neighboring forms joining through a continuous neck or one solid form separating through
           a growing indentation; retain continuous surfaces throughout.
+        - Every target must develop from the existing on-screen boundary of its mapped source.
+          Preserve a visibly nonzero region of each mapping throughout the shot. Never solve a
+          correspondence by shrinking a source to nothing while an independent target enlarges,
+          and never use a frame edge to introduce, remove, replace, or exchange a visible form.
+          A form already cropped by an endpoint may remain cropped, but its crop changes gradually
+          and only as needed to reach the other endpoint.
+        - Size differences are handled by gradual boundary deformation of the same mapped form,
+          centered on a persistent overlap region. Keep centroids local, avoid crossing mappings,
+          and do not use scale-only disappearance/reappearance as a path between objects.
         - Keep the quantity of visible material, negative-space layout, and object density on a
           gradual endpoint-to-endpoint path. A sparse pair remains sparse.
         - Consolidate related forms into 4-10 concise mappings. Each source and target statement
@@ -166,6 +178,8 @@ cells = [
           composition, boundary motion, material, texture, color, lighting, or spatial relation.
         - Existing boundaries advance through small local increments. Forms remain opaque, solid,
           spatially attached, sharply resolved, and continuously identifiable with their mapping.
+          Every mapped form remains on-screen with a visibly nonzero footprint from first frame to
+          last frame; each target emerges from its source's continuously deforming boundary.
         - Surface detail develops only toward detail actually visible in Picture 2.
         - End by settling into the exact silhouettes, positions, spacing, lighting, and composition
           of Picture 2.

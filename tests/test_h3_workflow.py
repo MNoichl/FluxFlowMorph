@@ -263,6 +263,9 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     assert "Picture 2 (from Shot 1) aligns with the 6.00-second mark" in prompt
     assert "Static Shot with unchanged framing, lens, and viewpoint" in prompt
     assert "opaque, solid, continuous, and sharply resolved" in prompt
+    assert "stays on-screen with a visibly nonzero area" in prompt
+    assert "nothing enters or exits through a frame edge" in prompt
+    assert "replaced by a separate form enlarging elsewhere" in prompt
     assert "progressively narrow" in prompt
     assert "overall_soundscape: N/A" in prompt
     assert strip_h3_source_only_tokens("RIJKSOIL, a sparse scene") == "a sparse scene"
@@ -281,6 +284,9 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     assert "Picture 1" in openai_prompt and "Picture 2" in openai_prompt
     assert "small local silhouette and surface adjustments" in openai_prompt
     assert "Static Shot with unchanged framing, lens, and viewpoint" in openai_prompt
+    assert "stays on-screen with a visibly nonzero area" in openai_prompt
+    assert "Nothing enters or exits through a frame edge" in openai_prompt
+    assert "every target develops from its mapped source's existing boundary" in openai_prompt
     assert "overall_soundscape: N/A" in openai_prompt
 
 

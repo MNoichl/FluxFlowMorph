@@ -15,8 +15,10 @@ DEFAULT_H3_MOTION_DIRECTIVE = (
     "A static locked-off view begins exactly at #Image1. Every visible object remains opaque, "
     "solid, and sharply resolved while its existing boundary continuously deforms along the "
     "shortest path into the corresponding object at the same screen position in #Image2. "
-    "Shape, material, texture, and color change through small coherent updates until the view "
-    "settles exactly at #Image2."
+    "Each mapped form stays on-screen with a visibly nonzero area; nothing enters or exits "
+    "through a frame edge, shrinks away, or is replaced by a separate form enlarging elsewhere. "
+    "Shape, material, texture, color, and any required size change proceed through small coherent "
+    "updates until the view settles exactly at #Image2."
 )
 
 SOURCE_ONLY_PROMPT_TOKENS = ("RIJKSOIL",)
@@ -300,7 +302,11 @@ def wrap_openai_h3_motion(
         "form remains opaque, solid, continuous, and sharply resolved while its boundary advances "
         "through small local changes toward the mapped target form. The background, tabletop, "
         "illumination, object density, and negative space evolve continuously. All remaining "
-        "differences progressively narrow until the exact Picture 2 composition is reached.\n\n"
+        "differences progressively narrow until the exact Picture 2 composition is reached. Each "
+        "mapped form stays on-screen with a visibly nonzero area throughout. Nothing enters or "
+        "exits through a frame edge, shrinks away, or gets replaced by a separate form enlarging "
+        "elsewhere; every target develops from its mapped source's existing boundary, with gradual "
+        "size change only when the endpoints require it.\n\n"
         "overall_soundscape: N/A\n"
         "non_diegetic_music: N/A"
     )

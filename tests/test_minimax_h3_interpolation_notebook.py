@@ -109,7 +109,7 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert 'H3_LORA_TRIGGER' not in code
     assert 'H3_DURATION_SECONDS = 6.0' in code
     assert 'H3_JOB_TIMEOUT_SECONDS = 1800' in code
-    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v5"' in code
+    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v6"' in code
     assert "H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r\"\"\"" in code
     assert "first-frame state -> observable intermediate changes -> progressively" in code
     assert "Match forms primarily by screen region, silhouette, scale, visual role" in code
@@ -138,6 +138,11 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert "if len(description) < OPENAI_H3_DESCRIPTION_MIN_CHARS:" in code
     assert "(?:[.!?]|\\u2026)[\\)\\]" in code
     assert "include the exact phrase Static Shot" in code
+    assert "Each mapped form stays on-screen with a visibly nonzero area" in code
+    assert "Preserve a visibly nonzero region of each mapping" in code
+    assert "correspondence by shrinking a source to nothing" in code
+    assert "never use a frame edge to introduce, remove, replace, or exchange" in code
+    assert "centered on a persistent overlap region" in code
     assert '"output_tokens_including_reasoning": getattr(usage, "output_tokens", None)' in code
     assert '"reasoning_tokens": getattr(output_details, "reasoning_tokens", None)' in code
     assert 'f"The previous draft was rejected for this exact reason: {last_error}. "' in code
@@ -154,7 +159,7 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert '"disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS' in code
     assert 'print("POSITIVE OBJECT CORRESPONDENCE MAP:")' in code
     assert "H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144" in code
-    assert "H3_WORKFLOW_PATCH_VERSION = 9" in code
+    assert "H3_WORKFLOW_PATCH_VERSION = 10" in code
     assert "H3_IMAGE_CONDITIONING_TOKEN_RESERVE = 8192" in code
     assert "H3_PROMPT_MAX_UTF8_BYTES = 8192" in code
     assert "from comfy.text_encoders.minimax import MiniMaxH3Tokenizer" not in code
