@@ -185,11 +185,12 @@ def test_border_flicker_correction_is_post_rife_anchor_safe_and_center_safe() ->
     assert "Correct low-frequency flicker only at the image margins" in markdown
 
 
-def test_flashvsr_v11_is_final_streamed_cyclic_four_x_stage() -> None:
+def test_flashvsr_v11_is_final_streamed_cyclic_net_two_x_stage() -> None:
     code = code_source()
     markdown = markdown_source()
     assert "RUN_FLASHVSR_UPSCALE = True" in code
     assert "FLASHVSR_SCALE = 4.0" in code
+    assert "FLASHVSR_INPUT_RESIZE_FACTOR = 0.5" in code
     assert 'FLASHVSR_MODEL_REPOSITORY = "JunhaoZhuang/FlashVSR-v1.1"' in code
     assert 'FLASHVSR_MODEL_REVISION = "ad1aceeac60dbd288e51acea9096b821a8703bee"' in code
     assert 'FLASHVSR_REPOSITORY_URL = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git"' in code
@@ -201,7 +202,10 @@ def test_flashvsr_v11_is_final_streamed_cyclic_four_x_stage() -> None:
     assert "release_h3()" in code
     assert "FLASHVSR_DELETE_LOCAL_H3_CHECKPOINTS_IF_DISK_LOW" in code
     assert '"flashvsr_v11_streaming_runner.py"' in code
-    assert '"minimax_h3_flashvsr_v1_1_x4_cyclic_loop.mp4"' in code
+    assert 'f"minimax_h3_flashvsr_v1_1_net_x{flashvsr_net_scale_token}_cyclic_loop.mp4"' in code
+    assert '"--input-resize-factor", str(FLASHVSR_INPUT_RESIZE_FACTOR)' in code
+    assert '"input_resize_factor": FLASHVSR_INPUT_RESIZE_FACTOR' in code
+    assert '"net_scale": flashvsr_net_scale' in code
     assert "FLASHVSR_FINAL_VIDEO_PATH\n    if FLASHVSR_FINAL_VIDEO_PATH is not None" in code
     assert '"flashvsr_frame_count_preserved"' in code
     assert 'globals().get("BORDER_STABILIZED_PATHS")' in code

@@ -40,6 +40,22 @@ def compute_target_dimensions(
     return target_width, target_height
 
 
+def compute_model_input_dimensions(
+    width: int,
+    height: int,
+    input_resize_factor: float,
+) -> tuple[int, int]:
+    """Return the low-resolution canvas presented to the trained 4x model."""
+    if width <= 0 or height <= 0:
+        raise ValueError("Input dimensions must be positive")
+    if not 0 < input_resize_factor <= 1:
+        raise ValueError("Input resize factor must be in (0, 1]")
+    return (
+        max(1, int(round(width * input_resize_factor))),
+        max(1, int(round(height * input_resize_factor))),
+    )
+
+
 @dataclass(frozen=True)
 class CyclicStreamPlan:
     source_indices: tuple[int, ...]
@@ -89,16 +105,28 @@ def load_manifest(path: Path) -> tuple[list[Path], float]:
 class LazyCyclicFrames:
     """Load only the temporal slices currently requested by the streaming model."""
 
-    def __init__(self, paths: Sequence[Path], plan: CyclicStreamPlan, scale: float):
+    def __init__(
+        self,
+        paths: Sequence[Path],
+        plan: CyclicStreamPlan,
+        scale: float,
+        input_resize_factor: float = 1.0,
+    ):
         from PIL import Image
 
         self.paths = tuple(paths)
         self.plan = plan
         self.scale = float(scale)
+        self.input_resize_factor = float(input_resize_factor)
         with Image.open(self.paths[0]) as image:
             self.input_width, self.input_height = image.size
+        self.model_input_width, self.model_input_height = compute_model_input_dimensions(
+            self.input_width,
+            self.input_height,
+            self.input_resize_factor,
+        )
         self.width, self.height = compute_target_dimensions(
-            self.input_width, self.input_height, self.scale
+            self.model_input_width, self.model_input_height, self.scale
         )
 
     def _load(self, source_index: int):
@@ -108,6 +136,16 @@ class LazyCyclicFrames:
 
         with Image.open(self.paths[source_index]) as opened:
             image = opened.convert("RGB")
+            if image.size != (self.input_width, self.input_height):
+                raise ValueError(
+                    f"Frame {self.paths[source_index]} has size {image.size}; expected "
+                    f"{(self.input_width, self.input_height)}"
+                )
+            if self.input_resize_factor != 1.0:
+                image = image.resize(
+                    (self.model_input_width, self.model_input_height),
+                    Image.Resampling.LANCZOS,
+                )
             scaled_width = int(round(image.width * self.scale))
             scaled_height = int(round(image.height * self.scale))
             image = image.resize((scaled_width, scaled_height), Image.Resampling.BICUBIC)
@@ -426,6 +464,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--ffmpeg", required=True)
     parser.add_argument("--scale", type=float, default=4.0)
+    parser.add_argument("--input-resize-factor", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sparse-ratio", type=float, default=2.0)
     parser.add_argument("--local-range", type=int, choices=(9, 11), default=11)
@@ -450,7 +489,12 @@ def main() -> None:
             raise FileNotFoundError(args.weights / filename)
     paths, fps = load_manifest(args.manifest)
     plan = build_cyclic_stream_plan(len(paths), warmup_frames=args.warmup_frames)
-    source = LazyCyclicFrames(paths, plan, args.scale)
+    source = LazyCyclicFrames(
+        paths,
+        plan,
+        args.scale,
+        input_resize_factor=args.input_resize_factor,
+    )
 
     import torch
 
@@ -464,7 +508,13 @@ def main() -> None:
                 "pipeline_frames": plan.pipeline_frames,
                 "cyclic_warmup_frames": plan.trim_start,
                 "input_resolution": [source.input_width, source.input_height],
+                "model_input_resolution": [
+                    source.model_input_width,
+                    source.model_input_height,
+                ],
                 "output_resolution": [source.width, source.height],
+                "input_resize_factor": source.input_resize_factor,
+                "net_scale": args.scale * source.input_resize_factor,
                 "fps": fps,
             },
             indent=2,
@@ -513,7 +563,10 @@ def main() -> None:
         "fps": fps,
         "duration_seconds": writer.count / fps,
         "scale_requested": args.scale,
+        "input_resize_factor": source.input_resize_factor,
+        "net_scale": args.scale * source.input_resize_factor,
         "input_resolution": [source.input_width, source.input_height],
+        "model_input_resolution": [source.model_input_width, source.model_input_height],
         "output_resolution": [source.width, source.height],
         "sparse_ratio": args.sparse_ratio,
         "local_range": args.local_range,

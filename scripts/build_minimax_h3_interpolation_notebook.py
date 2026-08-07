@@ -156,6 +156,7 @@ cells = [
         # Sparse Sage path is streamed after H3/RIFE have released the GPU.
         RUN_FLASHVSR_UPSCALE = True
         FLASHVSR_SCALE = 4.0  # The official project strongly recommends its trained 4x setting.
+        FLASHVSR_INPUT_RESIZE_FACTOR = 0.5  # 768 -> 384 model input -> 1536 output (net 2x).
         FLASHVSR_REPOSITORY_URL = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git"
         FLASHVSR_REPOSITORY_REVISION = "f7f55bae4c0e82b18b190d4b62a977995507c51c"
         FLASHVSR_ROOT = "/content/ComfyUI-FlashVSR-Stable"
@@ -1419,14 +1420,18 @@ cells = [
     markdown(
         "h3-24-flashvsr-heading",
         r"""
-        ## 13. Optionally finish with streamed FlashVSR v1.1 4x super-resolution
+        ## 13. Optionally finish with streamed FlashVSR v1.1 net-2x super-resolution
 
         This is a spatial finishing stage: it keeps the same frames, frame rate, duration, and
-        cyclic ordering. The default 4x setting turns the 768x768 loop into 3072x3072. It uses
-        the v1.1 tiny-long model through the pinned ComfyUI-FlashVSR-Stable implementation. Its
-        bundled Triton Sparse Sage backend preserves the fork's locality mask without compiling
-        Block-Sparse Attention. This is a deliberate practical tradeoff: it is not bit-identical
-        to the official LCSA CUDA backend, but it avoids a 20–40 minute native build on Colab.
+        cyclic ordering. FlashVSR stays in its recommended trained 4x mode, but the default first
+        reduces each 768x768 source frame to a 384x384 model input. The result is 1536x1536: net
+        2x output with roughly one quarter of the spatial activation load of direct 3072x3072.
+        Set `FLASHVSR_INPUT_RESIZE_FACTOR=1.0` only to opt into net 4x on a larger-memory setup.
+        The v1.1 tiny-long model runs through the pinned ComfyUI-FlashVSR-Stable implementation.
+        Its bundled Triton Sparse Sage backend preserves the fork's locality mask without
+        compiling Block-Sparse Attention. This is a deliberate practical tradeoff: it is not
+        bit-identical to the official LCSA CUDA backend, but it avoids a 20–40 minute native
+        build on Colab.
 
         The stock long-video example retains the complete 4x input and output in memory. This
         notebook instead lazy-loads temporal slices and streams decoded RGB frames directly to
@@ -1457,6 +1462,11 @@ cells = [
             import imageio_ffmpeg
             import inspect
             from IPython.display import Markdown, Video, display
+
+            if not 0 < FLASHVSR_INPUT_RESIZE_FACTOR <= 1:
+                raise ValueError("FLASHVSR_INPUT_RESIZE_FACTOR must be in (0, 1]")
+            flashvsr_net_scale = FLASHVSR_SCALE * FLASHVSR_INPUT_RESIZE_FACTOR
+            flashvsr_net_scale_token = f"{flashvsr_net_scale:g}".replace(".", "p")
 
             def flashvsr_sha256_file(path):
                 digest = hashlib.sha256()
@@ -1597,6 +1607,8 @@ cells = [
                 "source_frame_count": len(flashvsr_input_paths),
                 "fps": flashvsr_input_fps,
                 "scale": FLASHVSR_SCALE,
+                "input_resize_factor": FLASHVSR_INPUT_RESIZE_FACTOR,
+                "net_scale": flashvsr_net_scale,
                 "seed": FLASHVSR_SEED,
                 "sparse_ratio": FLASHVSR_SPARSE_RATIO,
                 "local_range": FLASHVSR_LOCAL_RANGE,
@@ -1612,7 +1624,8 @@ cells = [
             }
             flashvsr_fingerprint_value = flashvsr_fingerprint(flashvsr_payload)
             FLASHVSR_FINAL_VIDEO_PATH = (
-                RUN_DIRECTORY / "video" / "minimax_h3_flashvsr_v1_1_x4_cyclic_loop.mp4"
+                RUN_DIRECTORY / "video"
+                / f"minimax_h3_flashvsr_v1_1_net_x{flashvsr_net_scale_token}_cyclic_loop.mp4"
             )
             flashvsr_report_path = RUN_DIRECTORY / "metadata" / "flashvsr_v1_1_report.json"
             reuse_flashvsr = False
@@ -1887,6 +1900,7 @@ cells = [
                     "--report", str(flashvsr_report_path),
                     "--ffmpeg", str(ffmpeg),
                     "--scale", str(FLASHVSR_SCALE),
+                    "--input-resize-factor", str(FLASHVSR_INPUT_RESIZE_FACTOR),
                     "--seed", str(FLASHVSR_SEED),
                     "--sparse-ratio", str(FLASHVSR_SPARSE_RATIO),
                     "--local-range", str(FLASHVSR_LOCAL_RANGE),
@@ -1920,7 +1934,9 @@ cells = [
             if not FLASHVSR_FINAL_VIDEO_PATH.is_file() or FLASHVSR_FINAL_VIDEO_PATH.stat().st_size == 0:
                 raise RuntimeError("FlashVSR output is missing or empty")
             print(json.dumps(FLASHVSR_REPORT, indent=2))
-            display(Markdown("### FlashVSR Stable + Sparse Sage v1.1 4x cyclic loop"))
+            display(Markdown(
+                f"### FlashVSR Stable + Sparse Sage v1.1 net-{flashvsr_net_scale:g}x cyclic loop"
+            ))
             display(Video(
                 str(FLASHVSR_FINAL_VIDEO_PATH), embed=False, width=DISPLAY_VIDEO_WIDTH,
                 html_attributes="controls loop muted playsinline",
@@ -1987,6 +2003,12 @@ cells = [
             ),
             "flashvsr_scale": (
                 FLASHVSR_REPORT.get("scale_requested") if FLASHVSR_REPORT is not None else None
+            ),
+            "flashvsr_input_resize_factor": (
+                FLASHVSR_REPORT.get("input_resize_factor") if FLASHVSR_REPORT is not None else None
+            ),
+            "flashvsr_net_scale": (
+                FLASHVSR_REPORT.get("net_scale") if FLASHVSR_REPORT is not None else None
             ),
             "flashvsr_output_resolution": (
                 FLASHVSR_REPORT.get("output_resolution") if FLASHVSR_REPORT is not None else None

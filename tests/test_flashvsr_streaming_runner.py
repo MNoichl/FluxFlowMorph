@@ -14,6 +14,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 build_cyclic_stream_plan = MODULE.build_cyclic_stream_plan
+compute_model_input_dimensions = MODULE.compute_model_input_dimensions
 compute_target_dimensions = MODULE.compute_target_dimensions
 
 
@@ -22,6 +23,14 @@ def test_four_x_dimensions_follow_flashvsr_grid() -> None:
     assert compute_target_dimensions(1408, 768, 4.0) == (5632, 3072)
     with pytest.raises(ValueError):
         compute_target_dimensions(100, 100, 1.0)
+
+
+def test_half_size_model_input_keeps_trained_four_x_path_for_net_two_x() -> None:
+    model_width, model_height = compute_model_input_dimensions(768, 768, 0.5)
+    assert (model_width, model_height) == (384, 384)
+    assert compute_target_dimensions(model_width, model_height, 4.0) == (1536, 1536)
+    with pytest.raises(ValueError):
+        compute_model_input_dimensions(768, 768, 0.0)
 
 
 def test_cyclic_stream_plan_warms_from_tail_and_preserves_exact_cycle() -> None:
