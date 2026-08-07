@@ -322,6 +322,7 @@ cells = [
         from flowmorph_klein.h3_workflow import (
             build_default_h3_prompt,
             cyclic_h3_pairs,
+            discover_h3_finishing_source,
             h3_ui_workflow_controls,
             load_h3_anchor_records,
             patch_h3_ui_workflow,
@@ -1554,50 +1555,34 @@ cells = [
                 flashvsr_input_video = H3_NATIVE_VIDEO_PATH
                 flashvsr_input_stage = "native_h3"
             else:
-                persistent_candidates = (
-                    (
-                        "border_stabilized",
-                        RUN_DIRECTORY / "video" / "minimax_h3_border_stabilized_cyclic_loop.mp4",
-                        RUN_DIRECTORY / "metadata" / "border_stabilization.json",
-                        "frame_count",
-                    ),
-                    (
-                        "rife_x2",
-                        RUN_DIRECTORY / "video" / "minimax_h3_rife_x2_cyclic_loop.mp4",
-                        RUN_DIRECTORY / "metadata" / "rife_report.json",
-                        "output_unique_frames",
-                    ),
-                    (
-                        "native_h3",
-                        RUN_DIRECTORY / "video" / "minimax_h3_native_cyclic_loop.mp4",
-                        RUN_DIRECTORY / "metadata" / "native_assembly.json",
-                        "native_unique_frames",
-                    ),
+                h3_project_root = drive_base / H3_PROJECT_NAME
+                recovered_source = discover_h3_finishing_source(
+                    h3_project_root,
+                    preferred_run=RUN_DIRECTORY,
                 )
-                for stage, video_path, metadata_path, count_key in persistent_candidates:
-                    if not video_path.is_file() or not metadata_path.is_file():
-                        continue
-                    try:
-                        source_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                        recovered_count = int(source_metadata[count_key])
-                        recovered_fps = float(source_metadata["fps"])
-                    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-                        continue
-                    if recovered_count > 0 and recovered_fps > 0:
-                        flashvsr_input_paths = [
-                            work_root / "source_frames_not_loaded" / f"{index:07d}.png"
-                            for index in range(recovered_count)
-                        ]
-                        flashvsr_input_fps = recovered_fps
-                        flashvsr_input_video = video_path
-                        flashvsr_input_stage = stage
-                        print(f"Recovered persistent FlashVSR source metadata from {metadata_path.name}")
-                        break
-                else:
+                if recovered_source is None:
                     raise RuntimeError(
                         "No in-memory finishing frames or completed persistent H3 video/report "
-                        "were found in RUN_DIRECTORY."
+                        f"were found in RUN_DIRECTORY or beneath {h3_project_root}."
                     )
+                RUN_DIRECTORY = recovered_source["run_directory"]
+                work_root = Path(LOCAL_ASSET_ROOT) / "runs" / RUN_DIRECTORY.name
+                flashvsr_input_paths = [
+                    work_root / "source_frames_not_loaded" / f"{index:07d}.png"
+                    for index in range(recovered_source["frame_count"])
+                ]
+                flashvsr_input_fps = recovered_source["fps"]
+                flashvsr_input_video = recovered_source["video"]
+                flashvsr_input_stage = recovered_source["stage"]
+                print({
+                    "flashvsr_recovery_selection": recovered_source["selection"],
+                    "recovered_h3_run": str(RUN_DIRECTORY),
+                    "source_stage": flashvsr_input_stage,
+                    "source_video": str(flashvsr_input_video),
+                    "source_metadata": str(recovered_source["metadata"]),
+                    "source_frame_count": len(flashvsr_input_paths),
+                    "fps": flashvsr_input_fps,
+                })
             if not flashvsr_input_paths:
                 raise RuntimeError("FlashVSR input frame sequence is empty")
             if flashvsr_input_video is None or not Path(flashvsr_input_video).is_file():

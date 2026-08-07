@@ -19,6 +19,91 @@ DEFAULT_H3_MOTION_DIRECTIVE = (
 
 SOURCE_ONLY_PROMPT_TOKENS = ("RIJKSOIL",)
 
+H3_FINISHING_SOURCES = (
+    (
+        "border_stabilized",
+        "minimax_h3_border_stabilized_cyclic_loop.mp4",
+        "border_stabilization.json",
+        "frame_count",
+    ),
+    (
+        "rife_x2",
+        "minimax_h3_rife_x2_cyclic_loop.mp4",
+        "rife_report.json",
+        "output_unique_frames",
+    ),
+    (
+        "native_h3",
+        "minimax_h3_native_cyclic_loop.mp4",
+        "native_assembly.json",
+        "native_unique_frames",
+    ),
+)
+
+
+def recover_h3_finishing_source(run_directory: str | Path) -> dict[str, Any] | None:
+    """Recover the best completed finishing video persisted inside one H3 run."""
+
+    run_path = Path(run_directory).expanduser()
+    for stage, video_name, report_name, count_key in H3_FINISHING_SOURCES:
+        video_path = run_path / "video" / video_name
+        metadata_path = run_path / "metadata" / report_name
+        try:
+            video_stat = video_path.stat()
+            metadata_stat = metadata_path.stat()
+            if video_stat.st_size <= 0 or metadata_stat.st_size <= 0:
+                continue
+            source_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            frame_count = int(source_metadata[count_key])
+            fps = float(source_metadata["fps"])
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+        if frame_count > 0 and fps > 0:
+            return {
+                "run_directory": run_path,
+                "stage": stage,
+                "video": video_path,
+                "metadata": metadata_path,
+                "frame_count": frame_count,
+                "fps": fps,
+                "freshness": max(video_stat.st_mtime, metadata_stat.st_mtime),
+            }
+    return None
+
+
+def discover_h3_finishing_source(
+    project_root: str | Path,
+    *,
+    preferred_run: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """Use the current H3 run when complete, otherwise find the newest completed run."""
+
+    if preferred_run is not None:
+        recovered = recover_h3_finishing_source(preferred_run)
+        if recovered is not None:
+            return {**recovered, "selection": "current_run"}
+
+    root = Path(project_root).expanduser()
+    if not root.is_dir():
+        return None
+    run_directories: set[Path] = set()
+    for _, _, report_name, _ in H3_FINISHING_SOURCES:
+        run_directories.update(
+            report_path.parent.parent for report_path in root.rglob(f"metadata/{report_name}")
+        )
+    recovered_sources = [
+        recovered
+        for run_directory in run_directories
+        if (recovered := recover_h3_finishing_source(run_directory)) is not None
+    ]
+    if not recovered_sources:
+        return None
+    newest = max(
+        recovered_sources,
+        key=lambda recovered: (recovered["freshness"], str(recovered["run_directory"])),
+    )
+    return {**newest, "selection": "latest_completed_h3_run"}
+
 
 def strip_h3_source_only_tokens(
     text: str,

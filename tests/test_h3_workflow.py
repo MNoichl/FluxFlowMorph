@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,9 +11,11 @@ from flowmorph_klein.h3_workflow import (
     DEFAULT_H3_MOTION_DIRECTIVE,
     build_default_h3_prompt,
     cyclic_h3_pairs,
+    discover_h3_finishing_source,
     h3_ui_workflow_controls,
     load_h3_anchor_records,
     patch_h3_ui_workflow,
+    recover_h3_finishing_source,
     snap_h3_frame_count,
     stable_h3_fingerprint,
     strip_h3_source_only_tokens,
@@ -45,6 +48,43 @@ def _write_source_run(root: Path) -> Path:
         json.dumps({"complete": True, "records": records}), encoding="utf-8"
     )
     return source
+
+
+def _write_finishing_source(
+    run_directory: Path,
+    *,
+    stage: str,
+    timestamp: float,
+) -> None:
+    specifications = {
+        "border_stabilized": (
+            "minimax_h3_border_stabilized_cyclic_loop.mp4",
+            "border_stabilization.json",
+            "frame_count",
+        ),
+        "rife_x2": (
+            "minimax_h3_rife_x2_cyclic_loop.mp4",
+            "rife_report.json",
+            "output_unique_frames",
+        ),
+        "native_h3": (
+            "minimax_h3_native_cyclic_loop.mp4",
+            "native_assembly.json",
+            "native_unique_frames",
+        ),
+    }
+    video_name, report_name, count_key = specifications[stage]
+    video_path = run_directory / "video" / video_name
+    report_path = run_directory / "metadata" / report_name
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"finished-video")
+    report_path.write_text(
+        json.dumps({count_key: 120, "fps": 48.0}),
+        encoding="utf-8",
+    )
+    os.utime(video_path, (timestamp, timestamp))
+    os.utime(report_path, (timestamp, timestamp))
 
 
 def _minimal_official_template() -> dict:
@@ -165,6 +205,48 @@ def test_h3_frame_grid_and_canvas_contract() -> None:
         validate_h3_canvas(750, 768)
     with pytest.raises(ValueError, match="capped"):
         validate_h3_canvas(1024, 1024)
+
+
+def test_finishing_source_recovery_prefers_current_then_newest_completed_run(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "minimax_h3_interpolations"
+    empty_current_run = project_root / "source_a" / "h3_fl2va_0003"
+    empty_current_run.mkdir(parents=True)
+    older_run = project_root / "source_a" / "h3_fl2va_0001"
+    newest_run = project_root / "source_b" / "h3_fl2va_0002"
+    _write_finishing_source(older_run, stage="border_stabilized", timestamp=10.0)
+    _write_finishing_source(newest_run, stage="native_h3", timestamp=20.0)
+
+    recovered = discover_h3_finishing_source(project_root, preferred_run=empty_current_run)
+    assert recovered is not None
+    assert recovered["selection"] == "latest_completed_h3_run"
+    assert recovered["run_directory"] == newest_run
+    assert recovered["stage"] == "native_h3"
+    assert recovered["frame_count"] == 120
+    assert recovered["fps"] == 48.0
+
+    _write_finishing_source(empty_current_run, stage="rife_x2", timestamp=5.0)
+    recovered = discover_h3_finishing_source(project_root, preferred_run=empty_current_run)
+    assert recovered is not None
+    assert recovered["selection"] == "current_run"
+    assert recovered["run_directory"] == empty_current_run
+    assert recovered["stage"] == "rife_x2"
+
+
+def test_finishing_source_recovery_rejects_incomplete_persistent_artifacts(
+    tmp_path: Path,
+) -> None:
+    run_directory = tmp_path / "run"
+    report_path = run_directory / "metadata" / "native_assembly.json"
+    video_path = run_directory / "video" / "minimax_h3_native_cyclic_loop.mp4"
+    report_path.parent.mkdir(parents=True)
+    video_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps({"native_unique_frames": 120, "fps": 24}), encoding="utf-8")
+    video_path.write_bytes(b"")
+
+    assert recover_h3_finishing_source(run_directory) is None
+    assert discover_h3_finishing_source(tmp_path, preferred_run=run_directory) is None
 
 
 def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -> None:
