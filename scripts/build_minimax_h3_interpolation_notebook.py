@@ -102,7 +102,7 @@ cells = [
         H3_FPS = 24
         H3_JOB_TIMEOUT_SECONDS = 1800
         H3_ENFORCE_SOURCE_ASPECT = True
-        H3_WORKFLOW_PATCH_VERSION = 8
+        H3_WORKFLOW_PATCH_VERSION = 9
         # The released Qwen3-VL encoder advertises 262,144 positions. Keep generated six-second
         # prompts far below that and reserve ample space for both image-conditioning blocks.
         H3_TEXT_ENCODER_CONTEXT_TOKENS = 262144
@@ -130,7 +130,7 @@ cells = [
 
         # Image-aware OpenAI prompt writer. This text is intentionally editable and printed by
         # the prompt cell. It follows MiniMax's official FL2VA guide and h3-prompt-writing skill.
-        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v4"
+        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v5"
         H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r"""
         You write a structured motion plan for MiniMax H3-Base-FL2VA using two endpoint images.
         Inspect Picture 1, Picture 2, and both authored image prompts. The images are the visual
@@ -160,7 +160,8 @@ cells = [
           should be one compact sentence; each path should use no more than three sentences.
 
         Write integrated_multimodal_description as production-ready natural English:
-        - Begin with [Shot 1], the observed visual style, and the exact Picture 1 composition.
+        - Begin with [Shot 1], include the exact phrase Static Shot, then state the observed
+          visual style and the exact Picture 1 composition.
         - Describe early, middle, and late observable states. Every sentence must concern visible
           composition, boundary motion, material, texture, color, lighting, or spatial relation.
         - Existing boundaries advance through small local increments. Forms remain opaque, solid,
@@ -721,18 +722,23 @@ cells = [
             object_correspondences: list[H3ObjectCorrespondence] = Field(
                 min_length=4, max_length=10
             )
-            integrated_multimodal_description: str = Field(
-                min_length=OPENAI_H3_DESCRIPTION_MIN_CHARS,
-            )
+            # Length is app-validated after generation. A schema-level minLength masks the
+            # closing quote until the boundary and can make constrained decoding stop mid-clause.
+            integrated_multimodal_description: str
 
         def validate_openai_motion_proposal(proposal):
             description = proposal.integrated_multimodal_description.strip()
+            if len(description) < OPENAI_H3_DESCRIPTION_MIN_CHARS:
+                raise ValueError(
+                    f"OpenAI H3 description has {len(description)} characters; expand it to "
+                    f"at least {OPENAI_H3_DESCRIPTION_MIN_CHARS} and finish every sentence"
+                )
             if len(description) > OPENAI_H3_DESCRIPTION_MAX_CHARS:
                 raise ValueError(
                     f"OpenAI H3 description has {len(description)} characters; compact it to "
                     f"at most {OPENAI_H3_DESCRIPTION_MAX_CHARS}"
                 )
-            if not re.search(r'[.!?]["\u201d\u2019\']?$', description):
+            if not re.search(r'(?:[.!?]|\u2026)[\)\]"\u201d\u2019\']*$', description):
                 raise ValueError("OpenAI H3 description ended mid-sentence")
             required = ("[Shot 1]", "Picture 1", "Picture 2", "Static Shot")
             missing = [item for item in required if item.lower() not in description.lower()]
@@ -899,7 +905,7 @@ cells = [
                 "prompt_guide_version": H3_OPENAI_PROMPT_GUIDE_VERSION,
                 "prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
                 "disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS,
-                "structured_output_schema": "compact-correspondences+app-validated-description-v4",
+                "structured_output_schema": "compact-correspondences+app-validated-description-v5",
                 "openai_max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
                 "openai_reasoning_effort": OPENAI_REASONING_EFFORT,
                 "description_min_chars": OPENAI_H3_DESCRIPTION_MIN_CHARS,
