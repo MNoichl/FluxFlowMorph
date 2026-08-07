@@ -73,7 +73,7 @@ cells = [
         MOUNT_DRIVE = True
         DRIVE_PROJECT_BASE = "/content/drive/MyDrive/FluxFlowMorphArt"
         SOURCE_PROJECT_NAME = "science_path_prompt_only_chimera"
-        SOURCE_RUN_DIRECTORY = None  # Or an exact completed FLUX/CHIMERA run directory.
+        SOURCE_RUN_DIRECTORY = None  # Or a completed run basename/full Drive path.
         H3_PROJECT_NAME = "minimax_h3_interpolations"
         RESUME_H3_RUN_DIRECTORY = None
         LOCAL_ASSET_ROOT = "/content/minimax_h3_interpolation"
@@ -378,12 +378,13 @@ cells = [
         drive_base = Path(DRIVE_PROJECT_BASE)
         drive_base.mkdir(parents=True, exist_ok=True)
 
+        source_project_directory = drive_base / SOURCE_PROJECT_NAME
+
         def completed_source_runs():
-            project_directory = drive_base / SOURCE_PROJECT_NAME
-            if not project_directory.is_dir():
+            if not source_project_directory.is_dir():
                 return []
             candidates = []
-            for candidate in project_directory.iterdir():
+            for candidate in source_project_directory.iterdir():
                 manifest = candidate / "metadata" / "base_manifest.json"
                 if not candidate.is_dir() or not manifest.is_file():
                     continue
@@ -404,10 +405,29 @@ cells = [
             SOURCE_RUN = available_sources[-1]
             source_selection = "latest_completed"
         else:
-            SOURCE_RUN = Path(SOURCE_RUN_DIRECTORY).expanduser()
-            source_selection = "explicit"
-        if not SOURCE_RUN.is_dir():
-            raise FileNotFoundError(f"SOURCE_RUN_DIRECTORY does not exist: {SOURCE_RUN}")
+            configured_source = Path(SOURCE_RUN_DIRECTORY).expanduser()
+            source_candidates = (
+                [configured_source]
+                if configured_source.is_absolute()
+                else [
+                    source_project_directory / configured_source,
+                    drive_base / configured_source,
+                    configured_source,
+                ]
+            )
+            SOURCE_RUN = next(
+                (candidate for candidate in source_candidates if candidate.is_dir()),
+                None,
+            )
+            if SOURCE_RUN is None:
+                searched = "\n  - ".join(str(candidate) for candidate in source_candidates)
+                raise FileNotFoundError(
+                    "SOURCE_RUN_DIRECTORY did not resolve to a directory. Searched:\n  - "
+                    + searched
+                )
+            source_selection = (
+                "explicit_path" if configured_source.is_absolute() else "explicit_basename"
+            )
 
         def reserve_h3_run(parent, source_name):
             source_root = Path(parent) / H3_PROJECT_NAME / source_name

@@ -89,8 +89,11 @@ def test_h3_is_open_weight_local_fl2va_not_minimax_api() -> None:
 
 def test_source_run_images_and_authored_prompts_are_loaded_read_only() -> None:
     code = code_source()
-    assert 'SOURCE_RUN_DIRECTORY = None' in code
+    assert "SOURCE_RUN_DIRECTORY =" in code
     assert 'SOURCE_PROJECT_NAME = "science_path_prompt_only_chimera"' in code
+    assert "source_project_directory = drive_base / SOURCE_PROJECT_NAME" in code
+    assert "source_project_directory / configured_source" in code
+    assert '"explicit_basename"' in code
     assert "BASE_RECORDS = load_h3_anchor_records(SOURCE_RUN)" in code
     assert "H3_PAIRS = cyclic_h3_pairs(BASE_RECORDS)" in code
     assert 'record["authored_prompt"]' in code
