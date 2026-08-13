@@ -1419,6 +1419,7 @@ cells = [
     code(
         "h3-15-server",
         r'''
+        import threading
         import urllib.error
 
         H3_SERVER_URL = f"http://127.0.0.1:{H3_COMFY_PORT}"
@@ -1431,45 +1432,86 @@ cells = [
             except (OSError, urllib.error.URLError):
                 return False
 
-        H3_COMFY_PROCESS = globals().get("H3_COMFY_PROCESS")
-        if not comfy_server_ready():
-            launch = [
-                sys.executable, str(Path(COMFYUI_ROOT) / "main.py"),
-                "--listen", "127.0.0.1", "--port", str(H3_COMFY_PORT),
-                "--disable-api-nodes", "--disable-metadata", "--preview-method", "none",
-                "--reserve-vram", "3" if gpu_vram_gib >= 35 else "2",
-            ]
-            if gpu_vram_gib < 35:
-                launch.append("--lowvram")
-            environment = dict(os.environ)
-            environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-            COMFY_LOG_HANDLE = COMFY_LOG_PATH.open("w", encoding="utf-8")
-            H3_COMFY_PROCESS = subprocess.Popen(
-                launch,
-                cwd=COMFYUI_ROOT,
-                stdout=COMFY_LOG_HANDLE,
-                stderr=subprocess.STDOUT,
-                env=environment,
-                text=True,
-            )
-            deadline = time.time() + 600
-            while time.time() < deadline and not comfy_server_ready():
-                if H3_COMFY_PROCESS.poll() is not None:
-                    tail = COMFY_LOG_PATH.read_text(encoding="utf-8", errors="replace")[-10000:]
-                    raise RuntimeError("ComfyUI exited during startup:\n" + tail)
-                time.sleep(3)
-            if not comfy_server_ready():
-                raise TimeoutError("ComfyUI did not become ready within ten minutes")
-            server_source = "started_now"
-        else:
-            server_source = "already_running"
-        print({
-            "server": H3_SERVER_URL,
-            "source": server_source,
-            "pid": getattr(H3_COMFY_PROCESS, "pid", None),
-            "log": str(COMFY_LOG_PATH),
-            "memory_mode": "lowvram" if gpu_vram_gib < 35 else "dynamic_default",
-        })
+        H3_SERVER_START_LOCK = globals().get(
+            "H3_SERVER_START_LOCK", threading.Lock()
+        )
+
+        def ensure_h3_server_running():
+            global H3_COMFY_PROCESS, COMFY_LOG_HANDLE
+            with H3_SERVER_START_LOCK:
+                H3_COMFY_PROCESS = globals().get("H3_COMFY_PROCESS")
+                if comfy_server_ready():
+                    server_source = "already_running"
+                else:
+                    if (
+                        H3_COMFY_PROCESS is not None
+                        and H3_COMFY_PROCESS.poll() is None
+                    ):
+                        startup_grace_deadline = time.time() + 60
+                        while (
+                            time.time() < startup_grace_deadline
+                            and not comfy_server_ready()
+                            and H3_COMFY_PROCESS.poll() is None
+                        ):
+                            time.sleep(2)
+                    if not comfy_server_ready():
+                        if (
+                            H3_COMFY_PROCESS is not None
+                            and H3_COMFY_PROCESS.poll() is None
+                        ):
+                            tail = COMFY_LOG_PATH.read_text(
+                                encoding="utf-8", errors="replace"
+                            )[-10000:]
+                            raise RuntimeError(
+                                "ComfyUI process is alive but its local server is not ready.\n"
+                                + tail
+                            )
+                        launch = [
+                            sys.executable, str(Path(COMFYUI_ROOT) / "main.py"),
+                            "--listen", "127.0.0.1", "--port", str(H3_COMFY_PORT),
+                            "--disable-api-nodes", "--disable-metadata",
+                            "--preview-method", "none",
+                            "--reserve-vram", "3" if gpu_vram_gib >= 35 else "2",
+                        ]
+                        if gpu_vram_gib < 35:
+                            launch.append("--lowvram")
+                        environment = dict(os.environ)
+                        environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+                        COMFY_LOG_HANDLE = COMFY_LOG_PATH.open("w", encoding="utf-8")
+                        H3_COMFY_PROCESS = subprocess.Popen(
+                            launch,
+                            cwd=COMFYUI_ROOT,
+                            stdout=COMFY_LOG_HANDLE,
+                            stderr=subprocess.STDOUT,
+                            env=environment,
+                            text=True,
+                        )
+                        deadline = time.time() + 600
+                        while time.time() < deadline and not comfy_server_ready():
+                            if H3_COMFY_PROCESS.poll() is not None:
+                                tail = COMFY_LOG_PATH.read_text(
+                                    encoding="utf-8", errors="replace"
+                                )[-10000:]
+                                raise RuntimeError("ComfyUI exited during startup:\n" + tail)
+                            time.sleep(3)
+                        if not comfy_server_ready():
+                            raise TimeoutError(
+                                "ComfyUI did not become ready within ten minutes"
+                            )
+                        server_source = "restarted_automatically"
+                state = {
+                    "server": H3_SERVER_URL,
+                    "source": server_source,
+                    "pid": getattr(H3_COMFY_PROCESS, "pid", None),
+                    "log": str(COMFY_LOG_PATH),
+                    "memory_mode": (
+                        "lowvram" if gpu_vram_gib < 35 else "dynamic_default"
+                    ),
+                }
+                print(state)
+                return state
+
+        H3_SERVER_STATE = ensure_h3_server_running()
         '''
     ),
     markdown(
@@ -1600,6 +1642,7 @@ cells = [
             return process.wait(), "".join(output_lines)
 
         def render_h3_attempt(pair, render_attempt, clip_path, pair_slug):
+            ensure_h3_server_running()
             payload = h3_job_payload(pair, render_attempt=render_attempt)
             first_name = f"h3_{RUN_DIRECTORY.name}_{pair['index']:04d}_first.png"
             last_name = f"h3_{RUN_DIRECTORY.name}_{pair['index']:04d}_last.png"

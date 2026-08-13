@@ -262,6 +262,11 @@ def test_official_workflow_is_pinned_patched_and_pair_clips_resume() -> None:
     assert "first_image=first_name" in code
     assert "last_image=last_name" in code
     assert '"--workflow", str(workflow_path), "--wait"' in code
+    assert "def ensure_h3_server_running():" in code
+    assert "H3_SERVER_STATE = ensure_h3_server_running()" in code
+    assert "def render_h3_attempt(" in code
+    assert "ensure_h3_server_running()" in code
+    assert 'server_source = "restarted_automatically"' in code
     assert "H3_REUSE_EXISTING_CLIPS = True" in code
     assert 'prior.get("fingerprint") == fingerprint' in code
     assert "def resolve_h3_base_seed_for_render():" in code
@@ -271,6 +276,39 @@ def test_official_workflow_is_pinned_patched_and_pair_clips_resume() -> None:
     assert "as_completed(future_to_pair)" in code
     assert "executor.submit(render_h3_pair, pair)" in code
     assert "H3_CLIP_RECORDS.update(render_h3_pairs_parallel(H3_PAIRS))" in code
+
+
+def test_live_h3_server_preflight_reuses_a_ready_server() -> None:
+    tree = ast.parse(cell_source("h3-15-server"))
+    ensure = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "ensure_h3_server_running"
+    )
+
+    class Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    namespace = {
+        "H3_SERVER_START_LOCK": Lock(),
+        "H3_COMFY_PROCESS": None,
+        "comfy_server_ready": lambda: True,
+        "H3_SERVER_URL": "http://127.0.0.1:8188",
+        "COMFY_LOG_PATH": Path("/tmp/not-read.log"),
+        "gpu_vram_gib": 40,
+    }
+    exec(
+        compile(ast.Module(body=[ensure], type_ignores=[]), "server-preflight", "exec"),
+        namespace,
+    )
+    state = namespace["ensure_h3_server_running"]()
+    assert state["source"] == "already_running"
+    assert state["server"] == "http://127.0.0.1:8188"
 
 
 def test_render_recovers_seed_after_out_of_order_settings_rerun(tmp_path: Path) -> None:

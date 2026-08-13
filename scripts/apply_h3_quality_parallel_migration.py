@@ -19,6 +19,7 @@ BUILDER_PATH = ROOT / "scripts" / "build_minimax_h3_interpolation_notebook.py"
 ALLOWED_CELL_IDS = {
     "h3-02-settings",
     "h3-07-drive",
+    "h3-15-server",
     "h3-16-render-heading",
     "h3-17-render",
     "h3-22-audit-heading",
@@ -124,6 +125,9 @@ def main() -> None:
     current_cells["h3-16-render-heading"]["source"] = deepcopy(
         reference_cells["h3-16-render-heading"]["source"]
     )
+    current_cells["h3-15-server"]["source"] = deepcopy(
+        reference_cells["h3-15-server"]["source"]
+    )
 
     render = current_cells["h3-17-render"]
     render_source = source(render)
@@ -138,6 +142,12 @@ def main() -> None:
         source(reference_cells["h3-17-render"]),
         current_start_marker="def safe_name(value):",
         end_marker="def stream_command(command):",
+    )
+    render_source = replace_bounded_fragment(
+        render_source,
+        source(reference_cells["h3-17-render"]),
+        current_start_marker="def render_h3_attempt(",
+        end_marker="def h3_quality_sample_fractions():",
     )
     render_source = replace_bounded_fragment(
         render_source,
