@@ -1940,10 +1940,18 @@ cells = [
             })
             return report
 
-        def archive_rejected_h3_clip(pair, clip_path, render_attempt):
-            rejected_directory = (
-                RUN_DIRECTORY / H3_REJECTED_VIDEO_SUBDIRECTORY
+        def h3_rejected_video_directory():
+            subdirectory = globals().get(
+                "H3_REJECTED_VIDEO_SUBDIRECTORY", "rejected_videos"
             )
+            if not subdirectory or Path(subdirectory).name != subdirectory:
+                raise ValueError(
+                    "H3_REJECTED_VIDEO_SUBDIRECTORY must be one directory name"
+                )
+            return RUN_DIRECTORY / subdirectory
+
+        def archive_rejected_h3_clip(pair, clip_path, render_attempt):
+            rejected_directory = h3_rejected_video_directory()
             rejected_directory.mkdir(parents=True, exist_ok=True)
             rejected_path = rejected_directory / (
                 f"pair_{pair['index']:04d}_{safe_name(pair['pair_id'])}"
@@ -3089,7 +3097,7 @@ cells = [
             "h3_max_parallel_transition_calls": H3_MAX_PARALLEL_TRANSITION_CALLS,
             "h3_max_render_attempts_per_execution": H3_MAX_RENDER_ATTEMPTS,
             "h3_rejected_video_directory": str(
-                RUN_DIRECTORY / H3_REJECTED_VIDEO_SUBDIRECTORY
+                h3_rejected_video_directory()
             ),
             "quality_gate_version": (
                 H3_QUALITY_GATE_VERSION if RUN_OPENAI_H3_QUALITY_GATE else None

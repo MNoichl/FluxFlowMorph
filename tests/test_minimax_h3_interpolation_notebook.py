@@ -326,7 +326,9 @@ def test_post_render_quality_gate_is_permissive_resumable_and_parallel() -> None
     assert '"low_confidence_retry_overridden"' in code
     assert "archive_rejected_h3_clip(" in code
     assert 'H3_REJECTED_VIDEO_SUBDIRECTORY = "rejected_videos"' in code
-    assert "RUN_DIRECTORY / H3_REJECTED_VIDEO_SUBDIRECTORY" in code
+    assert "def h3_rejected_video_directory():" in code
+    assert '"H3_REJECTED_VIDEO_SUBDIRECTORY", "rejected_videos"' in code
+    assert "rejected_directory = h3_rejected_video_directory()" in code
     assert 'f"_attempt_{render_attempt:02d}_rejected.mp4"' in code
     assert "Saved rejected H3 video" in code
     assert "H3_QUALITY_NEGATIVE_EXAMPLES = (" in code
@@ -358,20 +360,25 @@ def test_post_render_quality_gate_is_permissive_resumable_and_parallel() -> None
 
 def test_rejected_h3_clips_are_archived_in_dedicated_folder(tmp_path: Path) -> None:
     tree = ast.parse(cell_source("h3-17-render"))
-    archive = next(
+    selected = [
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "archive_rejected_h3_clip"
-    )
+        and node.name in {
+            "h3_rejected_video_directory",
+            "archive_rejected_h3_clip",
+        }
+    ]
     namespace = {
         "RUN_DIRECTORY": tmp_path,
-        "H3_REJECTED_VIDEO_SUBDIRECTORY": "rejected_videos",
+        # Deliberately omit the new setting to simulate a refreshed render cell
+        # running in an older live kernel.
         "shutil": shutil,
+        "Path": Path,
         "safe_name": lambda value: str(value).replace("/", "_"),
     }
     exec(
-        compile(ast.Module(body=[archive], type_ignores=[]), "rejected-archive", "exec"),
+        compile(ast.Module(body=selected, type_ignores=[]), "rejected-archive", "exec"),
         namespace,
     )
     source_clip = tmp_path / "candidate.mp4"
