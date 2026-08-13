@@ -119,6 +119,7 @@ cells = [
         H3_ONE_PAIR_TEST_INDEX = 0
         RUN_FULL_H3_SEQUENCE = True
         H3_KEEP_NATIVE_AUDIO_IN_PAIR_CLIPS = True  # Final loop is silent for clean joins.
+        H3_REJECTED_VIDEO_SUBDIRECTORY = "rejected_videos"
         # Submit ordinary ComfyUI transition requests concurrently. ComfyUI schedules the actual
         # GPU work; this bounds outstanding calls without using any asynchronous Batch API.
         H3_MAX_PARALLEL_TRANSITION_CALLS = 3
@@ -666,7 +667,16 @@ cells = [
                 raise FileNotFoundError(f"RESUME_H3_RUN_DIRECTORY does not exist: {RUN_DIRECTORY}")
         else:
             RUN_DIRECTORY = reserve_h3_run(drive_base, SOURCE_RUN.name)
-        for child in ("clips", "metadata", "prompts", "workflows", "video", "diagnostics"):
+        if (
+            not H3_REJECTED_VIDEO_SUBDIRECTORY
+            or Path(H3_REJECTED_VIDEO_SUBDIRECTORY).name
+            != H3_REJECTED_VIDEO_SUBDIRECTORY
+        ):
+            raise ValueError("H3_REJECTED_VIDEO_SUBDIRECTORY must be one directory name")
+        for child in (
+            "clips", "metadata", "prompts", "workflows", "video", "diagnostics",
+            H3_REJECTED_VIDEO_SUBDIRECTORY,
+        ):
             (RUN_DIRECTORY / child).mkdir(parents=True, exist_ok=True)
         Path(HF_CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -1475,8 +1485,8 @@ cells = [
         independent exponential backoff and resumable state. ComfyUI schedules the actual work on
         the available GPU. After every clip, OpenAI compares 1-3 ordered interior frames with both
         endpoints and two known-bad visual calibration examples. Only a high-confidence catastrophic
-        verdict triggers a new-seed retry; rejected clips and judgment evidence remain in
-        `diagnostics`.
+        verdict triggers a new-seed retry. Rejected MP4s are retained in `rejected_videos`;
+        sampled frames and judgment evidence remain in `diagnostics`.
         """,
     ),
     code(
@@ -1931,11 +1941,16 @@ cells = [
             return report
 
         def archive_rejected_h3_clip(pair, clip_path, render_attempt):
-            rejected_path = (
-                RUN_DIRECTORY / "diagnostics" /
-                f"rejected_pair_{pair['index']:04d}_attempt_{render_attempt:02d}.mp4"
+            rejected_directory = (
+                RUN_DIRECTORY / H3_REJECTED_VIDEO_SUBDIRECTORY
+            )
+            rejected_directory.mkdir(parents=True, exist_ok=True)
+            rejected_path = rejected_directory / (
+                f"pair_{pair['index']:04d}_{safe_name(pair['pair_id'])}"
+                f"_attempt_{render_attempt:02d}_rejected.mp4"
             )
             shutil.copy2(clip_path, rejected_path)
+            print(f"Saved rejected H3 video: {rejected_path}")
             return rejected_path
 
         def render_h3_pair(pair):
@@ -3073,6 +3088,9 @@ cells = [
             ),
             "h3_max_parallel_transition_calls": H3_MAX_PARALLEL_TRANSITION_CALLS,
             "h3_max_render_attempts_per_execution": H3_MAX_RENDER_ATTEMPTS,
+            "h3_rejected_video_directory": str(
+                RUN_DIRECTORY / H3_REJECTED_VIDEO_SUBDIRECTORY
+            ),
             "quality_gate_version": (
                 H3_QUALITY_GATE_VERSION if RUN_OPENAI_H3_QUALITY_GATE else None
             ),

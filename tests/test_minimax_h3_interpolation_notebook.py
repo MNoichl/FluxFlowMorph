@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import shutil
 import types
 from pathlib import Path
 
@@ -324,6 +325,10 @@ def test_post_render_quality_gate_is_permissive_resumable_and_parallel() -> None
     assert "judgment.confidence >= H3_QUALITY_RETRY_MIN_CONFIDENCE" in code
     assert '"low_confidence_retry_overridden"' in code
     assert "archive_rejected_h3_clip(" in code
+    assert 'H3_REJECTED_VIDEO_SUBDIRECTORY = "rejected_videos"' in code
+    assert "RUN_DIRECTORY / H3_REJECTED_VIDEO_SUBDIRECTORY" in code
+    assert 'f"_attempt_{render_attempt:02d}_rejected.mp4"' in code
+    assert "Saved rejected H3 video" in code
     assert "H3_QUALITY_NEGATIVE_EXAMPLES = (" in code
     assert "retry_example_transition_front.jpg" in code
     assert "retry_example_detached_collage.jpg" in code
@@ -348,6 +353,36 @@ def test_post_render_quality_gate_is_permissive_resumable_and_parallel() -> None
     assert "high-confidence" in markdown
     assert "catastrophic" in markdown
     assert "verdict" in markdown
+    assert "Rejected MP4s are retained in `rejected_videos`" in markdown
+
+
+def test_rejected_h3_clips_are_archived_in_dedicated_folder(tmp_path: Path) -> None:
+    tree = ast.parse(cell_source("h3-17-render"))
+    archive = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "archive_rejected_h3_clip"
+    )
+    namespace = {
+        "RUN_DIRECTORY": tmp_path,
+        "H3_REJECTED_VIDEO_SUBDIRECTORY": "rejected_videos",
+        "shutil": shutil,
+        "safe_name": lambda value: str(value).replace("/", "_"),
+    }
+    exec(
+        compile(ast.Module(body=[archive], type_ignores=[]), "rejected-archive", "exec"),
+        namespace,
+    )
+    source_clip = tmp_path / "candidate.mp4"
+    source_clip.write_bytes(b"candidate-video")
+    rejected_path = namespace["archive_rejected_h3_clip"](
+        {"index": 2, "pair_id": "left/right"}, source_clip, 3
+    )
+    assert rejected_path == (
+        tmp_path / "rejected_videos" / "pair_0002_left_right_attempt_03_rejected.mp4"
+    )
+    assert rejected_path.read_bytes() == b"candidate-video"
 
 
 def test_quality_gate_negative_example_assets_are_packaged() -> None:
@@ -485,6 +520,7 @@ def test_final_audit_records_quality_gate_and_retry_outcomes() -> None:
     assert '"quality_gate_all_pairs_passed"' in code
     assert '"quality_gate_rejected_attempt_count"' in code
     assert '"h3_max_parallel_transition_calls": H3_MAX_PARALLEL_TRANSITION_CALLS' in code
+    assert '"h3_rejected_video_directory"' in code
     assert '"quality_gate_negative_examples"' in code
 
 

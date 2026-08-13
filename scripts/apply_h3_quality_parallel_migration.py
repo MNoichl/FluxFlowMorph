@@ -98,8 +98,16 @@ def main() -> None:
     settings["source"] = settings_source.splitlines(keepends=True)
 
     drive = current_cells["h3-07-drive"]
+    drive_source = source(drive)
+    drive_source = replace_bounded_fragment(
+        drive_source,
+        source(reference_cells["h3-07-drive"]),
+        current_start_marker='for child in ("clips",',
+        end_marker="Path(HF_CACHE_DIR).mkdir",
+        reference_start_marker="if (\n    not H3_REJECTED_VIDEO_SUBDIRECTORY",
+    )
     drive["source"] = replace_bounded_fragment(
-        source(drive),
+        drive_source,
         source(reference_cells["h3-07-drive"]),
         current_start_marker="OPENAI_CLIENT = None",
         end_marker=(
@@ -131,6 +139,12 @@ def main() -> None:
         source(reference_cells["h3-17-render"]),
         current_start_marker="def h3_quality_sample_fractions():",
         end_marker="def archive_rejected_h3_clip(",
+    )
+    render_source = replace_bounded_fragment(
+        render_source,
+        source(reference_cells["h3-17-render"]),
+        current_start_marker="def archive_rejected_h3_clip(",
+        end_marker="def render_h3_pair(",
     )
     current_parallel_start = (
         "def render_h3_pairs_parallel(pairs):"
