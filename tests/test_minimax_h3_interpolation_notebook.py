@@ -263,10 +263,41 @@ def test_official_workflow_is_pinned_patched_and_pair_clips_resume() -> None:
     assert '"--workflow", str(workflow_path), "--wait"' in code
     assert "H3_REUSE_EXISTING_CLIPS = True" in code
     assert 'prior.get("fingerprint") == fingerprint' in code
+    assert "def resolve_h3_base_seed_for_render():" in code
+    assert "base_seed = resolve_h3_base_seed_for_render()" in code
+    assert '"seed": (base_seed + pair["index"] + retry_offset)' in code
     assert "ThreadPoolExecutor(" in code
     assert "as_completed(future_to_pair)" in code
     assert "executor.submit(render_h3_pair, pair)" in code
     assert "H3_CLIP_RECORDS.update(render_h3_pairs_parallel(H3_PAIRS))" in code
+
+
+def test_render_recovers_seed_after_out_of_order_settings_rerun(tmp_path: Path) -> None:
+    metadata_directory = tmp_path / "metadata"
+    metadata_directory.mkdir()
+    persisted_seed = 1_234_567_890
+    (metadata_directory / "run_seed.json").write_text(
+        json.dumps({"h3_base_seed": persisted_seed}), encoding="utf-8"
+    )
+    tree = ast.parse(cell_source("h3-17-render"))
+    resolver = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "resolve_h3_base_seed_for_render"
+    )
+    namespace = {
+        "H3_BASE_SEED": None,
+        "RUN_DIRECTORY": tmp_path,
+        "Path": Path,
+        "json": json,
+    }
+    exec(
+        compile(ast.Module(body=[resolver], type_ignores=[]), "seed-recovery", "exec"),
+        namespace,
+    )
+    assert namespace["resolve_h3_base_seed_for_render"]() == persisted_seed
+    assert namespace["H3_BASE_SEED"] == persisted_seed
 
 
 def test_post_render_quality_gate_is_permissive_resumable_and_parallel() -> None:

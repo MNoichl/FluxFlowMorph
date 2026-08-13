@@ -1511,12 +1511,41 @@ cells = [
         def safe_name(value):
             return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._") or "pair"
 
+        def resolve_h3_base_seed_for_render():
+            global H3_BASE_SEED
+            if H3_BASE_SEED is None:
+                active_run_directory = globals().get("RUN_DIRECTORY")
+                if active_run_directory is None:
+                    raise RuntimeError(
+                        "H3_BASE_SEED is unset and no active run exists; rerun the Drive/run cell."
+                    )
+                persisted_seed_path = (
+                    Path(active_run_directory) / "metadata" / "run_seed.json"
+                )
+                if not persisted_seed_path.is_file():
+                    raise RuntimeError(
+                        "H3_BASE_SEED is unset and the active run has no persisted seed: "
+                        f"{persisted_seed_path}. Rerun the Drive/run cell."
+                    )
+                H3_BASE_SEED = int(json.loads(
+                    persisted_seed_path.read_text(encoding="utf-8")
+                )["h3_base_seed"])
+                print(
+                    "Recovered H3_BASE_SEED from the active run after an out-of-order "
+                    "settings-cell rerun."
+                )
+            resolved_seed = int(H3_BASE_SEED)
+            if not 0 <= resolved_seed < 2**63:
+                raise ValueError("H3_BASE_SEED is outside [0, 2**63)")
+            return resolved_seed
+
         def h3_job_payload(pair, render_attempt=1):
             prompt_plan = PAIR_PROMPT_PLANS[pair["index"]]
             prompt_byte_count = h3_prompt_utf8_bytes(prompt_plan["h3_prompt"])
             if prompt_plan.get("h3_prompt_utf8_bytes") != prompt_byte_count:
                 raise RuntimeError("H3 prompt changed after its UTF-8 byte audit")
             retry_offset = (max(1, int(render_attempt)) - 1) * H3_RETRY_SEED_STRIDE
+            base_seed = resolve_h3_base_seed_for_render()
             return {
                 "pair_id": pair["pair_id"],
                 "left_uid": pair["left"]["uid"],
@@ -1527,7 +1556,7 @@ cells = [
                 "h3_prompt": prompt_plan["h3_prompt"],
                 "h3_prompt_utf8_bytes": prompt_byte_count,
                 "h3_prompt_max_utf8_bytes": H3_PROMPT_MAX_UTF8_BYTES,
-                "seed": (H3_BASE_SEED + pair["index"] + retry_offset) % (2**63 - 1),
+                "seed": (base_seed + pair["index"] + retry_offset) % (2**63 - 1),
                 "width": H3_WIDTH,
                 "height": H3_HEIGHT,
                 "duration_seconds": H3_DURATION_SECONDS,

@@ -123,6 +123,12 @@ def main() -> None:
     render_source = replace_bounded_fragment(
         render_source,
         source(reference_cells["h3-17-render"]),
+        current_start_marker="def safe_name(value):",
+        end_marker="def stream_command(command):",
+    )
+    render_source = replace_bounded_fragment(
+        render_source,
+        source(reference_cells["h3-17-render"]),
         current_start_marker="def h3_quality_sample_fractions():",
         end_marker="def archive_rejected_h3_clip(",
     )
