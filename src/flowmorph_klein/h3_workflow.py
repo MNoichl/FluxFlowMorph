@@ -12,16 +12,22 @@ from typing import Any
 
 
 DEFAULT_H3_MOTION_DIRECTIVE = (
-    "A static locked-off view begins exactly at #Image1. Every visible object remains opaque, "
-    "solid, and sharply resolved while its existing boundary continuously deforms along the "
-    "shortest path into the corresponding object at the same screen position in #Image2. "
-    "Each mapped form stays on-screen with a visibly nonzero area; nothing enters or exits "
-    "through a frame edge, shrinks away, or is replaced by a separate form enlarging elsewhere. "
-    "Shape, material, texture, color, and any required size change proceed through small coherent "
-    "updates until the view settles exactly at #Image2."
+    "A static locked-off view begins exactly at #Image1 and ends exactly at #Image2. From the "
+    "first moment, several spatially separated mapped forms across the left, center, and right "
+    "change concurrently. Their silhouettes, materials, textures, colors, and sizes develop "
+    "locally at overlapping but slightly offset rates, so every intermediate frame contains "
+    "active transformations throughout the composition. Where the endpoints support it, "
+    "backgrounds and broad color, shadow, or texture fields blend, flow, drift, spread, and "
+    "reshape through opaque painterly intermediates. Each mapped object remains solid, sharply "
+    "resolved, and continuously identifiable. The whole frame remains one integrated scene "
+    "rather than intact endpoint regions separated by a moving boundary."
 )
 
 SOURCE_ONLY_PROMPT_TOKENS = ("RIJKSOIL",)
+
+H3_ANCHOR_IMAGE_SUFFIXES = frozenset(
+    {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+)
 
 H3_FINISHING_SOURCES = (
     (
@@ -129,7 +135,57 @@ def _record_prompt(record: Mapping[str, Any]) -> str:
         value = record.get(field)
         if isinstance(value, str) and value.strip():
             return " ".join(value.split())
-    raise ValueError(f"anchor {record.get('uid', '<unknown>')!r} has no saved prompt")
+    return ""
+
+
+def _natural_relative_path_key(
+    path: Path,
+    root: Path,
+) -> tuple[tuple[tuple[int, int | str], ...], str]:
+    relative = path.relative_to(root).as_posix()
+    return (
+        tuple(
+            (0, int(token)) if token.isdigit() else (1, token.casefold())
+            for token in re.split(r"(\d+)", relative)
+            if token
+        ),
+        relative,
+    )
+
+
+def _directory_anchor_records(source_directory: Path) -> list[dict[str, Any]]:
+    image_paths = sorted(
+        (
+            path
+            for path in source_directory.rglob("*")
+            if path.is_file()
+            and path.suffix.casefold() in H3_ANCHOR_IMAGE_SUFFIXES
+            and not any(part.startswith(".") for part in path.relative_to(source_directory).parts)
+        ),
+        key=lambda path: _natural_relative_path_key(path, source_directory),
+    )
+    if len(image_paths) < 2:
+        suffixes = ", ".join(sorted(H3_ANCHOR_IMAGE_SUFFIXES))
+        raise ValueError(
+            f"source directory needs at least two supported images; found {len(image_paths)} "
+            f"under {source_directory} (supported extensions: {suffixes})"
+        )
+
+    records: list[dict[str, Any]] = []
+    for index, image_path in enumerate(image_paths):
+        stem_slug = re.sub(r"[^a-z0-9]+", "_", image_path.stem.casefold()).strip("_")
+        uid = f"image_{index:04d}_{stem_slug[:48] or 'anchor'}"
+        records.append(
+            {
+                "uid": uid,
+                "source_index": index,
+                "path": image_path.relative_to(source_directory).as_posix(),
+                "resolved_path": str(image_path.resolve()),
+                "authored_prompt": "",
+                "source_kind": "directory_scan",
+            }
+        )
+    return records
 
 
 def _resolve_record_path(record: Mapping[str, Any], source_run: Path) -> Path:
@@ -163,12 +219,19 @@ def _resolve_record_path(record: Mapping[str, Any], source_run: Path) -> Path:
 
 
 def load_h3_anchor_records(source_run: str | Path, *, require_complete: bool = True) -> list[dict[str, Any]]:
-    """Load ordered FLUX anchors and their authored prompts from ``base_manifest.json``."""
+    """Load ordered H3 anchors from a manifest or a plain image directory.
+
+    A ``metadata/base_manifest.json`` remains authoritative when present. If it is
+    absent, supported images anywhere below ``source_run`` are natural-sorted by
+    relative path and receive stable synthetic IDs plus blank optional prompts.
+    """
 
     run_directory = Path(source_run).expanduser()
+    if not run_directory.is_dir():
+        raise FileNotFoundError(f"source directory does not exist: {run_directory}")
     manifest_path = run_directory / "metadata" / "base_manifest.json"
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"source run has no base manifest: {manifest_path}")
+        return _directory_anchor_records(run_directory)
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
@@ -195,6 +258,7 @@ def load_h3_anchor_records(source_run: str | Path, *, require_complete: bool = T
         record["source_index"] = index
         record["authored_prompt"] = _record_prompt(raw_record)
         record["resolved_path"] = str(_resolve_record_path(raw_record, run_directory))
+        record["source_kind"] = "base_manifest"
         records.append(record)
     return records
 
@@ -254,16 +318,19 @@ def build_default_h3_prompt(
         raise ValueError("motion directive must refer to both #Image1 and #Image2")
     return (
         "How the reference pictures align with the target video — "
-        f"Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; "
-        f"Picture 2 (from Shot 1) aligns with the {float(duration_seconds):.2f}-second "
+        f"<Picture 1> (from [Shot 1]) aligns with the 0.00-second mark of the target video; "
+        f"<Picture 2> (from [Shot 1]) aligns with the {float(duration_seconds):.2f}-second "
         "mark of the target video.\n\n"
         "integrated_multimodal_description: [Shot 1] "
         f"{clean_directive} The camera holds a Static Shot with unchanged framing, lens, and "
-        "viewpoint. Every visible form remains opaque, solid, continuous, and sharply resolved "
-        "while its boundary advances through small local changes toward its corresponding form. "
-        "The background, tabletop, illumination, object density, and negative space evolve "
-        "continuously, and all visible differences progressively narrow until the exact Picture 2 "
-        "composition is reached. Surface detail develops only toward detail visible in Picture 2."
+        "viewpoint. Spatially separated forms on the left, center, and right transform concurrently "
+        "throughout the shot, with overlapping local changes at every intermediate time. The frame "
+        "remains one integrated scene: no frame-spanning dividing line, moving sheet or band, "
+        "single propagation front, or side-by-side display separates earlier and later states. "
+        "Where supported by the endpoints, background planes and broad color, shadow, or texture "
+        "fields blend and flow locally through overlapping opaque intermediate states. The tabletop, "
+        "illumination, object density, and negative space evolve together until the exact <Picture 2> "
+        "composition is reached."
         "\n\noverall_soundscape: N/A\n"
         "non_diegetic_music: N/A"
     )
@@ -281,32 +348,44 @@ def wrap_openai_h3_motion(
     clean = strip_h3_source_only_tokens(motion_description)
     if len(clean) < 80:
         raise ValueError("OpenAI motion description is unexpectedly short")
-    clean = re.sub(r"#Image1\b|<Picture 1>", "Picture 1", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"#Image2\b|<Picture 2>", "Picture 2", clean, flags=re.IGNORECASE)
+    clean = re.sub(
+        r"#Image1\b|<Picture\s+1>|\bPicture\s+1\b",
+        "<Picture 1>",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    clean = re.sub(
+        r"#Image2\b|<Picture\s+2>|\bPicture\s+2\b",
+        "<Picture 2>",
+        clean,
+        flags=re.IGNORECASE,
+    )
     clean = re.sub(r"^integrated_multimodal_description:\s*", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"^\[Shot 1\]\s*", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\s+", " ", clean).strip()
     if not re.search(r'[.!?][\"\u201d\u2019\']?$', clean):
         raise ValueError("OpenAI motion description must end with a complete sentence")
-    if "Picture 1" not in clean:
-        clean = "Beginning exactly from Picture 1, " + clean
-    if "Picture 2" not in clean:
-        clean += " The forms settle exactly into Picture 2."
+    if "<Picture 1>" not in clean:
+        clean = "Beginning exactly from <Picture 1>, " + clean
+    if "<Picture 2>" not in clean:
+        clean += " The forms settle exactly into <Picture 2>."
     return (
         "How the reference pictures align with the target video — "
-        f"Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; "
-        f"Picture 2 (from Shot 1) aligns with the {float(duration_seconds):.2f}-second "
+        f"<Picture 1> (from [Shot 1]) aligns with the 0.00-second mark of the target video; "
+        f"<Picture 2> (from [Shot 1]) aligns with the {float(duration_seconds):.2f}-second "
         "mark of the target video.\n\n"
         f"integrated_multimodal_description: [Shot 1] {clean} "
-        "The camera holds a Static Shot with unchanged framing, lens, and viewpoint. Every visible "
-        "form remains opaque, solid, continuous, and sharply resolved while its boundary advances "
-        "through small local changes toward the mapped target form. The background, tabletop, "
-        "illumination, object density, and negative space evolve continuously. All remaining "
-        "differences progressively narrow until the exact Picture 2 composition is reached. Each "
-        "mapped form stays on-screen with a visibly nonzero area throughout. Nothing enters or "
-        "exits through a frame edge, shrinks away, or gets replaced by a separate form enlarging "
-        "elsewhere; every target develops from its mapped source's existing boundary, with gradual "
-        "size change only when the endpoints require it.\n\n"
+        "The camera holds a Static Shot with unchanged framing, lens, and viewpoint. From early in "
+        "the shot onward, multiple spatially separated forms on the left, center, and right transform "
+        "concurrently at overlapping but slightly offset rates. Every intermediate time contains "
+        "local silhouette, material, texture, and color changes distributed throughout the frame. "
+        "The composition remains one integrated scene, with no frame-spanning dividing line, moving "
+        "sheet or band, single propagation front, or side-by-side display of the endpoint states. "
+        "Mapped objects remain opaque, solid, sharply resolved, and continuously identifiable. "
+        "Where supported by the endpoints, background planes and broad color, shadow, or texture "
+        "fields blend, flow, drift, spread, and reshape through overlapping opaque intermediate "
+        "states. The support surface, illumination, object density, and negative space evolve "
+        "together until the exact <Picture 2> composition is reached.\n\n"
         "overall_soundscape: N/A\n"
         "non_diegetic_music: N/A"
     )

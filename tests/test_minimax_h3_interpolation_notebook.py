@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import types
 from pathlib import Path
 
 
@@ -26,6 +28,12 @@ def markdown_source() -> str:
         "".join(cell.get("source", []))
         for cell in load_notebook()["cells"]
         if cell.get("cell_type") == "markdown"
+    )
+
+
+def cell_source(cell_id: str) -> str:
+    return "".join(
+        next(cell for cell in load_notebook()["cells"] if cell.get("id") == cell_id)["source"]
     )
 
 
@@ -87,44 +95,110 @@ def test_h3_is_open_weight_local_fl2va_not_minimax_api() -> None:
     assert "H3-Base-FL2VA" in markdown
 
 
-def test_source_run_images_and_authored_prompts_are_loaded_read_only() -> None:
+def test_manifest_or_plain_directory_images_are_loaded_read_only() -> None:
     code = code_source()
+    markdown = markdown_source()
     assert "SOURCE_RUN_DIRECTORY =" in code
-    assert 'SOURCE_PROJECT_NAME = "science_path_prompt_only_chimera"' in code
+    assert "SOURCE_PROJECT_NAME =" in code
     assert "source_project_directory = drive_base / SOURCE_PROJECT_NAME" in code
     assert "source_project_directory / configured_source" in code
     assert '"explicit_basename"' in code
-    assert "BASE_RECORDS = load_h3_anchor_records(SOURCE_RUN)" in code
+    assert "def load_h3_anchor_records_portable(source_directory):" in code
+    assert 'manifest_path = source_directory / "metadata" / "base_manifest.json"' in code
+    assert "if manifest_path.is_file():" in code
+    assert "return load_h3_anchor_records(source_directory)" in code
+    assert 'source_directory.rglob("*")' in code
+    assert "NOTEBOOK_ANCHOR_IMAGE_SUFFIXES" in code
+    assert "BASE_RECORDS = load_h3_anchor_records_portable(SOURCE_RUN)" in code
     assert "H3_PAIRS = cyclic_h3_pairs(BASE_RECORDS)" in code
-    assert 'record["authored_prompt"]' in code
+    assert 'record.get("authored_prompt", "").strip()' in code
     assert 'pair["left"]["authored_prompt"]' in code
     assert 'pair["right"]["authored_prompt"]' in code
+    assert 'BASE_RECORDS[0].get("source_kind", "base_manifest")' in code
+    assert "plain image directory" in markdown
+    assert "natural filename order" in markdown
     assert '"source_run_modified": False' in code
     assert 'H3_PROJECT_NAME = "minimax_h3_interpolations"' in code
 
 
-def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visible() -> None:
+def test_notebook_plain_directory_scanner_bypasses_old_manifest_only_package(
+    tmp_path: Path,
+) -> None:
+    tree = ast.parse(cell_source("h3-09-anchors"))
+    portable_nodes = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Import)
+            and any(alias.name == "re" for alias in node.names)
+        )
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "NOTEBOOK_ANCHOR_IMAGE_SUFFIXES"
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "notebook_natural_image_key",
+                "load_h3_anchor_records_portable",
+            }
+        )
+    ]
+    namespace = {
+        "Path": Path,
+        "load_h3_anchor_records": lambda _source: (_ for _ in ()).throw(
+            FileNotFoundError("old package still requires metadata/base_manifest.json")
+        ),
+    }
+    exec(compile(ast.Module(body=portable_nodes, type_ignores=[]), "h3-portable", "exec"), namespace)
+
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "frame_10.PNG").write_bytes(b"image")
+    (source / "frame_2.jpg").write_bytes(b"image")
+    (source / "notes.txt").write_text("ignore", encoding="utf-8")
+    hidden = source / ".thumbnails"
+    hidden.mkdir()
+    (hidden / "ignored.png").write_bytes(b"image")
+
+    records = namespace["load_h3_anchor_records_portable"](source)
+
+    assert [record["path"] for record in records] == ["frame_2.jpg", "frame_10.PNG"]
+    assert all(record["authored_prompt"] == "" for record in records)
+    assert all(record["source_kind"] == "directory_scan" for record in records)
+
+
+def test_official_fl2va_openai_writer_uses_both_images_and_optional_prompts() -> None:
     code = code_source()
     assert 'H3_PROMPT_MODE = "openai_per_pair"' in code
     assert 'H3_LORA_TRIGGER' not in code
     assert 'H3_DURATION_SECONDS = 6.0' in code
     assert 'H3_JOB_TIMEOUT_SECONDS = 1800' in code
-    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v6"' in code
+    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-distributed-blending-v9"' in code
     assert "H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r\"\"\"" in code
-    assert "first-frame state -> observable intermediate changes -> progressively" in code
+    assert "<Picture 1> state -> observable intermediate changes -> progressively" in code
     assert "Match forms primarily by screen region, silhouette, scale, visual role" in code
     assert "Do not merely describe two static images" in code
     assert 'print("OPENAI H3 PROMPT-WRITER INSTRUCTIONS' in code
-    assert 'strip_h3_source_only_tokens(pair["left"]["authored_prompt"])' in code
-    assert 'strip_h3_source_only_tokens(pair["right"]["authored_prompt"])' in code
+    assert 'strip_h3_source_only_tokens(record.get("authored_prompt", ""))' in code
+    assert "authored prompt is supplied for either endpoint" in code
+    assert "def append_optional_prompt_context" in code
+    assert "if clean_prompt:" in code
     assert 'if "RIJKSOIL" in payload["h3_prompt"]' in code
     assert 'OPENAI_MODEL = "gpt-5.6"' in code
     assert 'OPENAI_IMAGE_DETAIL = "original"' in code
     assert "OPENAI_CLIENT.responses.parse(" in code
     assert '"image_url": image_data_url(pair["left"]["resolved_path"])' in code
     assert '"image_url": image_data_url(pair["right"]["resolved_path"])' in code
-    assert '"Picture 1 authored image prompt (semantic context only):\\n"' in code
-    assert '"Picture 2 authored image prompt (semantic context only):\\n"' in code
+    assert '"text": "<Picture 1> — exact first frame:"' in code
+    assert '"text": "<Picture 2> — exact last frame:"' in code
+    assert 'append_optional_prompt_context(user_content, "<Picture 1>", pair["left"])' in code
+    assert 'append_optional_prompt_context(user_content, "<Picture 2>", pair["right"])' in code
+    assert 'f"{picture_label} optional authored image prompt (semantic context only):\\n"' in code
     assert "class H3ObjectCorrespondence(BaseModel):" in code
     assert "object_correspondences: list[H3ObjectCorrespondence]" in code
     assert "min_length=4, max_length=10" in code
@@ -138,18 +212,20 @@ def test_official_fl2va_openai_writer_sees_both_images_and_prompts_and_is_visibl
     assert "if len(description) < OPENAI_H3_DESCRIPTION_MIN_CHARS:" in code
     assert "(?:[.!?]|\\u2026)[\\)\\]" in code
     assert "include the exact phrase Static Shot" in code
-    assert "Each mapped form stays on-screen with a visibly nonzero area" in code
-    assert "Preserve a visibly nonzero region of each mapping" in code
-    assert "correspondence by shrinking a source to nothing" in code
-    assert "never use a frame edge to introduce, remove, replace, or exchange" in code
-    assert "centered on a persistent overlap region" in code
+    assert "Start visible changes concurrently in at least three spatially separated regions" in code
+    assert "no large region remains an intact endpoint while another large" in code
+    assert "frame-spanning dividing line, moving sheet, moving band, single propagation front" in code
+    assert "Treat the background and any broad color, shadow, light, or texture area as an active" in code
+    assert "fields blend, flow, drift, spread, fold, or reshape across overlapping regions" in code
+    assert "Broad background and color-field mappings may instead mix and move continuously" in code
+    assert 'required = ("[Shot 1]", "<Picture 1>", "<Picture 2>", "Static Shot")' in code
     assert '"output_tokens_including_reasoning": getattr(usage, "output_tokens", None)' in code
     assert '"reasoning_tokens": getattr(output_details, "reasoning_tokens", None)' in code
     assert 'f"The previous draft was rejected for this exact reason: {last_error}. "' in code
     assert '"description_characters": len(description)' in code
     assert '"description_tail": description[-180:]' in code
     assert '"openai_reasoning_effort": OPENAI_REASONING_EFFORT' in code
-    assert '"structured_output_schema": "compact-correspondences+app-validated-description-v5"' in code
+    assert '"structured_output_schema": "compact-correspondences+distributed-blending-description-v8"' in code
     assert 'if response.status != "completed":' in code
     assert "OpenAI H3 description ended mid-sentence" in code
     assert "H3_DISALLOWED_GENERATED_TRANSITION_TERMS = (" in code
@@ -187,8 +263,198 @@ def test_official_workflow_is_pinned_patched_and_pair_clips_resume() -> None:
     assert '"--workflow", str(workflow_path), "--wait"' in code
     assert "H3_REUSE_EXISTING_CLIPS = True" in code
     assert 'prior.get("fingerprint") == fingerprint' in code
-    assert 'for pair in H3_PAIRS:' in code
-    assert 'H3_CLIP_RECORDS[pair["index"]] = render_h3_pair(pair)' in code
+    assert "ThreadPoolExecutor(" in code
+    assert "as_completed(future_to_pair)" in code
+    assert "executor.submit(render_h3_pair, pair)" in code
+    assert "H3_CLIP_RECORDS.update(render_h3_pairs_parallel(H3_PAIRS))" in code
+
+
+def test_post_render_quality_gate_is_permissive_resumable_and_parallel() -> None:
+    code = code_source()
+    markdown = markdown_source()
+    assert "RUN_OPENAI_H3_QUALITY_GATE = True" in code
+    assert "H3_QUALITY_SAMPLE_FRAME_COUNT = 3" in code
+    assert "H3_QUALITY_RETRY_MIN_CONFIDENCE = 0.78" in code
+    assert 'H3_QUALITY_GATE_VERSION = "h3-interior-catastrophe-gate-v4-github-assets"' in code
+    assert "one to three ordered interior video frames" in code
+    assert "Be deliberately tolerant" in code
+    assert "evidence is ambiguous, choose pass" in code
+    assert "dominant_blank_or_flat_field" in code
+    assert "disconnected_collage_or_cutouts" in code
+    assert "frame_wide_wipe_or_split" in code
+    assert "class H3QualityJudgment(BaseModel):" in code
+    assert 'verdict: Literal["pass", "retry"]' in code
+    assert "def h3_quality_sample_fractions():" in code
+    assert "(index + 1) / (count + 1)" in code
+    assert '"text": "<Picture 1> — exact first endpoint:"' in code
+    assert '"text": "<Picture 2> — exact last endpoint:"' in code
+    assert 'f"Interior frame {frame_number}/{len(frame_paths)} "' in code
+    assert "text_format=H3QualityJudgment" in code
+    assert "judgment.confidence >= H3_QUALITY_RETRY_MIN_CONFIDENCE" in code
+    assert '"low_confidence_retry_overridden"' in code
+    assert "archive_rejected_h3_clip(" in code
+    assert "H3_QUALITY_NEGATIVE_EXAMPLES = (" in code
+    assert "retry_example_transition_front.jpg" in code
+    assert "retry_example_detached_collage.jpg" in code
+    assert "def resolve_h3_quality_negative_examples():" in code
+    assert '"download_url": (' in code
+    assert '"github_download_cache"' in code
+    assert "urllib.request.urlretrieve(" in code
+    assert "failed its SHA-256 check" in code
+    assert '"image_url": example["image_url"]' in code
+    assert '"negative_examples": [{' in code
+    assert "Known RETRY example" in code
+    assert "Learn only each labeled failure pattern" in code
+    assert "quality_rejected_on_resume" in code
+    assert '"awaiting_quality_gate": True' in code
+    assert "Retrying with a new seed" in code
+    assert "H3_MAX_PARALLEL_TRANSITION_CALLS = 3" in code
+    assert "def render_h3_pairs_parallel(pairs):" in code
+    assert "ThreadPoolExecutor(" in code
+    assert "as_completed(future_to_pair)" in code
+    assert "H3_RETRY_SEED_STRIDE = 1_000_003" in code
+    assert "bounded parallel pool" in markdown
+    assert "high-confidence" in markdown
+    assert "catastrophic" in markdown
+    assert "verdict" in markdown
+
+
+def test_quality_gate_negative_example_assets_are_packaged() -> None:
+    example_directory = ROOT / "notebooks" / "assets" / "h3_quality_examples"
+    for filename in (
+        "retry_example_transition_front.jpg",
+        "retry_example_detached_collage.jpg",
+    ):
+        payload = (example_directory / filename).read_bytes()
+        assert len(payload) > 10_000
+        assert payload.startswith(b"\xff\xd8")
+
+
+def test_quality_gate_examples_download_from_github_and_cache(tmp_path: Path) -> None:
+    settings_tree = ast.parse(cell_source("h3-02-settings"))
+    quality_assignments = [
+        node
+        for node in settings_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id in {
+                "H3_QUALITY_EXAMPLE_RAW_BASE_URL",
+                "H3_QUALITY_NEGATIVE_EXAMPLES",
+            }
+            for target in node.targets
+        )
+    ]
+    settings_namespace = {
+        "REPOSITORY_REF": "agent/chimera-flux-flat-morph",
+    }
+    exec(
+        compile(
+            ast.Module(body=quality_assignments, type_ignores=[]),
+            "quality-example-settings",
+            "exec",
+        ),
+        settings_namespace,
+    )
+    examples = settings_namespace["H3_QUALITY_NEGATIVE_EXAMPLES"]
+    assert len(examples) == 2
+    for example in examples:
+        asset_path = ROOT / example["relative_path"]
+        assert example["download_url"].startswith(
+            "https://raw.githubusercontent.com/MNoichl/FluxFlowMorph/"
+        )
+        assert hashlib.sha256(asset_path.read_bytes()).hexdigest() == example["sha256"]
+
+    render_tree = ast.parse(cell_source("h3-17-render"))
+    resolver = next(
+        node
+        for node in render_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "resolve_h3_quality_negative_examples"
+    )
+    downloads = []
+
+    def fake_urlretrieve(url, destination):
+        configured = next(item for item in examples if item["download_url"] == url)
+        Path(destination).write_bytes((ROOT / configured["relative_path"]).read_bytes())
+        downloads.append(url)
+
+    def sha256_file(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    namespace = {
+        "Path": Path,
+        "PROJECT_ROOT": str(tmp_path / "empty_checkout"),
+        "LOCAL_ASSET_ROOT": str(tmp_path / "cache"),
+        "H3_QUALITY_NEGATIVE_EXAMPLES": examples,
+        "urllib": types.SimpleNamespace(
+            request=types.SimpleNamespace(urlretrieve=fake_urlretrieve)
+        ),
+        "sha256_file": sha256_file,
+        "image_data_url": lambda path: f"data:image/jpeg;base64,{Path(path).name}",
+    }
+    exec(
+        compile(ast.Module(body=[resolver], type_ignores=[]), "quality-examples", "exec"),
+        namespace,
+    )
+    resolved = namespace["resolve_h3_quality_negative_examples"]()
+    assert len(downloads) == 2
+    assert all(item["source"] == "github_download" for item in resolved)
+    assert all(item["image_url"].startswith("data:image/jpeg;base64,") for item in resolved)
+    cached = namespace["resolve_h3_quality_negative_examples"]()
+    assert len(downloads) == 2
+    assert all(item["source"] == "github_download_cache" for item in cached)
+
+
+def test_openai_calls_use_bounded_backoff_and_prompt_micro_batches() -> None:
+    code = code_source()
+    assert "OPENAI_REQUEST_MAX_ATTEMPTS = 5" in code
+    assert "OPENAI_RETRY_INITIAL_SECONDS = 2.0" in code
+    assert "OPENAI_RETRY_MAX_SECONDS = 60.0" in code
+    assert "OPENAI_PROMPT_BATCH_SIZE = 4" in code
+    assert "def bounded_backoff_seconds(" in code
+    assert "def openai_call_with_backoff(label, operation):" in code
+    assert 'headers.get("retry-after", 0.0)' in code
+    assert '"insufficient_quota"' in code
+    assert "except OPENAI_TRANSIENT_ERRORS as error:" in code
+    assert "OpenAI(api_key=api_key, max_retries=0)" in code
+    assert "OpenAI prompt pair" in code
+    assert "OpenAI quality gate pair" in code
+    assert "openai_prompts_since_pause >= OPENAI_PROMPT_BATCH_SIZE" in code
+    assert "OPENAI_PROMPT_BATCH_PAUSE_SECONDS" in code
+
+
+def test_quality_sample_fractions_cover_one_to_three_interior_frames() -> None:
+    tree = ast.parse(cell_source("h3-17-render"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "h3_quality_sample_fractions"
+    )
+    namespace: dict = {}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "quality-fractions", "exec"),
+        namespace,
+    )
+    expected = {
+        1: (0.5,),
+        2: (1 / 3, 2 / 3),
+        3: (0.25, 0.5, 0.75),
+    }
+    for count, fractions in expected.items():
+        namespace["H3_QUALITY_SAMPLE_FRAME_COUNT"] = count
+        assert namespace["h3_quality_sample_fractions"]() == fractions
+
+
+def test_final_audit_records_quality_gate_and_retry_outcomes() -> None:
+    code = code_source()
+    assert '"openai_used_for_prompt_planning"' in code
+    assert '"openai_used_for_post_render_quality_gate"' in code
+    assert '"quality_gate_all_pairs_passed"' in code
+    assert '"quality_gate_rejected_attempt_count"' in code
+    assert '"h3_max_parallel_transition_calls": H3_MAX_PARALLEL_TRANSITION_CALLS' in code
+    assert '"quality_gate_negative_examples"' in code
 
 
 def test_square_canvas_is_verified_against_source_aspect() -> None:

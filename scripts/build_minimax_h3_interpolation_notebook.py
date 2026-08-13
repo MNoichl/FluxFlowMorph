@@ -39,16 +39,17 @@ cells = [
 
         [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MNoichl/FluxFlowMorph/blob/agent/chimera-flux-flat-morph/notebooks/StillLife_MiniMax_H3_FL2V_Interpolation.ipynb)
 
-        This is a separate downstream notebook. It does **not** regenerate FLUX anchors or
-        alter any CHIMERA run. It reads the ordered anchor images and their authored prompts
-        from one completed `base_manifest.json`, renders every adjacent pair (including the
-        last-to-first closure) with the open MiniMax H3 FL2VA weights on the Colab GPU, and
-        writes a new resumable run beneath `minimax_h3_interpolations` on Drive.
+        This is a separate downstream notebook. It does **not** regenerate or alter source images.
+        It reads ordered anchors from a completed CHIMERA
+        `base_manifest.json` when present, or natural-sorts images in any plain Drive directory,
+        renders every adjacent pair (including the last-to-first closure) with the open MiniMax
+        H3 FL2VA weights on the Colab GPU, and writes a new resumable run beneath
+        `minimax_h3_interpolations` on Drive.
 
-        The default `openai_per_pair` mode sends both endpoint images and both saved prompts to
-        the Responses API, caches one structured positive-correspondence plan per pair, and prints
-        the editable writer instructions, correspondence map, and exact H3 prompt before local
-        rendering. H3 inference itself is always local.
+        The default `openai_per_pair` mode always sends both endpoint images and includes saved
+        prompts only when they exist. It caches one structured positive-correspondence plan per
+        pair and prints the editable writer instructions, correspondence map, and exact H3 prompt
+        before local rendering. H3 inference itself is always local.
         """,
     ),
     markdown(
@@ -57,7 +58,9 @@ cells = [
         ## 1. Editable source, H3, prompt, and finishing settings
 
         `SOURCE_RUN_DIRECTORY=None` discovers the newest completed prompt-only CHIMERA run.
-        Replace it with an exact Drive directory to pin a particular set of FLUX anchors.
+        Replace it with any exact Drive directory containing at least two supported images; no
+        manifest, prompts, or CHIMERA folder structure is required. A manifest remains authoritative
+        when present; otherwise images are recursively loaded in natural filename order.
         A100 40/80 GB is the recommended Colab target. L4 24 GB selects ComfyUI low-VRAM
         offload automatically and is expected to be substantially slower.
         """,
@@ -116,74 +119,141 @@ cells = [
         H3_ONE_PAIR_TEST_INDEX = 0
         RUN_FULL_H3_SEQUENCE = True
         H3_KEEP_NATIVE_AUDIO_IN_PAIR_CLIPS = True  # Final loop is silent for clean joins.
+        # Submit ordinary ComfyUI transition requests concurrently. ComfyUI schedules the actual
+        # GPU work; this bounds outstanding calls without using any asynchronous Batch API.
+        H3_MAX_PARALLEL_TRANSITION_CALLS = 3
+        H3_MAX_RENDER_ATTEMPTS = 3
+        H3_RENDER_RETRY_INITIAL_SECONDS = 10.0
+        H3_RENDER_RETRY_MAX_SECONDS = 90.0
+        H3_RENDER_RETRY_JITTER_FRACTION = 0.25
+        H3_RETRY_SEED_STRIDE = 1_000_003
 
+        # A permissive vision gate rejects only conspicuous broken-transition cases.
+        RUN_OPENAI_H3_QUALITY_GATE = True
+        H3_QUALITY_SAMPLE_FRAME_COUNT = 3  # Must be 1, 2, or 3 interior frames.
+        H3_QUALITY_RETRY_MIN_CONFIDENCE = 0.78
+        H3_QUALITY_GATE_VERSION = "h3-interior-catastrophe-gate-v4-github-assets"
+        H3_QUALITY_EXAMPLE_RAW_BASE_URL = (
+            "https://raw.githubusercontent.com/MNoichl/FluxFlowMorph/"
+            f"{REPOSITORY_REF}/notebooks/assets/h3_quality_examples"
+        )
+        H3_QUALITY_NEGATIVE_EXAMPLES = (
+            {
+                "relative_path": (
+                    "notebooks/assets/h3_quality_examples/"
+                    "retry_example_transition_front.jpg"
+                ),
+                "download_url": (
+                    H3_QUALITY_EXAMPLE_RAW_BASE_URL
+                    + "/retry_example_transition_front.jpg"
+                ),
+                "sha256": "2b9823ea34a14d76ac30130dd5052040e8ac2eedb18cba48c70e9bb771336a95",
+                "failure_type": "frame_wide_wipe_or_split",
+                "description": (
+                    "Known RETRY case: a broad vertical boundary leaves an intact endpoint-like "
+                    "region beside a separately changed region, so the transition reads as one "
+                    "advancing front rather than distributed local morphs."
+                ),
+            },
+            {
+                "relative_path": (
+                    "notebooks/assets/h3_quality_examples/"
+                    "retry_example_detached_collage.jpg"
+                ),
+                "download_url": (
+                    H3_QUALITY_EXAMPLE_RAW_BASE_URL
+                    + "/retry_example_detached_collage.jpg"
+                ),
+                "sha256": "7847a979ebe78e117f29a814589c548cbdcd493e04153b1671c871829d11d774",
+                "failure_type": "disconnected_collage_or_cutouts",
+                "description": (
+                    "Known RETRY case: the integrated still life has broken into isolated bouquet, "
+                    "flower, fruit, shell, and cloth cutouts floating on a dominant white field."
+                ),
+            },
+        )
         # Positive correspondence language avoids priming H3 with a named transition effect.
         H3_BASE_MOTION_PROMPT = (
-            "A static locked-off view begins exactly at #Image1. Every visible object remains "
-            "opaque, solid, and sharply resolved while its existing boundary continuously "
-            "deforms along the shortest path into the corresponding object at the same screen "
-            "position in #Image2. Each mapped form stays on-screen with a visibly nonzero area; "
-            "nothing enters or exits through a frame edge, shrinks away, or is replaced by a "
-            "separate form enlarging elsewhere. Shape, material, texture, color, and any required "
-            "size change proceed through small coherent updates until the view settles exactly "
-            "at #Image2."
+            "A static locked-off view begins exactly at #Image1 and ends exactly at #Image2. "
+            "From the first moment, several spatially separated mapped forms across the left, "
+            "center, and right change concurrently. Their silhouettes, materials, textures, "
+            "colors, and sizes develop locally at overlapping but slightly offset rates, so "
+            "every intermediate frame contains active transformations throughout the composition. "
+            "Where the endpoints support it, backgrounds and broad color, shadow, or texture "
+            "fields blend, flow, drift, spread, and reshape through opaque painterly intermediates. "
+            "Each mapped object remains solid, sharply resolved, and continuously identifiable. "
+            "The whole frame remains one integrated scene rather than intact endpoint regions "
+            "separated by a moving boundary."
         )
         H3_PROMPT_MODE = "openai_per_pair"  # Or "template" for no prompt-planning API call.
         H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE = False
 
         # Image-aware OpenAI prompt writer. This text is intentionally editable and printed by
         # the prompt cell. It follows MiniMax's official FL2VA guide and h3-prompt-writing skill.
-        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-positive-correspondence-v6"
+        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-distributed-blending-v9"
         H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r"""
         You write a structured motion plan for MiniMax H3-Base-FL2VA using two endpoint images.
-        Inspect Picture 1, Picture 2, and both authored image prompts. The images are the visual
-        ground truth; the authored prompts clarify intended subject matter but cannot override
-        visible composition.
+        Inspect <Picture 1> and <Picture 2> as the visual ground truth. Optional authored image
+        prompts may be supplied as semantic context, but they can never override visible composition.
+        If no authored prompt is supplied for either endpoint, work directly from the images and do
+        not invent, request, or assume missing source metadata.
 
         Follow MiniMax's official FL2VA method:
         - Plan exactly one [Shot 1]. It is a Static Shot with unchanged framing, lens, viewpoint,
-          crop, background plane, tabletop horizon, and illumination direction.
-        - Use this chronology: first-frame state -> observable intermediate changes -> progressively
-          narrowing differences -> exact last-frame state.
+          crop, and tabletop horizon. Keep the background spatially registered and the overall
+          illumination direction stable, while allowing background appearance and broad color or
+          light fields to move and develop toward the endpoint.
+        - Use this chronology: <Picture 1> state -> observable intermediate changes -> progressively
+          narrowing differences -> exact <Picture 2> state.
         - Do not merely describe two static images. Explain the visible path connecting them.
 
         Build positive object correspondence before writing the motion description:
-        - Account for every major visible form in Picture 1 and Picture 2, including the background,
+        - Account for every major visible form in <Picture 1> and <Picture 2>, including the background,
           support surface, large objects, and compositionally important small objects.
         - Match forms primarily by screen region, silhouette, scale, visual role, material, and
-          color. Semantic names are secondary. Keep motion local and choose the shortest coherent
-          path compatible with both endpoints.
+          color. Semantic names are secondary. Keep each mapping local while coordinating many
+          mappings across the frame.
         - For each mapping, state the source form and location, target form and location, and the
           continuous geometric/material changes connecting them. If counts differ, describe opaque
           neighboring forms joining through a continuous neck or one solid form separating through
           a growing indentation; retain continuous surfaces throughout.
-        - Every target must develop from the existing on-screen boundary of its mapped source.
-          Preserve a visibly nonzero region of each mapping throughout the shot. Never solve a
-          correspondence by shrinking a source to nothing while an independent target enlarges,
-          and never use a frame edge to introduce, remove, replace, or exchange a visible form.
-          A form already cropped by an endpoint may remain cropped, but its crop changes gradually
-          and only as needed to reach the other endpoint.
-        - Size differences are handled by gradual boundary deformation of the same mapped form,
-          centered on a persistent overlap region. Keep centroids local, avoid crossing mappings,
-          and do not use scale-only disappearance/reappearance as a path between objects.
+        - Preserve continuous identity within each mapping through local silhouette, material,
+          texture, color, and size development. Keep centroids local and avoid crossing mappings.
+          A form already cropped by an endpoint may remain cropped, with gradual crop adjustment.
         - Keep the quantity of visible material, negative-space layout, and object density on a
           gradual endpoint-to-endpoint path. A sparse pair remains sparse.
+        - Treat the background and any broad color, shadow, light, or texture area as an active
+          mapping rather than a frozen plate. Where the endpoint images support it, let these large
+          fields blend, flow, drift, spread, fold, or reshape across overlapping regions through
+          opaque painterly intermediate states. This is in-scene material, pigment, texture, or
+          light evolution, never a composited dissolve, crossfade, or layer-opacity effect.
+        - Start visible changes concurrently in at least three spatially separated regions during
+          the first second. Continue with overlapping, slightly offset transformations across the
+          left, center, and right so no large region remains an intact endpoint while another large
+          region has already completed.
+        - At early, middle, and late times, the entire frame must remain one integrated scene with
+          local intermediate states distributed throughout it. Do not organize the change as a
+          frame-spanning dividing line, moving sheet, moving band, single propagation front, or
+          side-by-side display of <Picture 1> and <Picture 2>.
         - Consolidate related forms into 4-10 concise mappings. Each source and target statement
           should be one compact sentence; each path should use no more than three sentences.
 
         Write integrated_multimodal_description as production-ready natural English:
         - Begin with [Shot 1], include the exact phrase Static Shot, then state the observed
-          visual style and the exact Picture 1 composition.
+          visual style and the exact <Picture 1> composition.
         - Describe early, middle, and late observable states. Every sentence must concern visible
-          composition, boundary motion, material, texture, color, lighting, or spatial relation.
-        - Existing boundaries advance through small local increments. Forms remain opaque, solid,
-          spatially attached, sharply resolved, and continuously identifiable with their mapping.
-          Every mapped form remains on-screen with a visibly nonzero footprint from first frame to
-          last frame; each target emerges from its source's continuously deforming boundary.
-        - Surface detail develops only toward detail actually visible in Picture 2.
+          composition, concurrent local deformation, material, texture, color, lighting, or spatial
+          relation. At every phase, explicitly name simultaneous changes in separated frame regions.
+        - Forms remain opaque, solid, spatially attached, sharply resolved, and continuously
+          identifiable with their mappings while transformations overlap across the composition.
+          Broad background and color-field mappings may instead mix and move continuously as one
+          opaque field when that better connects the visible endpoints.
+        - Surface detail develops only toward detail actually visible in <Picture 2>.
         - End by settling into the exact silhouettes, positions, spacing, lighting, and composition
-          of Picture 2.
-        - Use the literal labels Picture 1 and Picture 2. Do not add shots, cuts, camera motion,
+          of <Picture 2>.
+        - Use the exact literal tags <Picture 1> and <Picture 2>, including angle brackets, every
+          time an endpoint is referenced. Never substitute plain "Picture 1" or "Picture 2".
+        - Do not add shots, cuts, camera motion,
           characters, actions, typography, dialogue, sound, production commentary, or unreferenced
           objects. Do not name or propose cinematic transition effects.
         - RIJKSOIL is an upstream FLUX LoRA trigger and must never appear in the H3 plan.
@@ -199,13 +269,46 @@ cells = [
             "dissolv",
             "crossfade",
             "wipe",
+            "dividing line",
+            "moving sheet",
+            "moving band",
+            "propagation front",
+            "side-by-side",
             "particle cloud",
             "powder cloud",
             "smoke cloud",
             "slideshow",
         )
 
-        # OpenAI is used only to plan prompts; H3 itself remains local and open-weight.
+        H3_OPENAI_QUALITY_GATE_INSTRUCTIONS = r"""
+        You are a permissive quality-control judge for a generated transition video. You receive
+        the exact first endpoint, one to three ordered interior video frames, and the exact last
+        endpoint. Decide only whether the generated transition has a conspicuous catastrophic
+        failure that warrants the high cost of rendering it again.
+
+        Return retry only for a clear major failure, such as:
+        - a dominant blank, white, black, flat-color, noise, or broken area that is not plausibly
+          supported by the endpoint images;
+        - source or target content broken into isolated pasted cutouts, floating collage islands,
+          duplicated fragments, or a destroyed composition rather than one integrated scene;
+        - a frame-wide wipe, hard split, or intact endpoint regions separated by a moving front;
+        - most important content disappearing, unrelated content replacing the scene, severe
+          tiling/corruption, or interior frames that plainly fail to connect the endpoints.
+
+        Be deliberately tolerant. Pass ordinary generative imperfections: surreal intermediate
+        shapes, local flicker, imperfect object identity, uneven pacing, mild ghosting, temporary
+        awkward geometry, local blur, small composition drift, and imperfect but recognizable
+        blending. Do not demand photorealism, exact prompt compliance, or beautiful frames. If the
+        evidence is ambiguous, choose pass. Judge only the supplied ordered frames and endpoints.
+        Keep the reason concise and concrete. For pass, return only "none" as the failure type;
+        for retry, never include "none".
+
+        Before the candidate sequence, you may receive user-supplied known RETRY examples. Use
+        them only to calibrate the visible failure patterns named in their labels. Do not compare
+        subject matter, palette, style, or composition between those examples and the candidate.
+        """.strip()
+
+        # OpenAI plans prompts and optionally judges interior frames; H3 remains local/open-weight.
         OPENAI_KEY_FILENAME = "openaiapikey.txt"
         OPENAI_MODEL = "gpt-5.6"
         OPENAI_REASONING_EFFORT = "high"
@@ -213,6 +316,15 @@ cells = [
         # Shared ceiling for hidden reasoning plus the complete structured JSON response.
         OPENAI_MAX_OUTPUT_TOKENS = 32768
         OPENAI_MAX_ATTEMPTS = 3
+        OPENAI_REQUEST_MAX_ATTEMPTS = 5
+        OPENAI_RETRY_INITIAL_SECONDS = 2.0
+        OPENAI_RETRY_MAX_SECONDS = 60.0
+        OPENAI_RETRY_JITTER_FRACTION = 0.25
+        OPENAI_PROMPT_BATCH_SIZE = 4
+        OPENAI_PROMPT_BATCH_PAUSE_SECONDS = 2.0
+        OPENAI_QUALITY_REASONING_EFFORT = "medium"
+        OPENAI_QUALITY_MAX_OUTPUT_TOKENS = 4096
+        OPENAI_QUALITY_IMAGE_DETAIL = "high"
         OPENAI_H3_DESCRIPTION_MIN_CHARS = 1200
         OPENAI_H3_DESCRIPTION_MAX_CHARS = 2400
         VISION_IMAGE_MAX_SIDE = 1024
@@ -456,7 +568,7 @@ cells = [
         r"""
         ## 4. Mount Drive, choose the source run, and reserve a separate H3 run
 
-        The source manifest is read-only. Every H3 prompt plan, patched workflow, pair clip,
+        The source directory and optional manifest are read-only. Every H3 prompt plan, patched workflow, pair clip,
         and final video goes into the new directory printed by this cell. A random run seed is
         created once and persisted, so a disconnected session can resume deterministically.
         """,
@@ -582,10 +694,29 @@ cells = [
 
         OPENAI_CLIENT = None
         OPENAI_KEY_PATH = None
+        OPENAI_TRANSIENT_ERRORS = ()
         if H3_PROMPT_MODE not in {"template", "openai_per_pair"}:
             raise ValueError("H3_PROMPT_MODE must be 'template' or 'openai_per_pair'")
-        if H3_PROMPT_MODE == "openai_per_pair":
-            from openai import OpenAI
+        if H3_MAX_PARALLEL_TRANSITION_CALLS < 1 or H3_MAX_RENDER_ATTEMPTS < 1:
+            raise ValueError("H3 parallel call count and max attempts must be positive")
+        if H3_QUALITY_SAMPLE_FRAME_COUNT not in {1, 2, 3}:
+            raise ValueError("H3_QUALITY_SAMPLE_FRAME_COUNT must be 1, 2, or 3")
+        if not 0.0 <= H3_QUALITY_RETRY_MIN_CONFIDENCE <= 1.0:
+            raise ValueError("H3_QUALITY_RETRY_MIN_CONFIDENCE must be within [0, 1]")
+        if H3_PROMPT_MODE == "openai_per_pair" or RUN_OPENAI_H3_QUALITY_GATE:
+            from openai import (
+                APIConnectionError,
+                APITimeoutError,
+                InternalServerError,
+                OpenAI,
+                RateLimitError,
+            )
+            OPENAI_TRANSIENT_ERRORS = (
+                APIConnectionError,
+                APITimeoutError,
+                InternalServerError,
+                RateLimitError,
+            )
             OPENAI_KEY_PATH = drive_base / OPENAI_KEY_FILENAME
             if not OPENAI_KEY_PATH.is_file():
                 raise FileNotFoundError(
@@ -594,7 +725,8 @@ cells = [
             api_key = OPENAI_KEY_PATH.read_text(encoding="utf-8").strip()
             if len(api_key) < 20 or any(character.isspace() for character in api_key):
                 raise ValueError("OpenAI key file is empty or malformed")
-            OPENAI_CLIENT = OpenAI(api_key=api_key)
+            # Application-level bounded backoff below owns retries and logs every wait.
+            OPENAI_CLIENT = OpenAI(api_key=api_key, max_retries=0)
             del api_key
         run_identity = {
             "project": H3_PROJECT_NAME,
@@ -608,6 +740,7 @@ cells = [
             "h3_prompt_mode": H3_PROMPT_MODE,
             "h3_base_seed": H3_BASE_SEED,
             "openai_model": OPENAI_MODEL if OPENAI_CLIENT is not None else None,
+            "openai_quality_gate": RUN_OPENAI_H3_QUALITY_GATE,
             "openai_key_value_recorded": False,
         }
         (RUN_DIRECTORY / "metadata" / "run_identity.json").write_text(
@@ -626,21 +759,88 @@ cells = [
     markdown(
         "h3-08-anchors-heading",
         r"""
-        ## 5. Load and inspect the FLUX anchors and saved prompts
+        ## 5. Load and inspect the source anchors and optional prompts
 
-        Ordering comes exclusively from the selected run's `base_manifest.json`; the notebook
-        does not guess from filenames. The final anchor is paired back to the first. Paths from
-        an older Colab mount are recovered by filename inside the selected source run.
+        If the selected directory has `metadata/base_manifest.json`, its ordering remains
+        authoritative and stale Colab paths are recovered by filename. Otherwise supported images
+        (`png`, `jpg`, `jpeg`, `webp`, `bmp`, `tif`, `tiff`) are found recursively and put in
+        deterministic natural filename order. The final anchor is paired back to the first.
         """,
     ),
     code(
         "h3-09-anchors",
         r'''
+        import re
         from PIL import Image, ImageDraw, ImageFont
         from IPython.display import Markdown, display
 
-        BASE_RECORDS = load_h3_anchor_records(SOURCE_RUN)
+        NOTEBOOK_ANCHOR_IMAGE_SUFFIXES = {
+            ".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"
+        }
+
+        def notebook_natural_image_key(path, root):
+            relative = path.relative_to(root).as_posix()
+            return (
+                tuple(
+                    (0, int(token)) if token.isdigit() else (1, token.casefold())
+                    for token in re.split(r"(\d+)", relative)
+                    if token
+                ),
+                relative,
+            )
+
+        def load_h3_anchor_records_portable(source_directory):
+            """Keep plain-directory loading independent of the checked-out package revision."""
+
+            source_directory = Path(source_directory).expanduser()
+            if not source_directory.is_dir():
+                raise FileNotFoundError(f"Source directory does not exist: {source_directory}")
+            manifest_path = source_directory / "metadata" / "base_manifest.json"
+            if manifest_path.is_file():
+                return load_h3_anchor_records(source_directory)
+
+            image_paths = sorted(
+                (
+                    path
+                    for path in source_directory.rglob("*")
+                    if path.is_file()
+                    and path.suffix.casefold() in NOTEBOOK_ANCHOR_IMAGE_SUFFIXES
+                    and not any(
+                        part.startswith(".")
+                        for part in path.relative_to(source_directory).parts
+                    )
+                ),
+                key=lambda path: notebook_natural_image_key(path, source_directory),
+            )
+            if len(image_paths) < 2:
+                supported = ", ".join(sorted(NOTEBOOK_ANCHOR_IMAGE_SUFFIXES))
+                raise ValueError(
+                    f"Source directory needs at least two supported images; found "
+                    f"{len(image_paths)} under {source_directory}. Supported extensions: "
+                    f"{supported}"
+                )
+            records = []
+            for index, image_path in enumerate(image_paths):
+                stem_slug = re.sub(
+                    r"[^a-z0-9]+", "_", image_path.stem.casefold()
+                ).strip("_")
+                records.append({
+                    "uid": f"image_{index:04d}_{stem_slug[:48] or 'anchor'}",
+                    "source_index": index,
+                    "path": image_path.relative_to(source_directory).as_posix(),
+                    "resolved_path": str(image_path.resolve()),
+                    "authored_prompt": "",
+                    "source_kind": "directory_scan",
+                })
+            print(
+                "No metadata/base_manifest.json found; loaded images directly with the "
+                "notebook compatibility scanner."
+            )
+            return records
+
+        BASE_RECORDS = load_h3_anchor_records_portable(SOURCE_RUN)
         H3_PAIRS = cyclic_h3_pairs(BASE_RECORDS)
+        SOURCE_RECORD_MODE = BASE_RECORDS[0].get("source_kind", "base_manifest")
 
         thumbnails = []
         thumb_size = 256
@@ -674,19 +874,28 @@ cells = [
         sheet = Image.new("RGB", (columns * thumb_size, rows * (thumb_size + 42)), "#080808")
         for index, thumbnail in enumerate(thumbnails):
             sheet.paste(thumbnail, ((index % columns) * thumb_size, (index // columns) * (thumb_size + 42)))
-        display(Markdown(f"### {len(BASE_RECORDS)} source anchors from `{SOURCE_RUN.name}`"))
+        display(Markdown(
+            f"### {len(BASE_RECORDS)} source anchors from `{SOURCE_RUN.name}` "
+            f"(`{SOURCE_RECORD_MODE}`)"
+        ))
         display(sheet)
 
         for record in BASE_RECORDS:
             print("\n" + "=" * 100)
             print(f"ANCHOR {record['source_index']:02d}: {record['uid']}")
             print("image:", record["resolved_path"])
-            print("saved prompt:")
-            print(record["authored_prompt"])
+            authored_prompt = record.get("authored_prompt", "").strip()
+            print("saved prompt:" if authored_prompt else "saved prompt: none (image-only source)")
+            if authored_prompt:
+                print(authored_prompt)
         print("\nCyclic pair order:")
         for pair in H3_PAIRS:
             print(f"  {pair['index']:02d}: {pair['left']['uid']} -> {pair['right']['uid']}")
-        print({"source_sizes": sorted(set(source_sizes)), "h3_canvas": (H3_WIDTH, H3_HEIGHT)})
+        print({
+            "source_record_mode": SOURCE_RECORD_MODE,
+            "source_sizes": sorted(set(source_sizes)),
+            "h3_canvas": (H3_WIDTH, H3_HEIGHT),
+        })
         '''
     ),
     markdown(
@@ -694,11 +903,15 @@ cells = [
         r"""
         ## 6. Build, cache, and print one H3 prompt per pair
 
-        In the default `openai_per_pair` mode, GPT sees both actual endpoint images and both
-        immutable saved prompts, then writes an explicit screen-position correspondence map and
-        chronological motion path. The editable `H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS` in the
-        settings cell follows MiniMax's official FL2VA sequence: first-frame state, observable
-        intermediate changes, progressively narrowing differences, and exact last-frame state.
+        In the default `openai_per_pair` mode, GPT always sees both actual endpoint images. Saved
+        prompts are included as optional semantic context only when present, so a plain image directory
+        follows the same image-grounded path without placeholder metadata. GPT writes an explicit
+        screen-position correspondence map and a spatially distributed chronological motion path. Exact
+        `<Picture 1>` / `<Picture 2>` tags are kept from the OpenAI request through the MiniMax prompt. The editable
+        `H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS` in the
+        settings cell follows MiniMax's official FL2VA sequence: exact first-frame state, concurrent
+        changes across separated regions, optional opaque blending of backgrounds and broad color
+        fields, progressively narrowing differences, and exact last-frame state.
         Fixed code rejects incomplete sentences and incomplete API responses, adds the official
         alignment header and three-field H3 format, then counts the final prompt with ComfyUI's
         conservative UTF-8 byte ceiling. Qwen's byte-level BPE cannot produce more text tokens
@@ -716,6 +929,7 @@ cells = [
         import base64
         import hashlib
         import io
+        import random
         from pydantic import BaseModel, Field
         from flowmorph_klein.h3_workflow import validate_h3_prompt_byte_budget
 
@@ -726,6 +940,70 @@ cells = [
                 model_context_tokens=H3_TEXT_ENCODER_CONTEXT_TOKENS,
                 reserved_condition_tokens=H3_IMAGE_CONDITIONING_TOKEN_RESERVE,
             )
+
+        def bounded_backoff_seconds(
+            failure_number,
+            *,
+            initial_seconds,
+            maximum_seconds,
+            jitter_fraction,
+            minimum_seconds=0.0,
+        ):
+            base = min(
+                float(maximum_seconds),
+                float(initial_seconds) * (2 ** max(0, int(failure_number) - 1)),
+            )
+            jitter = random.uniform(0.0, max(0.0, base * float(jitter_fraction)))
+            return max(float(minimum_seconds), base) + jitter
+
+        def openai_error_code(error):
+            body = getattr(error, "body", None)
+            if isinstance(body, dict):
+                nested = body.get("error", body)
+                if isinstance(nested, dict):
+                    return str(nested.get("code") or "").strip().lower()
+            return ""
+
+        def openai_retry_after_seconds(error):
+            response = getattr(error, "response", None)
+            headers = getattr(response, "headers", None)
+            if headers is None:
+                return 0.0
+            try:
+                return max(0.0, float(headers.get("retry-after", 0.0)))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def openai_call_with_backoff(label, operation):
+            non_retryable_codes = {
+                "billing_hard_limit_reached",
+                "credit_balance_exhausted",
+                "insufficient_quota",
+                "organization_spend_limit_exceeded",
+                "organization_usage_limit_exceeded",
+                "project_spend_limit_exceeded",
+            }
+            for transport_attempt in range(1, OPENAI_REQUEST_MAX_ATTEMPTS + 1):
+                try:
+                    return operation()
+                except OPENAI_TRANSIENT_ERRORS as error:
+                    if openai_error_code(error) in non_retryable_codes:
+                        raise
+                    if transport_attempt >= OPENAI_REQUEST_MAX_ATTEMPTS:
+                        raise
+                    delay = bounded_backoff_seconds(
+                        transport_attempt,
+                        initial_seconds=OPENAI_RETRY_INITIAL_SECONDS,
+                        maximum_seconds=OPENAI_RETRY_MAX_SECONDS,
+                        jitter_fraction=OPENAI_RETRY_JITTER_FRACTION,
+                        minimum_seconds=openai_retry_after_seconds(error),
+                    )
+                    print(
+                        f"{label}: transient OpenAI failure on transport attempt "
+                        f"{transport_attempt}/{OPENAI_REQUEST_MAX_ATTEMPTS}: {error}. "
+                        f"Retrying in {delay:.1f}s."
+                    )
+                    time.sleep(delay)
 
         class H3ObjectCorrespondence(BaseModel):
             source_form_and_region: str = Field(min_length=15, max_length=240)
@@ -754,8 +1032,8 @@ cells = [
                 )
             if not re.search(r'(?:[.!?]|\u2026)[\)\]"\u201d\u2019\']*$', description):
                 raise ValueError("OpenAI H3 description ended mid-sentence")
-            required = ("[Shot 1]", "Picture 1", "Picture 2", "Static Shot")
-            missing = [item for item in required if item.lower() not in description.lower()]
+            required = ("[Shot 1]", "<Picture 1>", "<Picture 2>", "Static Shot")
+            missing = [item for item in required if item not in description]
             if missing:
                 raise ValueError(f"OpenAI H3 description is missing required FL2VA anchors: {missing}")
             if not description.lower().startswith("[shot 1]") or description.lower().count("[shot 1]") != 1:
@@ -805,6 +1083,17 @@ cells = [
                 image.save(buffer, format="JPEG", quality=VISION_JPEG_QUALITY, optimize=True)
             return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
+        def append_optional_prompt_context(content, picture_label, record):
+            clean_prompt = strip_h3_source_only_tokens(record.get("authored_prompt", "")).strip()
+            if clean_prompt:
+                content.append({
+                    "type": "input_text",
+                    "text": (
+                        f"{picture_label} optional authored image prompt (semantic context only):\n"
+                        + clean_prompt
+                    ),
+                })
+
         def openai_motion_for_pair(pair):
             user_content = [
                 {
@@ -812,36 +1101,28 @@ cells = [
                     "text": (
                         "Create the positive object-correspondence plan and one production-ready "
                         "FL2VA integrated multimodal description for this pair. "
-                        f"The target duration is exactly {H3_DURATION_SECONDS:.2f} seconds."
+                        f"The target duration is exactly {H3_DURATION_SECONDS:.2f} seconds. "
+                        "Some endpoints have no authored prompt; absent context blocks are "
+                        "intentional, so infer the visual plan from the images themselves."
                     ),
                 },
-                {"type": "input_text", "text": "Picture 1 — exact first frame:"},
+                {"type": "input_text", "text": "<Picture 1> — exact first frame:"},
                 {
                     "type": "input_image",
                     "image_url": image_data_url(pair["left"]["resolved_path"]),
                     "detail": OPENAI_IMAGE_DETAIL,
                 },
-                {
-                    "type": "input_text",
-                    "text": (
-                        "Picture 1 authored image prompt (semantic context only):\n"
-                        + strip_h3_source_only_tokens(pair["left"]["authored_prompt"])
-                    ),
-                },
-                {"type": "input_text", "text": "Picture 2 — exact last frame:"},
+            ]
+            append_optional_prompt_context(user_content, "<Picture 1>", pair["left"])
+            user_content.extend([
+                {"type": "input_text", "text": "<Picture 2> — exact last frame:"},
                 {
                     "type": "input_image",
                     "image_url": image_data_url(pair["right"]["resolved_path"]),
                     "detail": OPENAI_IMAGE_DETAIL,
                 },
-                {
-                    "type": "input_text",
-                    "text": (
-                        "Picture 2 authored image prompt (semantic context only):\n"
-                        + strip_h3_source_only_tokens(pair["right"]["authored_prompt"])
-                    ),
-                },
-            ]
+            ])
+            append_optional_prompt_context(user_content, "<Picture 2>", pair["right"])
             last_error = None
             for attempt in range(1, OPENAI_MAX_ATTEMPTS + 1):
                 try:
@@ -854,22 +1135,29 @@ cells = [
                                 "Return a corrected, complete, compact JSON proposal now: 4-10 "
                                 "grouped correspondences, an integrated description aiming for "
                                 "1,400-1,800 characters and never exceeding 2,400, and a fully "
-                                "punctuated final sentence. Finish naturally well before the hard "
-                                "ceiling; do not stop at a character boundary."
+                                "punctuated final sentence. Use exact <Picture 1>/<Picture 2> tags "
+                                "and distributed concurrent changes across left, center, and right. "
+                                "When supported by the endpoints, describe opaque blending and "
+                                "movement of backgrounds or broad color, shadow, and texture fields. "
+                                "Finish naturally well before the hard ceiling; do not stop at a "
+                                "character boundary."
                             ),
                         })
-                    response = OPENAI_CLIENT.responses.parse(
-                        model=OPENAI_MODEL,
-                        reasoning={"effort": OPENAI_REASONING_EFFORT},
-                        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-                        input=[
-                            {
-                                "role": "system",
-                                "content": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
-                            },
-                            {"role": "user", "content": attempt_content},
-                        ],
-                        text_format=H3MotionProposal,
+                    response = openai_call_with_backoff(
+                        f"OpenAI prompt pair {pair['index']:02d}",
+                        lambda: OPENAI_CLIENT.responses.parse(
+                            model=OPENAI_MODEL,
+                            reasoning={"effort": OPENAI_REASONING_EFFORT},
+                            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+                            input=[
+                                {
+                                    "role": "system",
+                                    "content": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
+                                },
+                                {"role": "user", "content": attempt_content},
+                            ],
+                            text_format=H3MotionProposal,
+                        ),
                     )
                     usage = getattr(response, "usage", None)
                     output_details = getattr(usage, "output_tokens_details", None)
@@ -904,14 +1192,22 @@ cells = [
                     last_error = error
                     print(f"OpenAI pair {pair['index']:02d} attempt {attempt} failed: {error}")
                     if attempt < OPENAI_MAX_ATTEMPTS:
-                        time.sleep(2**attempt)
+                        delay = bounded_backoff_seconds(
+                            attempt,
+                            initial_seconds=OPENAI_RETRY_INITIAL_SECONDS,
+                            maximum_seconds=OPENAI_RETRY_MAX_SECONDS,
+                            jitter_fraction=OPENAI_RETRY_JITTER_FRACTION,
+                        )
+                        print(f"Retrying corrected prompt in {delay:.1f}s.")
+                        time.sleep(delay)
             raise RuntimeError(f"OpenAI prompt generation failed: {last_error}")
 
         print("OPENAI H3 PROMPT-WRITER INSTRUCTIONS (editable in the settings cell):")
         print(H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS)
 
         PAIR_PROMPT_PLANS = {}
-        for pair in H3_PAIRS:
+        openai_prompts_since_pause = 0
+        for pair_position, pair in enumerate(H3_PAIRS):
             prompt_path = RUN_DIRECTORY / "prompts" / f"{pair['index']:04d}_{pair['left']['uid']}_to_{pair['right']['uid']}.json"
             prompt_basis = {
                 "mode": H3_PROMPT_MODE,
@@ -919,7 +1215,7 @@ cells = [
                 "prompt_guide_version": H3_OPENAI_PROMPT_GUIDE_VERSION,
                 "prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS,
                 "disallowed_generated_terms": H3_DISALLOWED_GENERATED_TRANSITION_TERMS,
-                "structured_output_schema": "compact-correspondences+app-validated-description-v5",
+                "structured_output_schema": "compact-correspondences+distributed-blending-description-v8",
                 "openai_max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
                 "openai_reasoning_effort": OPENAI_REASONING_EFFORT,
                 "description_min_chars": OPENAI_H3_DESCRIPTION_MIN_CHARS,
@@ -954,12 +1250,20 @@ cells = [
                     motion_directive=H3_BASE_MOTION_PROMPT,
                 )
                 if H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE:
-                    h3_prompt += (
-                        "\n\nAuthored visual intent for <Picture 1>: "
-                        + strip_h3_source_only_tokens(pair["left"]["authored_prompt"])
-                        + "\nAuthored visual intent for <Picture 2>: "
-                        + strip_h3_source_only_tokens(pair["right"]["authored_prompt"])
-                    )
+                    endpoint_context = []
+                    for picture_label, record in (
+                        ("<Picture 1>", pair["left"]),
+                        ("<Picture 2>", pair["right"]),
+                    ):
+                        clean_prompt = strip_h3_source_only_tokens(
+                            record.get("authored_prompt", "")
+                        ).strip()
+                        if clean_prompt:
+                            endpoint_context.append(
+                                f"Authored visual intent for {picture_label}: {clean_prompt}"
+                            )
+                    if endpoint_context:
+                        h3_prompt += "\n\n" + "\n".join(endpoint_context)
                 plan = {
                     "fingerprint": fingerprint,
                     "pair_id": pair["pair_id"],
@@ -987,6 +1291,7 @@ cells = [
                     "basis": prompt_basis,
                 }
                 plan_source = "generated_openai"
+                openai_prompts_since_pause += 1
             prompt_byte_count = h3_prompt_utf8_bytes(plan["h3_prompt"])
             recorded_byte_count = plan.get("h3_prompt_utf8_bytes")
             if recorded_byte_count not in (None, prompt_byte_count):
@@ -1001,8 +1306,14 @@ cells = [
                 f"PAIR {pair['index']:02d}: {pair['left']['uid']} -> {pair['right']['uid']} "
                 f"[{plan_source}]"
             )
-            print("LEFT AUTHORED PROMPT:\n" + pair["left"]["authored_prompt"])
-            print("RIGHT AUTHORED PROMPT:\n" + pair["right"]["authored_prompt"])
+            print(
+                "LEFT AUTHORED PROMPT:\n"
+                + (pair["left"]["authored_prompt"] or "[none — image-only source]")
+            )
+            print(
+                "RIGHT AUTHORED PROMPT:\n"
+                + (pair["right"]["authored_prompt"] or "[none — image-only source]")
+            )
             if plan.get("object_correspondences"):
                 print("POSITIVE OBJECT CORRESPONDENCE MAP:")
                 for mapping_index, mapping in enumerate(plan["object_correspondences"], start=1):
@@ -1015,6 +1326,16 @@ cells = [
                 f"(worst-case text tokens <= {prompt_byte_count})"
             )
             print("GENERATED TRANSITION PROMPT SENT TO LOCAL H3:\n" + plan["h3_prompt"])
+            if (
+                openai_prompts_since_pause >= OPENAI_PROMPT_BATCH_SIZE
+                and pair_position + 1 < len(H3_PAIRS)
+            ):
+                print(
+                    f"Completed an OpenAI prompt batch of {openai_prompts_since_pause}; "
+                    f"pausing {OPENAI_PROMPT_BATCH_PAUSE_SECONDS:.1f}s."
+                )
+                time.sleep(OPENAI_PROMPT_BATCH_PAUSE_SECONDS)
+                openai_prompts_since_pause = 0
         '''
     ),
     markdown(
@@ -1150,28 +1471,52 @@ cells = [
         official UI workflow, converts it to the API graph client-side, and executes locally.
         Pair manifests include all inputs and a fingerprint; a disconnected rerun reuses only
         clips whose exact source images, prompts, checkpoints, seed, size, and duration match.
-        H3 jobs are intentionally serial because one 33B video model already saturates the GPU.
+        Ordinary transition requests are submitted through a bounded parallel pool; each pair has
+        independent exponential backoff and resumable state. ComfyUI schedules the actual work on
+        the available GPU. After every clip, OpenAI compares 1-3 ordered interior frames with both
+        endpoints and two known-bad visual calibration examples. Only a high-confidence catastrophic
+        verdict triggers a new-seed retry; rejected clips and judgment evidence remain in
+        `diagnostics`.
         """,
     ),
     code(
         "h3-17-render",
         r'''
         import glob
+        import imageio_ffmpeg
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from typing import Literal
 
         H3_TEMPLATE = json.loads(template_path.read_text(encoding="utf-8"))
         COMFY_INPUT = Path(COMFYUI_ROOT) / "input"
         COMFY_OUTPUT = Path(COMFYUI_ROOT) / "output"
         COMFY_INPUT.mkdir(parents=True, exist_ok=True)
         COMFY_OUTPUT.mkdir(parents=True, exist_ok=True)
+        H3_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+        class H3QualityJudgment(BaseModel):
+            verdict: Literal["pass", "retry"]
+            catastrophic_failure_types: list[Literal[
+                "none",
+                "dominant_blank_or_flat_field",
+                "disconnected_collage_or_cutouts",
+                "frame_wide_wipe_or_split",
+                "major_content_loss_or_unrelated_scene",
+                "severe_corruption",
+            ]] = Field(min_length=1, max_length=3)
+            confidence: float = Field(ge=0.0, le=1.0)
+            reason: str = Field(min_length=5, max_length=400)
 
         def safe_name(value):
             return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._") or "pair"
 
-        def h3_job_payload(pair):
+        def h3_job_payload(pair, render_attempt=1):
             prompt_plan = PAIR_PROMPT_PLANS[pair["index"]]
             prompt_byte_count = h3_prompt_utf8_bytes(prompt_plan["h3_prompt"])
             if prompt_plan.get("h3_prompt_utf8_bytes") != prompt_byte_count:
                 raise RuntimeError("H3 prompt changed after its UTF-8 byte audit")
+            retry_offset = (max(1, int(render_attempt)) - 1) * H3_RETRY_SEED_STRIDE
             return {
                 "pair_id": pair["pair_id"],
                 "left_uid": pair["left"]["uid"],
@@ -1182,7 +1527,7 @@ cells = [
                 "h3_prompt": prompt_plan["h3_prompt"],
                 "h3_prompt_utf8_bytes": prompt_byte_count,
                 "h3_prompt_max_utf8_bytes": H3_PROMPT_MAX_UTF8_BYTES,
-                "seed": H3_BASE_SEED + pair["index"],
+                "seed": (H3_BASE_SEED + pair["index"] + retry_offset) % (2**63 - 1),
                 "width": H3_WIDTH,
                 "height": H3_HEIGHT,
                 "duration_seconds": H3_DURATION_SECONDS,
@@ -1215,21 +1560,8 @@ cells = [
                 print(line, end="", flush=True)
             return process.wait(), "".join(output_lines)
 
-        def render_h3_pair(pair):
-            payload = h3_job_payload(pair)
-            fingerprint = stable_h3_fingerprint(payload)
-            pair_slug = safe_name(pair["pair_id"])
-            clip_path = RUN_DIRECTORY / "clips" / f"{pair['index']:04d}_{pair_slug}.mp4"
-            manifest_path = RUN_DIRECTORY / "metadata" / f"h3_pair_{pair['index']:04d}.json"
-            if H3_REUSE_EXISTING_CLIPS and clip_path.is_file() and manifest_path.is_file():
-                try:
-                    prior = json.loads(manifest_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    prior = {}
-                if prior.get("fingerprint") == fingerprint and prior.get("complete") is True:
-                    print(f"Reusing pair {pair['index']:02d}: {clip_path.name}")
-                    return {**prior, "clip_path": str(clip_path), "reused": True}
-
+        def render_h3_attempt(pair, render_attempt, clip_path, pair_slug):
+            payload = h3_job_payload(pair, render_attempt=render_attempt)
             first_name = f"h3_{RUN_DIRECTORY.name}_{pair['index']:04d}_first.png"
             last_name = f"h3_{RUN_DIRECTORY.name}_{pair['index']:04d}_last.png"
             for source, name in (
@@ -1239,7 +1571,10 @@ cells = [
                 with Image.open(source) as opened:
                     opened.convert("RGB").save(COMFY_INPUT / name, format="PNG", compress_level=4)
 
-            output_prefix = f"h3_{RUN_DIRECTORY.name}/{pair['index']:04d}_{pair_slug}"
+            output_prefix = (
+                f"h3_{RUN_DIRECTORY.name}/{pair['index']:04d}_{pair_slug}"
+                f"_attempt_{render_attempt:02d}"
+            )
             workflow = patch_h3_ui_workflow(
                 H3_TEMPLATE,
                 first_image=first_name,
@@ -1263,12 +1598,18 @@ cells = [
                 raise RuntimeError(f"Official H3 demo content survived workflow patching: {leaked}")
             if "RIJKSOIL" in payload["h3_prompt"]:
                 raise RuntimeError("Upstream FLUX LoRA token leaked into the MiniMax H3 prompt")
-            workflow_path = RUN_DIRECTORY / "workflows" / f"pair_{pair['index']:04d}.json"
+            workflow_path = (
+                RUN_DIRECTORY / "workflows" /
+                f"pair_{pair['index']:04d}_attempt_{render_attempt:02d}.json"
+            )
             workflow_path.write_text(
                 json.dumps(workflow, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
             print("\n" + "=" * 110)
-            print(f"LOCAL H3 PAIR {pair['index']:02d}: {pair['left']['uid']} -> {pair['right']['uid']}")
+            print(
+                f"LOCAL H3 PAIR {pair['index']:02d} ATTEMPT {render_attempt}: "
+                f"{pair['left']['uid']} -> {pair['right']['uid']}"
+            )
             print("seed:", payload["seed"])
             print("EXECUTABLE H3 CONTROLS:\n" + json.dumps(executable_controls, indent=2, ensure_ascii=False))
             print("prompt:\n" + payload["h3_prompt"])
@@ -1287,7 +1628,9 @@ cells = [
                 )
             output_directory = COMFY_OUTPUT / f"h3_{RUN_DIRECTORY.name}"
             candidates = sorted(
-                output_directory.glob(f"{pair['index']:04d}_{pair_slug}*.mp4"),
+                output_directory.glob(
+                    f"{pair['index']:04d}_{pair_slug}_attempt_{render_attempt:02d}*.mp4"
+                ),
                 key=lambda path: (path.stat().st_mtime_ns, path.name),
             )
             if not candidates:
@@ -1295,9 +1638,9 @@ cells = [
             shutil.copy2(candidates[-1], clip_path)
             if not clip_path.is_file() or clip_path.stat().st_size == 0:
                 raise RuntimeError(f"Persistent H3 clip is empty: {clip_path}")
-            record = {
-                "complete": True,
-                "fingerprint": fingerprint,
+            return {
+                "render_succeeded": True,
+                "render_attempt": render_attempt,
                 "clip_path": str(clip_path),
                 "workflow_path": str(workflow_path),
                 "payload": payload,
@@ -1305,10 +1648,459 @@ cells = [
                 "native_audio_kept_in_pair_clip": H3_KEEP_NATIVE_AUDIO_IN_PAIR_CLIPS,
                 "reused": False,
             }
-            manifest_path.write_text(
-                json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+
+        def h3_quality_sample_fractions():
+            count = int(H3_QUALITY_SAMPLE_FRAME_COUNT)
+            return tuple((index + 1) / (count + 1) for index in range(count))
+
+        def resolve_h3_quality_negative_examples():
+            resolved = []
+            cache_directory = Path(LOCAL_ASSET_ROOT) / "h3_quality_examples"
+            cache_directory.mkdir(parents=True, exist_ok=True)
+            for example_number, configured in enumerate(
+                H3_QUALITY_NEGATIVE_EXAMPLES, start=1
+            ):
+                relative_path = configured["relative_path"]
+                expected_sha256 = configured["sha256"]
+                repository_path = Path(PROJECT_ROOT) / relative_path
+                cache_path = cache_directory / Path(relative_path).name
+                valid_path = next((
+                    candidate for candidate in (repository_path, cache_path)
+                    if candidate.is_file() and sha256_file(candidate) == expected_sha256
+                ), None)
+                if valid_path is not None:
+                    example_path = valid_path
+                    example_source = (
+                        "repository_asset"
+                        if valid_path == repository_path
+                        else "github_download_cache"
+                    )
+                else:
+                    temporary_path = cache_path.with_suffix(cache_path.suffix + ".part")
+                    try:
+                        urllib.request.urlretrieve(
+                            configured["download_url"], temporary_path
+                        )
+                    except Exception as error:
+                        raise RuntimeError(
+                            f"Could not download H3 quality example {example_number} from "
+                            f"{configured['download_url']}"
+                        ) from error
+                    downloaded_sha256 = sha256_file(temporary_path)
+                    if downloaded_sha256 != expected_sha256:
+                        temporary_path.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            f"H3 quality example {example_number} failed its SHA-256 check: "
+                            f"expected {expected_sha256}, received {downloaded_sha256}"
+                        )
+                    temporary_path.replace(cache_path)
+                    example_path = cache_path
+                    example_source = "github_download"
+                    print(
+                        f"Downloaded H3 quality example {example_number}: "
+                        f"{configured['download_url']}"
+                    )
+                resolved.append({
+                    **configured,
+                    "example_number": example_number,
+                    "resolved_path": example_path,
+                    "image_url": image_data_url(example_path),
+                    "source": example_source,
+                    "sha256": expected_sha256,
+                })
+            return resolved
+
+        H3_RESOLVED_QUALITY_NEGATIVE_EXAMPLES = (
+            resolve_h3_quality_negative_examples()
+            if RUN_OPENAI_H3_QUALITY_GATE else []
+        )
+
+        def extract_h3_quality_frames(clip_path, pair, render_attempt):
+            fractions = h3_quality_sample_fractions()
+            quality_directory = (
+                RUN_DIRECTORY / "diagnostics" /
+                f"quality_pair_{pair['index']:04d}" /
+                f"attempt_{render_attempt:02d}"
             )
-            return record
+            quality_directory.mkdir(parents=True, exist_ok=True)
+            frame_paths = []
+            for frame_number, fraction in enumerate(fractions, start=1):
+                frame_path = quality_directory / f"middle_{frame_number:02d}.png"
+                command = [
+                    H3_FFMPEG, "-y", "-loglevel", "error", "-i", str(clip_path),
+                    "-ss", f"{H3_DURATION_SECONDS * fraction:.3f}",
+                    "-map", "0:v:0", "-frames:v", "1", "-an", str(frame_path),
+                ]
+                completed = subprocess.run(command, capture_output=True, text=True)
+                if completed.returncode != 0 or not frame_path.is_file():
+                    raise RuntimeError(
+                        f"Could not extract H3 quality frame {frame_number}: "
+                        f"{completed.stderr[-2000:]}"
+                    )
+                frame_paths.append(frame_path)
+            return fractions, frame_paths
+
+        def judge_h3_clip(pair, clip_path, render_attempt):
+            if not RUN_OPENAI_H3_QUALITY_GATE:
+                return {
+                    "gate_version": H3_QUALITY_GATE_VERSION,
+                    "enabled": False,
+                    "effective_verdict": "pass",
+                    "gate_passed": True,
+                    "reason": "OpenAI H3 quality gate disabled by settings.",
+                }
+            fractions, frame_paths = extract_h3_quality_frames(
+                clip_path, pair, render_attempt
+            )
+            negative_examples = H3_RESOLVED_QUALITY_NEGATIVE_EXAMPLES
+            quality_basis = {
+                "gate_version": H3_QUALITY_GATE_VERSION,
+                "instructions": H3_OPENAI_QUALITY_GATE_INSTRUCTIONS,
+                "model": OPENAI_MODEL,
+                "reasoning_effort": OPENAI_QUALITY_REASONING_EFFORT,
+                "image_detail": OPENAI_QUALITY_IMAGE_DETAIL,
+                "retry_min_confidence": H3_QUALITY_RETRY_MIN_CONFIDENCE,
+                "sample_fractions": fractions,
+                "left_sha256": sha256_file(pair["left"]["resolved_path"]),
+                "right_sha256": sha256_file(pair["right"]["resolved_path"]),
+                "clip_sha256": sha256_file(clip_path),
+                "sample_sha256": [sha256_file(path) for path in frame_paths],
+                "negative_examples": [{
+                    "relative_path": example["relative_path"],
+                    "download_url": example["download_url"],
+                    "failure_type": example["failure_type"],
+                    "description": example["description"],
+                    "source": example["source"],
+                    "sha256": example["sha256"],
+                } for example in negative_examples],
+            }
+            quality_fingerprint = stable_h3_fingerprint(quality_basis)
+            report_path = (
+                RUN_DIRECTORY / "metadata" / f"h3_quality_{pair['index']:04d}.json"
+            )
+            if report_path.is_file():
+                try:
+                    cached = json.loads(report_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    cached = None
+                if cached and cached.get("fingerprint") == quality_fingerprint:
+                    print(
+                        f"Reusing quality judgment for pair {pair['index']:02d}: "
+                        f"{cached['effective_verdict']}"
+                    )
+                    return {**cached, "cached": True}
+
+            user_content = [{
+                "type": "input_text",
+                "text": (
+                    "Calibration section: the following user-supplied images are known RETRY "
+                    "cases. Learn only each labeled failure pattern, not its subjects, colors, "
+                    "style, or layout. Do not judge the candidate until the candidate section."
+                ),
+            }]
+            for example in negative_examples:
+                user_content.extend([{
+                    "type": "input_text",
+                    "text": (
+                        f"Known RETRY example {example['example_number']} — "
+                        f"{example['failure_type']}: {example['description']}"
+                    ),
+                }, {
+                    "type": "input_image",
+                    "image_url": example["image_url"],
+                    "detail": OPENAI_QUALITY_IMAGE_DETAIL,
+                }])
+            user_content.extend([{
+                "type": "input_text",
+                "text": (
+                    "Candidate section: judge this ordered H3 transition independently. Return "
+                    "retry only for an obvious major failure. The endpoint images are references; "
+                    "judge the interior frames."
+                ),
+            }, {
+                "type": "input_text",
+                "text": "<Picture 1> — exact first endpoint:",
+            }, {
+                "type": "input_image",
+                "image_url": image_data_url(pair["left"]["resolved_path"]),
+                "detail": OPENAI_QUALITY_IMAGE_DETAIL,
+            }])
+            for frame_number, (fraction, frame_path) in enumerate(
+                zip(fractions, frame_paths), start=1
+            ):
+                user_content.extend([{
+                    "type": "input_text",
+                    "text": (
+                        f"Interior frame {frame_number}/{len(frame_paths)} "
+                        f"at {fraction:.0%} of the transition:"
+                    ),
+                }, {
+                    "type": "input_image",
+                    "image_url": image_data_url(frame_path),
+                    "detail": OPENAI_QUALITY_IMAGE_DETAIL,
+                }])
+            user_content.extend([{
+                "type": "input_text",
+                "text": "<Picture 2> — exact last endpoint:",
+            }, {
+                "type": "input_image",
+                "image_url": image_data_url(pair["right"]["resolved_path"]),
+                "detail": OPENAI_QUALITY_IMAGE_DETAIL,
+            }])
+            response = openai_call_with_backoff(
+                f"OpenAI quality gate pair {pair['index']:02d}",
+                lambda: OPENAI_CLIENT.responses.parse(
+                    model=OPENAI_MODEL,
+                    reasoning={"effort": OPENAI_QUALITY_REASONING_EFFORT},
+                    max_output_tokens=OPENAI_QUALITY_MAX_OUTPUT_TOKENS,
+                    input=[{
+                        "role": "system",
+                        "content": H3_OPENAI_QUALITY_GATE_INSTRUCTIONS,
+                    }, {"role": "user", "content": user_content}],
+                    text_format=H3QualityJudgment,
+                ),
+            )
+            if response.status != "completed" or response.output_parsed is None:
+                reason = getattr(getattr(response, "incomplete_details", None), "reason", None)
+                raise RuntimeError(
+                    f"OpenAI H3 quality judgment was incomplete: "
+                    f"status={response.status!r}, reason={reason!r}"
+                )
+            judgment = response.output_parsed
+            high_confidence_retry = (
+                judgment.verdict == "retry"
+                and judgment.confidence >= H3_QUALITY_RETRY_MIN_CONFIDENCE
+            )
+            report = {
+                "fingerprint": quality_fingerprint,
+                "basis": quality_basis,
+                "gate_version": H3_QUALITY_GATE_VERSION,
+                "enabled": True,
+                "render_attempt": render_attempt,
+                "sample_frame_paths": [str(path) for path in frame_paths],
+                "openai_response_id": response.id,
+                "model_judgment": judgment.model_dump(mode="json"),
+                "effective_verdict": "retry" if high_confidence_retry else "pass",
+                "gate_passed": not high_confidence_retry,
+                "low_confidence_retry_overridden": (
+                    judgment.verdict == "retry" and not high_confidence_retry
+                ),
+                "cached": False,
+            }
+            report_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            print({
+                "quality_pair": pair["index"],
+                "render_attempt": render_attempt,
+                "model_verdict": judgment.verdict,
+                "confidence": judgment.confidence,
+                "effective_verdict": report["effective_verdict"],
+                "failure_types": judgment.catastrophic_failure_types,
+                "reason": judgment.reason,
+            })
+            return report
+
+        def archive_rejected_h3_clip(pair, clip_path, render_attempt):
+            rejected_path = (
+                RUN_DIRECTORY / "diagnostics" /
+                f"rejected_pair_{pair['index']:04d}_attempt_{render_attempt:02d}.mp4"
+            )
+            shutil.copy2(clip_path, rejected_path)
+            return rejected_path
+
+        def render_h3_pair(pair):
+            base_payload = h3_job_payload(pair, render_attempt=1)
+            fingerprint = stable_h3_fingerprint(base_payload)
+            pair_slug = safe_name(pair["pair_id"])
+            clip_path = RUN_DIRECTORY / "clips" / f"{pair['index']:04d}_{pair_slug}.mp4"
+            manifest_path = RUN_DIRECTORY / "metadata" / f"h3_pair_{pair['index']:04d}.json"
+            prior = {}
+            if H3_REUSE_EXISTING_CLIPS and manifest_path.is_file():
+                try:
+                    prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    prior = {}
+            attempt_history = list(prior.get("attempt_history", []))
+            prior_attempt = max(1, int(prior.get("render_attempt", 1)))
+            reusable_render = (
+                H3_REUSE_EXISTING_CLIPS
+                and clip_path.is_file()
+                and clip_path.stat().st_size > 0
+                and prior.get("fingerprint") == fingerprint
+                and (prior.get("complete") is True or prior.get("render_succeeded") is True)
+            )
+            if reusable_render:
+                quality = judge_h3_clip(pair, clip_path, prior_attempt)
+                if quality["gate_passed"]:
+                    record = {
+                        **prior,
+                        "complete": True,
+                        "render_succeeded": True,
+                        "quality_gate": quality,
+                        "clip_path": str(clip_path),
+                        "reused": True,
+                    }
+                    manifest_path.write_text(
+                        json.dumps(record, indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8",
+                    )
+                    print(f"Reusing quality-approved pair {pair['index']:02d}: {clip_path.name}")
+                    return record
+                rejected_path = archive_rejected_h3_clip(
+                    pair, clip_path, prior_attempt
+                )
+                attempt_history.append({
+                    "render_attempt": prior_attempt,
+                    "seed": prior.get("payload", {}).get("seed"),
+                    "result": "quality_rejected_on_resume",
+                    "rejected_clip_path": str(rejected_path),
+                    "quality_gate": quality,
+                })
+
+            prior_numbers = [
+                int(item.get("render_attempt", 0))
+                for item in attempt_history
+                if isinstance(item, dict)
+            ]
+            first_render_attempt = max(prior_numbers + ([prior_attempt] if reusable_render else [0])) + 1
+            last_error = None
+            for attempt_offset in range(H3_MAX_RENDER_ATTEMPTS):
+                render_attempt = first_render_attempt + attempt_offset
+                try:
+                    rendered = render_h3_attempt(
+                        pair, render_attempt, clip_path, pair_slug
+                    )
+                except Exception as error:
+                    last_error = error
+                    attempt_history.append({
+                        "render_attempt": render_attempt,
+                        "seed": h3_job_payload(pair, render_attempt)["seed"],
+                        "result": "render_error",
+                        "error": str(error),
+                    })
+                    manifest_path.write_text(json.dumps({
+                        "complete": False,
+                        "render_succeeded": False,
+                        "fingerprint": fingerprint,
+                        "clip_path": str(clip_path),
+                        "render_attempt": render_attempt,
+                        "attempt_history": attempt_history,
+                    }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                    if attempt_offset + 1 >= H3_MAX_RENDER_ATTEMPTS:
+                        break
+                    delay = bounded_backoff_seconds(
+                        attempt_offset + 1,
+                        initial_seconds=H3_RENDER_RETRY_INITIAL_SECONDS,
+                        maximum_seconds=H3_RENDER_RETRY_MAX_SECONDS,
+                        jitter_fraction=H3_RENDER_RETRY_JITTER_FRACTION,
+                    )
+                    print(
+                        f"H3 pair {pair['index']:02d} render attempt {render_attempt} failed: "
+                        f"{error}. Retrying in {delay:.1f}s."
+                    )
+                    time.sleep(delay)
+                    continue
+
+                try:
+                    quality = judge_h3_clip(pair, clip_path, render_attempt)
+                except Exception:
+                    manifest_path.write_text(json.dumps({
+                        **rendered,
+                        "complete": False,
+                        "fingerprint": fingerprint,
+                        "awaiting_quality_gate": True,
+                        "attempt_history": attempt_history,
+                    }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                    raise
+                history_entry = {
+                    "render_attempt": render_attempt,
+                    "seed": rendered["payload"]["seed"],
+                    "result": (
+                        "quality_passed" if quality["gate_passed"] else "quality_rejected"
+                    ),
+                    "quality_gate": quality,
+                }
+                if quality["gate_passed"]:
+                    attempt_history.append(history_entry)
+                    record = {
+                        **rendered,
+                        "complete": True,
+                        "fingerprint": fingerprint,
+                        "quality_gate": quality,
+                        "attempt_history": attempt_history,
+                    }
+                    manifest_path.write_text(
+                        json.dumps(record, indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8",
+                    )
+                    return record
+
+                rejected_path = archive_rejected_h3_clip(
+                    pair, clip_path, render_attempt
+                )
+                history_entry["rejected_clip_path"] = str(rejected_path)
+                attempt_history.append(history_entry)
+                last_error = RuntimeError(
+                    f"OpenAI quality gate rejected H3 pair {pair['index']:02d} "
+                    f"attempt {render_attempt}: "
+                    f"{quality['model_judgment']['reason']}"
+                )
+                manifest_path.write_text(json.dumps({
+                    **rendered,
+                    "complete": False,
+                    "fingerprint": fingerprint,
+                    "quality_gate": quality,
+                    "attempt_history": attempt_history,
+                }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                if attempt_offset + 1 < H3_MAX_RENDER_ATTEMPTS:
+                    delay = bounded_backoff_seconds(
+                        attempt_offset + 1,
+                        initial_seconds=H3_RENDER_RETRY_INITIAL_SECONDS,
+                        maximum_seconds=H3_RENDER_RETRY_MAX_SECONDS,
+                        jitter_fraction=H3_RENDER_RETRY_JITTER_FRACTION,
+                    )
+                    print(f"{last_error}. Retrying with a new seed in {delay:.1f}s.")
+                    time.sleep(delay)
+            raise RuntimeError(
+                f"H3 pair {pair['index']:02d} exhausted {H3_MAX_RENDER_ATTEMPTS} "
+                f"attempts in this execution; diagnostics were retained. Last error: "
+                f"{last_error}"
+            )
+
+        def render_h3_pairs_parallel(pairs):
+            records = {}
+            failures = {}
+            worker_count = min(H3_MAX_PARALLEL_TRANSITION_CALLS, len(pairs))
+            print(
+                f"Submitting {len(pairs)} ordinary H3 transition calls with "
+                f"at most {worker_count} concurrent calls."
+            )
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="h3-transition",
+            ) as executor:
+                future_to_pair = {
+                    executor.submit(render_h3_pair, pair): pair for pair in pairs
+                }
+                for future in as_completed(future_to_pair):
+                    pair = future_to_pair[future]
+                    try:
+                        records[pair["index"]] = future.result()
+                        print(f"Parallel H3 call complete: pair {pair['index']:02d}")
+                    except Exception as error:
+                        failures[pair["index"]] = error
+                        print(f"Parallel H3 call failed: pair {pair['index']:02d}: {error}")
+            if failures:
+                summary = "; ".join(
+                    f"pair {index:02d}: {error}"
+                    for index, error in sorted(failures.items())
+                )
+                raise RuntimeError(
+                    "One or more parallel H3 transition calls exhausted their independent "
+                    f"backoff/retry loops: {summary}"
+                )
+            return records
 
         H3_CLIP_RECORDS = {}
         if RUN_ONE_PAIR_TEST:
@@ -1323,8 +2115,7 @@ cells = [
                 html_attributes="controls loop muted playsinline",
             ))
         if RUN_FULL_H3_SEQUENCE:
-            for pair in H3_PAIRS:
-                H3_CLIP_RECORDS[pair["index"]] = render_h3_pair(pair)
+            H3_CLIP_RECORDS.update(render_h3_pairs_parallel(H3_PAIRS))
         if len(H3_CLIP_RECORDS) != len(H3_PAIRS):
             raise RuntimeError("Full H3 assembly requires one complete clip for every cyclic pair")
         print(f"All {len(H3_CLIP_RECORDS)} cyclic H3 pair clips are persistent on Drive.")
@@ -2215,7 +3006,9 @@ cells = [
 
         Runtime unassignment is explicit and off by default. The source FLUX run is never
         modified. Local decoded PNGs may be removed only after both persistent videos and all
-        pair manifests are complete.
+        pair manifests are complete. The audit includes quality-gate verdicts, rejected-attempt
+        counts, parallel-call policy, and visual calibration provenance without recording the
+        OpenAI key.
         """,
     ),
     code(
@@ -2238,12 +3031,47 @@ cells = [
             "complete": True,
             "source_run": str(SOURCE_RUN),
             "run_directory": str(RUN_DIRECTORY),
+            "source_record_mode": SOURCE_RECORD_MODE,
             "anchor_count": len(BASE_RECORDS),
             "cyclic_pair_count": len(H3_PAIRS),
             "all_pair_clips_complete": len(H3_CLIP_RECORDS) == len(H3_PAIRS),
             "prompt_mode": H3_PROMPT_MODE,
             "prompts_printed_in_notebook": True,
-            "openai_used_only_for_prompt_planning": H3_PROMPT_MODE == "openai_per_pair",
+            "openai_used_for_prompt_planning": H3_PROMPT_MODE == "openai_per_pair",
+            "openai_used_for_post_render_quality_gate": RUN_OPENAI_H3_QUALITY_GATE,
+            "openai_used_only_for_prompt_planning": (
+                H3_PROMPT_MODE == "openai_per_pair" and not RUN_OPENAI_H3_QUALITY_GATE
+            ),
+            "h3_max_parallel_transition_calls": H3_MAX_PARALLEL_TRANSITION_CALLS,
+            "h3_max_render_attempts_per_execution": H3_MAX_RENDER_ATTEMPTS,
+            "quality_gate_version": (
+                H3_QUALITY_GATE_VERSION if RUN_OPENAI_H3_QUALITY_GATE else None
+            ),
+            "quality_gate_sample_frame_count": (
+                H3_QUALITY_SAMPLE_FRAME_COUNT if RUN_OPENAI_H3_QUALITY_GATE else 0
+            ),
+            "quality_gate_negative_examples": (
+                [{
+                    "relative_path": example["relative_path"],
+                    "download_url": example["download_url"],
+                    "failure_type": example["failure_type"],
+                    "source": example["source"],
+                    "sha256": example["sha256"],
+                } for example in H3_RESOLVED_QUALITY_NEGATIVE_EXAMPLES]
+                if RUN_OPENAI_H3_QUALITY_GATE else []
+            ),
+            "quality_gate_all_pairs_passed": all(
+                record.get("quality_gate", {}).get("gate_passed") is True
+                for record in H3_CLIP_RECORDS.values()
+            ),
+            "quality_gate_rejected_attempt_count": sum(
+                1
+                for record in H3_CLIP_RECORDS.values()
+                for attempt in record.get("attempt_history", [])
+                if attempt.get("result") in {
+                    "quality_rejected", "quality_rejected_on_resume"
+                }
+            ),
             "h3_inference": "local_open_weights",
             "h3_api_used": False,
             "native_video": str(H3_NATIVE_VIDEO_PATH),

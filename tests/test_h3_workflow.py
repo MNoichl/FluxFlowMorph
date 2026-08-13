@@ -196,6 +196,58 @@ def test_load_records_recovers_stale_colab_paths_and_closes_cycle(tmp_path: Path
     assert pairs[-1]["right"]["uid"] == "base_000"
 
 
+def test_load_records_falls_back_to_natural_sorted_plain_image_directory(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "plain images"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    Image.new("RGB", (32, 32), "red").save(source / "frame_10.PNG")
+    Image.new("RGB", (32, 32), "green").save(source / "frame_2.jpg")
+    Image.new("RGB", (32, 32), "blue").save(nested / "frame_20.webp")
+    (source / "notes.txt").write_text("not an anchor", encoding="utf-8")
+    hidden = source / ".thumbnails"
+    hidden.mkdir()
+    Image.new("RGB", (32, 32), "black").save(hidden / "ignored.png")
+
+    records = load_h3_anchor_records(source)
+
+    assert [record["path"] for record in records] == [
+        "frame_2.jpg",
+        "frame_10.PNG",
+        "nested/frame_20.webp",
+    ]
+    assert [record["source_index"] for record in records] == [0, 1, 2]
+    assert all(record["source_kind"] == "directory_scan" for record in records)
+    assert all(record["authored_prompt"] == "" for record in records)
+    assert all(Path(record["resolved_path"]).is_absolute() for record in records)
+    assert len({record["uid"] for record in records}) == 3
+
+
+def test_manifest_prompts_are_optional_for_image_only_sources(tmp_path: Path) -> None:
+    source = _write_source_run(tmp_path)
+    manifest_path = source / "metadata" / "base_manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["records"][0].pop("prompt")
+    payload["records"][0].pop("generation_prompt")
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    records = load_h3_anchor_records(source)
+
+    assert records[0]["authored_prompt"] == ""
+    assert records[0]["source_kind"] == "base_manifest"
+    assert records[1]["authored_prompt"] == "RIJKSOIL, generated scene 1"
+
+
+def test_plain_image_directory_requires_two_supported_images(tmp_path: Path) -> None:
+    source = tmp_path / "one_image"
+    source.mkdir()
+    Image.new("RGB", (32, 32), "white").save(source / "only.png")
+
+    with pytest.raises(ValueError, match="at least two supported images; found 1"):
+        load_h3_anchor_records(source)
+
+
 def test_h3_frame_grid_and_canvas_contract() -> None:
     assert snap_h3_frame_count(4.0) == 107
     assert snap_h3_frame_count(5.0) == 124
@@ -259,14 +311,14 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     assert DEFAULT_H3_MOTION_DIRECTIVE.startswith("A static locked-off view")
     assert "RIJKSOIL" not in prompt
     assert "<Picture 1>" in prompt and "<Picture 2>" in prompt
-    assert "Picture 1 (from Shot 1) aligns with the 0.00-second mark" in prompt
-    assert "Picture 2 (from Shot 1) aligns with the 6.00-second mark" in prompt
+    assert "<Picture 1> (from [Shot 1]) aligns with the 0.00-second mark" in prompt
+    assert "<Picture 2> (from [Shot 1]) aligns with the 6.00-second mark" in prompt
     assert "Static Shot with unchanged framing, lens, and viewpoint" in prompt
-    assert "opaque, solid, continuous, and sharply resolved" in prompt
-    assert "stays on-screen with a visibly nonzero area" in prompt
-    assert "nothing enters or exits through a frame edge" in prompt
-    assert "replaced by a separate form enlarging elsewhere" in prompt
-    assert "progressively narrow" in prompt
+    assert "left, center, and right transform concurrently" in prompt
+    assert "no frame-spanning dividing line, moving sheet or band" in prompt
+    assert "background planes and broad color, shadow, or texture fields blend" in prompt
+    assert "overlapping opaque intermediate states" in prompt
+    assert "boundary advances" not in prompt
     assert "overall_soundscape: N/A" in prompt
     assert strip_h3_source_only_tokens("RIJKSOIL, a sparse scene") == "a sparse scene"
 
@@ -280,13 +332,15 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     )
     assert "RIJKSOIL" not in openai_prompt
     assert openai_prompt.count("integrated_multimodal_description:") == 1
-    assert openai_prompt.count("[Shot 1]") == 1
-    assert "Picture 1" in openai_prompt and "Picture 2" in openai_prompt
+    assert openai_prompt.count("[Shot 1]") == 3  # Two alignment anchors plus one shot body.
+    assert "<Picture 1>" in openai_prompt and "<Picture 2>" in openai_prompt
+    assert "#Image1" not in openai_prompt and "#Image2" not in openai_prompt
     assert "small local silhouette and surface adjustments" in openai_prompt
     assert "Static Shot with unchanged framing, lens, and viewpoint" in openai_prompt
-    assert "stays on-screen with a visibly nonzero area" in openai_prompt
-    assert "Nothing enters or exits through a frame edge" in openai_prompt
-    assert "every target develops from its mapped source's existing boundary" in openai_prompt
+    assert "concurrently at overlapping but slightly offset rates" in openai_prompt
+    assert "no frame-spanning dividing line, moving sheet or band" in openai_prompt
+    assert "background planes and broad color, shadow, or texture fields blend" in openai_prompt
+    assert "overlapping opaque intermediate states" in openai_prompt
     assert "overall_soundscape: N/A" in openai_prompt
 
 
