@@ -179,11 +179,18 @@ def test_official_fl2va_openai_writer_uses_both_images_and_optional_prompts() ->
     assert 'H3_LORA_TRIGGER' not in code
     assert 'H3_DURATION_SECONDS = 6.0' in code
     assert 'H3_JOB_TIMEOUT_SECONDS = 1800' in code
-    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-distributed-blending-v9"' in code
+    assert 'H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-temporal-coherence-v10"' in code
     assert "H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r\"\"\"" in code
     assert "<Picture 1> state -> observable intermediate changes -> progressively" in code
     assert "Match forms primarily by screen region, silhouette, scale, visual role" in code
     assert "Do not merely describe two static images" in code
+    assert "Temporal smoothness is the highest-priority motion quality" in code
+    assert "minute frame-to-frame increments" in code
+    assert "each adjacent-frame step is nearly imperceptible in isolation" in code
+    assert "Let its speed and direction vary" in code
+    assert "progressively smaller adjustments" in code
+    assert "Backgrounds and large color, light, shadow, and texture areas move as stable spatial fields" in code
+    assert "none of the prohibited abrupt-motion words appears" in code
     assert 'print("OPENAI H3 PROMPT-WRITER INSTRUCTIONS' in code
     assert 'strip_h3_source_only_tokens(record.get("authored_prompt", ""))' in code
     assert "authored prompt is supplied for either endpoint" in code
@@ -230,6 +237,8 @@ def test_official_fl2va_openai_writer_uses_both_images_and_optional_prompts() ->
     assert 'if response.status != "completed":' in code
     assert "OpenAI H3 description ended mid-sentence" in code
     assert "H3_DISALLOWED_GENERATED_TRANSITION_TERMS = (" in code
+    assert '"jitter",' in code
+    assert '"stutter",' in code
     assert "def validate_openai_motion_proposal(proposal):" in code
     assert "validate_openai_motion_proposal(proposal)" in code
     assert '"prompt_writer_instructions": H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS' in code

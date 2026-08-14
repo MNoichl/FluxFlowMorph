@@ -1,4 +1,4 @@
-"""Narrowly add H3 visual failure exemplars and parallel transition calls.
+"""Narrowly maintain H3 prompts, visual failure exemplars, and parallel calls.
 
 Only the H3 runtime settings, OpenAI quality instructions, setup validation, render
 documentation/code, and final audit fields may change. Existing notebook outputs,
@@ -83,6 +83,12 @@ def main() -> None:
         source(reference_cells["h3-02-settings"]),
         current_start_marker="H3_KEEP_NATIVE_AUDIO_IN_PAIR_CLIPS =",
         end_marker="# Positive correspondence language",
+    )
+    settings_source = replace_bounded_fragment(
+        settings_source,
+        source(reference_cells["h3-02-settings"]),
+        current_start_marker="# Positive correspondence language",
+        end_marker='H3_OPENAI_QUALITY_GATE_INSTRUCTIONS = r"""',
     )
     quality_settings_end = (
         "# OpenAI plans prompts"
@@ -233,7 +239,7 @@ def main() -> None:
         encoding="utf-8",
     )
     print(
-        "Migrated H3 visual-exemplar and parallel-call cells: "
+        "Migrated H3 prompt, visual-exemplar, and parallel-call cells: "
         + ", ".join(sorted(ALLOWED_CELL_IDS))
         + "; outputs, execution counts, source selection, and unrelated cells preserved."
     )

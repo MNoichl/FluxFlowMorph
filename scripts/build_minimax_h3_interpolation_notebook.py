@@ -177,21 +177,25 @@ cells = [
         H3_BASE_MOTION_PROMPT = (
             "A static locked-off view begins exactly at #Image1 and ends exactly at #Image2. "
             "From the first moment, several spatially separated mapped forms across the left, "
-            "center, and right change concurrently. Their silhouettes, materials, textures, "
-            "colors, and sizes develop locally at overlapping but slightly offset rates, so "
-            "every intermediate frame contains active transformations throughout the composition. "
-            "Where the endpoints support it, backgrounds and broad color, shadow, or texture "
-            "fields blend, flow, drift, spread, and reshape through opaque painterly intermediates. "
+            "center, and right change concurrently through minute, temporally coherent increments. "
+            "Every contour, centroid, scale, material, texture, and color follows a continuous path "
+            "whose speed and direction vary gently, so adjacent-frame increments are nearly "
+            "imperceptible in isolation while the cumulative change remains clear across the full "
+            "shot. Each mapping begins immediately at a gentle nonzero rate, flows steadily through "
+            "the middle, and settles through "
+            "progressively smaller adjustments into #Image2. Where the endpoints support it, "
+            "backgrounds and broad color, shadow, or texture fields blend, flow, drift, spread, "
+            "and reshape as stable opaque painterly fields with equally smooth temporal motion. "
             "Each mapped object remains solid, sharply resolved, and continuously identifiable. "
-            "The whole frame remains one integrated scene rather than intact endpoint regions "
-            "separated by a moving boundary."
+            "The whole frame remains one integrated, fluid scene rather than a sequence of "
+            "discrete changes."
         )
         H3_PROMPT_MODE = "openai_per_pair"  # Or "template" for no prompt-planning API call.
         H3_INCLUDE_ENDPOINT_PROMPTS_IN_TEMPLATE = False
 
         # Image-aware OpenAI prompt writer. This text is intentionally editable and printed by
         # the prompt cell. It follows MiniMax's official FL2VA guide and h3-prompt-writing skill.
-        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-distributed-blending-v9"
+        H3_OPENAI_PROMPT_GUIDE_VERSION = "minimax-h3-fl2va-temporal-coherence-v10"
         H3_OPENAI_PROMPT_WRITER_INSTRUCTIONS = r"""
         You write a structured motion plan for MiniMax H3-Base-FL2VA using two endpoint images.
         Inspect <Picture 1> and <Picture 2> as the visual ground truth. Optional authored image
@@ -207,6 +211,26 @@ cells = [
         - Use this chronology: <Picture 1> state -> observable intermediate changes -> progressively
           narrowing differences -> exact <Picture 2> state.
         - Do not merely describe two static images. Explain the visible path connecting them.
+
+        Temporal smoothness is the highest-priority motion quality:
+        - Design the full six seconds as one dense, continuous trajectory. Every contour, object
+          centroid, scale, material, texture, color, highlight, shadow, and broad field changes
+          through minute frame-to-frame increments. The endpoint journey remains clearly visible
+          over seconds, but each adjacent-frame step is nearly imperceptible in isolation.
+        - Begin every mapping immediately at a gentle nonzero rate. Let its speed and direction vary
+          smoothly through early, middle, and late phases, then reach the target through progressively
+          smaller adjustments. Keep a continuous handoff between phases rather than pausing a region
+          and making it catch up later.
+        - Overlap transformations in time as well as space. Neighboring contours and surface details
+          travel on coherent paths, and object motion, deformation, material evolution, and lighting
+          remain synchronized instead of changing in separate steps.
+        - Backgrounds and large color, light, shadow, and texture areas move as stable spatial fields:
+          gradients drift, pigments mix, and boundaries reshape with gently varying local flow and
+          brightness. Their motion is as fluid and temporally coherent as the mapped objects.
+        - Express these requirements as affirmative visible physical evolution, not engineering
+          jargon or a list of defects. Never place abrupt-motion words such as sudden, instant, rapid,
+          snap, pop, jump, jitter, flicker, pulse, stutter, teleport, or freeze in the generated plan,
+          even inside a negation.
 
         Build positive object correspondence before writing the motion description:
         - Account for every major visible form in <Picture 1> and <Picture 2>, including the background,
@@ -244,14 +268,15 @@ cells = [
           visual style and the exact <Picture 1> composition.
         - Describe early, middle, and late observable states. Every sentence must concern visible
           composition, concurrent local deformation, material, texture, color, lighting, or spatial
-          relation. At every phase, explicitly name simultaneous changes in separated frame regions.
+          relation. At every phase, explicitly name simultaneous changes in separated frame regions,
+          and continue the trajectories established in the preceding phase at smoothly varying rates.
         - Forms remain opaque, solid, spatially attached, sharply resolved, and continuously
           identifiable with their mappings while transformations overlap across the composition.
           Broad background and color-field mappings may instead mix and move continuously as one
           opaque field when that better connects the visible endpoints.
         - Surface detail develops only toward detail actually visible in <Picture 2>.
-        - End by settling into the exact silhouettes, positions, spacing, lighting, and composition
-          of <Picture 2>.
+        - Through the final interval, use progressively smaller visible adjustments to settle into
+          the exact silhouettes, positions, spacing, lighting, and composition of <Picture 2>.
         - Use the exact literal tags <Picture 1> and <Picture 2>, including angle brackets, every
           time an endpoint is referenced. Never substitute plain "Picture 1" or "Picture 2".
         - Do not add shots, cuts, camera motion,
@@ -262,6 +287,10 @@ cells = [
           Finish every thought and end with a complete sentence; never stop at a character or
           token boundary. The object-correspondence fields are separate and do not count toward
           this description's character range.
+
+        Before returning, silently verify that every mapping has a continuous early-to-late path,
+        every phase overlaps changes across separated regions, adjacent-frame increments are minute,
+        and none of the prohibited abrupt-motion words appears in any returned field.
 
         Return only the requested structured fields. Do not include the FL2VA alignment header,
         field labels, overall_soundscape, or non_diegetic_music; fixed code adds those exactly.
@@ -279,6 +308,22 @@ cells = [
             "powder cloud",
             "smoke cloud",
             "slideshow",
+            "suddenly",
+            "abruptly",
+            "instantly",
+            "rapidly",
+            "snaps",
+            "snapping",
+            "pops into",
+            "popping",
+            "jumps",
+            "jumping",
+            "jitter",
+            "flicker",
+            "pulsing",
+            "stutter",
+            "teleport",
+            "freezes",
         )
 
         H3_OPENAI_QUALITY_GATE_INSTRUCTIONS = r"""

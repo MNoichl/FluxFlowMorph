@@ -318,6 +318,8 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     assert "no frame-spanning dividing line, moving sheet or band" in prompt
     assert "background planes and broad color, shadow, or texture fields blend" in prompt
     assert "overlapping opaque intermediate states" in prompt
+    assert "adjacent-frame increments are nearly imperceptible in isolation" in prompt
+    assert "progressively smaller adjustments" in prompt
     assert "boundary advances" not in prompt
     assert "overall_soundscape: N/A" in prompt
     assert strip_h3_source_only_tokens("RIJKSOIL, a sparse scene") == "a sparse scene"
@@ -338,6 +340,9 @@ def test_default_and_openai_prompts_remove_flux_token_and_lock_scene_content() -
     assert "small local silhouette and surface adjustments" in openai_prompt
     assert "Static Shot with unchanged framing, lens, and viewpoint" in openai_prompt
     assert "concurrently at overlapping but slightly offset rates" in openai_prompt
+    assert "Adjacent frames differ through minute coherent increments" in openai_prompt
+    assert "nearly imperceptible in isolation" in openai_prompt
+    assert "no individual frame change calls attention to itself" in openai_prompt
     assert "no frame-spanning dividing line, moving sheet or band" in openai_prompt
     assert "background planes and broad color, shadow, or texture fields blend" in openai_prompt
     assert "overlapping opaque intermediate states" in openai_prompt
