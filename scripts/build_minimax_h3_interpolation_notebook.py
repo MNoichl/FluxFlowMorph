@@ -129,11 +129,13 @@ cells = [
         H3_RENDER_RETRY_JITTER_FRACTION = 0.25
         H3_RETRY_SEED_STRIDE = 1_000_003
 
-        # A permissive vision gate rejects only conspicuous broken-transition cases.
+        # A focused vision gate is tolerant of ordinary morph artifacts but treats a slider/wipe
+        # seam in any inspected frame as a mandatory retry.
         RUN_OPENAI_H3_QUALITY_GATE = True
-        H3_QUALITY_SAMPLE_FRAME_COUNT = 3  # Must be 1, 2, or 3 interior frames.
+        H3_QUALITY_SAMPLE_FRAME_COUNT = 7  # Must be one of 3, 5, 7, or 9.
         H3_QUALITY_RETRY_MIN_CONFIDENCE = 0.78
-        H3_QUALITY_GATE_VERSION = "h3-interior-catastrophe-gate-v4-github-assets"
+        H3_SLIDER_RETRY_MIN_CONFIDENCE = 0.50
+        H3_QUALITY_GATE_VERSION = "h3-interior-slider-hard-veto-v5-seven-frames"
         H3_QUALITY_EXAMPLE_RAW_BASE_URL = (
             "https://raw.githubusercontent.com/MNoichl/FluxFlowMorph/"
             f"{REPOSITORY_REF}/notebooks/assets/h3_quality_examples"
@@ -327,10 +329,20 @@ cells = [
         )
 
         H3_OPENAI_QUALITY_GATE_INSTRUCTIONS = r"""
-        You are a permissive quality-control judge for a generated transition video. You receive
-        the exact first endpoint, one to three ordered interior video frames, and the exact last
-        endpoint. Decide only whether the generated transition has a conspicuous catastrophic
-        failure that warrants the high cost of rendering it again.
+        You are a focused quality-control judge for a generated transition video. You receive the
+        exact first endpoint, several numbered interior video frames in chronological order, and
+        the exact last endpoint. Inspect every interior frame separately before deciding the global
+        verdict. Return exactly one frame_checks entry for every numbered interior frame.
+
+        A slider, wipe, or split is a mandatory RETRY, even when the image is otherwise attractive
+        and coherent. Mark frame_wide_wipe_or_split true for any interior frame containing a sharp
+        or conspicuous near-straight vertical, horizontal, or diagonal seam that divides two large
+        regions into differently advanced, endpoint-like states. Typical evidence includes an
+        intact earlier-state region beside an intact later-state region, a rectangular block of one
+        state embedded in the other, or a single boundary advancing across the composition. One
+        affected interior frame is sufficient; the defect does not need to persist for the whole
+        video. Do not excuse a slider as uneven pacing, blending, composition drift, or a coherent
+        still life.
 
         Return retry only for a clear major failure, such as:
         - a dominant blank, white, black, flat-color, noise, or broken area that is not plausibly
@@ -341,13 +353,14 @@ cells = [
         - most important content disappearing, unrelated content replacing the scene, severe
           tiling/corruption, or interior frames that plainly fail to connect the endpoints.
 
-        Be deliberately tolerant. Pass ordinary generative imperfections: surreal intermediate
-        shapes, local flicker, imperfect object identity, uneven pacing, mild ghosting, temporary
-        awkward geometry, local blur, small composition drift, and imperfect but recognizable
-        blending. Do not demand photorealism, exact prompt compliance, or beautiful frames. If the
-        evidence is ambiguous, choose pass. Judge only the supplied ordered frames and endpoints.
-        Keep the reason concise and concrete. For pass, return only "none" as the failure type;
-        for retry, never include "none".
+        For non-slider defects, remain deliberately tolerant. Pass ordinary generative
+        imperfections: surreal intermediate shapes, local flicker, imperfect object identity,
+        uneven pacing without a spatial seam, mild ghosting, temporary awkward geometry, local
+        blur, small composition drift, and imperfect but integrated blending. Do not demand
+        photorealism, exact prompt compliance, or beautiful frames. If non-slider evidence is
+        ambiguous, choose pass. Keep every per-frame reason and the global reason concise and
+        concrete. For a global pass, return only "none" as the failure type; for retry, never
+        include "none".
 
         Before the candidate sequence, you may receive user-supplied known RETRY examples. Use
         them only to calibrate the visible failure patterns named in their labels. Do not compare
@@ -368,9 +381,9 @@ cells = [
         OPENAI_RETRY_JITTER_FRACTION = 0.25
         OPENAI_PROMPT_BATCH_SIZE = 4
         OPENAI_PROMPT_BATCH_PAUSE_SECONDS = 2.0
-        OPENAI_QUALITY_REASONING_EFFORT = "medium"
-        OPENAI_QUALITY_MAX_OUTPUT_TOKENS = 4096
-        OPENAI_QUALITY_IMAGE_DETAIL = "high"
+        OPENAI_QUALITY_REASONING_EFFORT = "high"
+        OPENAI_QUALITY_MAX_OUTPUT_TOKENS = 8192
+        OPENAI_QUALITY_IMAGE_DETAIL = "original"
         OPENAI_H3_DESCRIPTION_MIN_CHARS = 1200
         OPENAI_H3_DESCRIPTION_MAX_CHARS = 2400
         VISION_IMAGE_MAX_SIDE = 1024
@@ -754,10 +767,12 @@ cells = [
             raise ValueError("H3_PROMPT_MODE must be 'template' or 'openai_per_pair'")
         if H3_MAX_PARALLEL_TRANSITION_CALLS < 1 or H3_MAX_RENDER_ATTEMPTS < 1:
             raise ValueError("H3 parallel call count and max attempts must be positive")
-        if H3_QUALITY_SAMPLE_FRAME_COUNT not in {1, 2, 3}:
-            raise ValueError("H3_QUALITY_SAMPLE_FRAME_COUNT must be 1, 2, or 3")
+        if H3_QUALITY_SAMPLE_FRAME_COUNT not in {3, 5, 7, 9}:
+            raise ValueError("H3_QUALITY_SAMPLE_FRAME_COUNT must be 3, 5, 7, or 9")
         if not 0.0 <= H3_QUALITY_RETRY_MIN_CONFIDENCE <= 1.0:
             raise ValueError("H3_QUALITY_RETRY_MIN_CONFIDENCE must be within [0, 1]")
+        if not 0.0 <= H3_SLIDER_RETRY_MIN_CONFIDENCE <= 1.0:
+            raise ValueError("H3_SLIDER_RETRY_MIN_CONFIDENCE must be within [0, 1]")
         if H3_PROMPT_MODE == "openai_per_pair" or RUN_OPENAI_H3_QUALITY_GATE:
             from openai import (
                 APIConnectionError,
@@ -1570,10 +1585,12 @@ cells = [
         clips whose exact source images, prompts, checkpoints, seed, size, and duration match.
         Ordinary transition requests are submitted through a bounded parallel pool; each pair has
         independent exponential backoff and resumable state. ComfyUI schedules the actual work on
-        the available GPU. After every clip, OpenAI compares 1-3 ordered interior frames with both
-        endpoints and two known-bad visual calibration examples. Only a high-confidence catastrophic
-        verdict triggers a new-seed retry. Rejected MP4s are retained in `rejected_videos`;
-        sampled frames and judgment evidence remain in `diagnostics`.
+        the available GPU. After every clip, OpenAI compares seven ordered interior frames with both
+        endpoints and two known-bad visual calibration examples. It reports a separate slider check
+        for every frame. A sufficiently confident wipe/split flag in any frame is a mandatory
+        new-seed retry even if the global verdict says pass; other defects retain the permissive
+        high-confidence threshold. Rejected MP4s are retained in `rejected_videos`; sampled frames
+        and judgment evidence remain in `diagnostics`.
         """,
     ),
     code(
@@ -1592,7 +1609,17 @@ cells = [
         COMFY_OUTPUT.mkdir(parents=True, exist_ok=True)
         H3_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
+        class H3FrameQualityJudgment(BaseModel):
+            frame_number: int = Field(ge=1, le=H3_QUALITY_SAMPLE_FRAME_COUNT)
+            frame_wide_wipe_or_split: bool
+            confidence: float = Field(ge=0.0, le=1.0)
+            reason: str = Field(min_length=3, max_length=240)
+
         class H3QualityJudgment(BaseModel):
+            frame_checks: list[H3FrameQualityJudgment] = Field(
+                min_length=H3_QUALITY_SAMPLE_FRAME_COUNT,
+                max_length=H3_QUALITY_SAMPLE_FRAME_COUNT,
+            )
             verdict: Literal["pass", "retry"]
             catastrophic_failure_types: list[Literal[
                 "none",
@@ -1780,6 +1807,35 @@ cells = [
             count = int(H3_QUALITY_SAMPLE_FRAME_COUNT)
             return tuple((index + 1) / (count + 1) for index in range(count))
 
+        def h3_slider_gate_decision(judgment, expected_frame_count):
+            expected_numbers = set(range(1, int(expected_frame_count) + 1))
+            checks = list(judgment.frame_checks)
+            observed_numbers = [int(check.frame_number) for check in checks]
+            frame_check_complete = (
+                len(observed_numbers) == int(expected_frame_count)
+                and set(observed_numbers) == expected_numbers
+            )
+            slider_frame_numbers = sorted({
+                int(check.frame_number)
+                for check in checks
+                if check.frame_wide_wipe_or_split
+                and check.confidence >= H3_SLIDER_RETRY_MIN_CONFIDENCE
+            })
+            global_slider_retry = (
+                judgment.verdict == "retry"
+                and "frame_wide_wipe_or_split"
+                in judgment.catastrophic_failure_types
+                and judgment.confidence >= H3_SLIDER_RETRY_MIN_CONFIDENCE
+            )
+            slider_hard_veto = bool(slider_frame_numbers) or global_slider_retry
+            return {
+                "frame_check_complete": frame_check_complete,
+                "slider_frame_numbers": slider_frame_numbers,
+                "slider_hard_veto": slider_hard_veto,
+                # A malformed/incomplete audit cannot safely approve an expensive render.
+                "gate_integrity_retry": not frame_check_complete,
+            }
+
         def resolve_h3_quality_negative_examples():
             resolved = []
             cache_directory = Path(LOCAL_ASSET_ROOT) / "h3_quality_examples"
@@ -1887,6 +1943,7 @@ cells = [
                 "reasoning_effort": OPENAI_QUALITY_REASONING_EFFORT,
                 "image_detail": OPENAI_QUALITY_IMAGE_DETAIL,
                 "retry_min_confidence": H3_QUALITY_RETRY_MIN_CONFIDENCE,
+                "slider_retry_min_confidence": H3_SLIDER_RETRY_MIN_CONFIDENCE,
                 "sample_fractions": fractions,
                 "left_sha256": sha256_file(pair["left"]["resolved_path"]),
                 "right_sha256": sha256_file(pair["right"]["resolved_path"]),
@@ -1941,7 +1998,10 @@ cells = [
                 "type": "input_text",
                 "text": (
                     "Candidate section: judge this ordered H3 transition independently. Return "
-                    "retry only for an obvious major failure. The endpoint images are references; "
+                    "retry for an obvious major failure. Inspect every numbered interior frame "
+                    "separately and return exactly one frame_checks entry for each. A slider, "
+                    "wipe, hard split, rectangular state block, or advancing seam in any single "
+                    "interior frame is a mandatory retry. The endpoint images are references; "
                     "judge the interior frames."
                 ),
             }, {
@@ -1994,10 +2054,35 @@ cells = [
                     f"status={response.status!r}, reason={reason!r}"
                 )
             judgment = response.output_parsed
-            high_confidence_retry = (
+            general_high_confidence_retry = (
                 judgment.verdict == "retry"
                 and judgment.confidence >= H3_QUALITY_RETRY_MIN_CONFIDENCE
             )
+            slider_decision = h3_slider_gate_decision(
+                judgment, len(frame_paths)
+            )
+            effective_retry = (
+                general_high_confidence_retry
+                or slider_decision["slider_hard_veto"]
+                or slider_decision["gate_integrity_retry"]
+            )
+            if slider_decision["slider_hard_veto"]:
+                effective_reason = (
+                    "Mandatory slider/wipe veto"
+                    + (
+                        " in interior frame(s) "
+                        + ", ".join(map(str, slider_decision["slider_frame_numbers"]))
+                        if slider_decision["slider_frame_numbers"] else ""
+                    )
+                    + ": " + judgment.reason
+                )
+            elif slider_decision["gate_integrity_retry"]:
+                effective_reason = (
+                    "Quality gate did not return one unique slider check for every interior "
+                    "frame; refusing to approve the render."
+                )
+            else:
+                effective_reason = judgment.reason
             report = {
                 "fingerprint": quality_fingerprint,
                 "basis": quality_basis,
@@ -2007,10 +2092,14 @@ cells = [
                 "sample_frame_paths": [str(path) for path in frame_paths],
                 "openai_response_id": response.id,
                 "model_judgment": judgment.model_dump(mode="json"),
-                "effective_verdict": "retry" if high_confidence_retry else "pass",
-                "gate_passed": not high_confidence_retry,
+                "slider_gate": slider_decision,
+                "effective_verdict": "retry" if effective_retry else "pass",
+                "effective_reason": effective_reason,
+                "gate_passed": not effective_retry,
                 "low_confidence_retry_overridden": (
-                    judgment.verdict == "retry" and not high_confidence_retry
+                    judgment.verdict == "retry"
+                    and not general_high_confidence_retry
+                    and not slider_decision["slider_hard_veto"]
                 ),
                 "cached": False,
             }
@@ -2023,8 +2112,10 @@ cells = [
                 "model_verdict": judgment.verdict,
                 "confidence": judgment.confidence,
                 "effective_verdict": report["effective_verdict"],
+                "slider_frame_numbers": slider_decision["slider_frame_numbers"],
+                "slider_hard_veto": slider_decision["slider_hard_veto"],
                 "failure_types": judgment.catastrophic_failure_types,
-                "reason": judgment.reason,
+                "reason": effective_reason,
             })
             return report
 
@@ -2184,7 +2275,7 @@ cells = [
                 last_error = RuntimeError(
                     f"OpenAI quality gate rejected H3 pair {pair['index']:02d} "
                     f"attempt {render_attempt}: "
-                    f"{quality['model_judgment']['reason']}"
+                    f"{quality.get('effective_reason', quality['model_judgment']['reason'])}"
                 )
                 manifest_path.write_text(json.dumps({
                     **rendered,
@@ -3192,6 +3283,15 @@ cells = [
             ),
             "quality_gate_sample_frame_count": (
                 H3_QUALITY_SAMPLE_FRAME_COUNT if RUN_OPENAI_H3_QUALITY_GATE else 0
+            ),
+            "quality_gate_slider_retry_min_confidence": (
+                H3_SLIDER_RETRY_MIN_CONFIDENCE if RUN_OPENAI_H3_QUALITY_GATE else None
+            ),
+            "quality_gate_image_detail": (
+                OPENAI_QUALITY_IMAGE_DETAIL if RUN_OPENAI_H3_QUALITY_GATE else None
+            ),
+            "quality_gate_reasoning_effort": (
+                OPENAI_QUALITY_REASONING_EFFORT if RUN_OPENAI_H3_QUALITY_GATE else None
             ),
             "quality_gate_negative_examples": (
                 [{

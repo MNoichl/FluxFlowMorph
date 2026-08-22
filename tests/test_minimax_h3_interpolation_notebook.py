@@ -348,28 +348,40 @@ def test_render_recovers_seed_after_out_of_order_settings_rerun(tmp_path: Path) 
     assert namespace["H3_BASE_SEED"] == persisted_seed
 
 
-def test_post_render_quality_gate_is_permissive_resumable_and_parallel() -> None:
+def test_post_render_quality_gate_has_slider_hard_veto_and_remains_resumable() -> None:
     code = code_source()
     markdown = markdown_source()
     assert "RUN_OPENAI_H3_QUALITY_GATE = True" in code
-    assert "H3_QUALITY_SAMPLE_FRAME_COUNT = 3" in code
+    assert "H3_QUALITY_SAMPLE_FRAME_COUNT = 7" in code
     assert "H3_QUALITY_RETRY_MIN_CONFIDENCE = 0.78" in code
-    assert 'H3_QUALITY_GATE_VERSION = "h3-interior-catastrophe-gate-v4-github-assets"' in code
-    assert "one to three ordered interior video frames" in code
-    assert "Be deliberately tolerant" in code
-    assert "evidence is ambiguous, choose pass" in code
+    assert "H3_SLIDER_RETRY_MIN_CONFIDENCE = 0.50" in code
+    assert 'H3_QUALITY_GATE_VERSION = "h3-interior-slider-hard-veto-v5-seven-frames"' in code
+    assert "Inspect every interior frame separately" in code
+    assert "A slider, wipe, or split is a mandatory RETRY" in code
+    assert "affected interior frame is sufficient" in code
+    assert "For non-slider defects, remain deliberately tolerant" in code
+    assert "If non-slider evidence is" in code
+    assert 'OPENAI_QUALITY_REASONING_EFFORT = "high"' in code
+    assert "OPENAI_QUALITY_MAX_OUTPUT_TOKENS = 8192" in code
+    assert 'OPENAI_QUALITY_IMAGE_DETAIL = "original"' in code
     assert "dominant_blank_or_flat_field" in code
     assert "disconnected_collage_or_cutouts" in code
     assert "frame_wide_wipe_or_split" in code
+    assert "class H3FrameQualityJudgment(BaseModel):" in code
     assert "class H3QualityJudgment(BaseModel):" in code
+    assert "frame_checks: list[H3FrameQualityJudgment]" in code
     assert 'verdict: Literal["pass", "retry"]' in code
     assert "def h3_quality_sample_fractions():" in code
+    assert "def h3_slider_gate_decision(judgment, expected_frame_count):" in code
     assert "(index + 1) / (count + 1)" in code
     assert '"text": "<Picture 1> — exact first endpoint:"' in code
     assert '"text": "<Picture 2> — exact last endpoint:"' in code
     assert 'f"Interior frame {frame_number}/{len(frame_paths)} "' in code
     assert "text_format=H3QualityJudgment" in code
     assert "judgment.confidence >= H3_QUALITY_RETRY_MIN_CONFIDENCE" in code
+    assert 'slider_decision["slider_hard_veto"]' in code
+    assert 'slider_decision["gate_integrity_retry"]' in code
+    assert '"effective_reason": effective_reason' in code
     assert '"low_confidence_retry_overridden"' in code
     assert "archive_rejected_h3_clip(" in code
     assert 'H3_REJECTED_VIDEO_SUBDIRECTORY = "rejected_videos"' in code
@@ -399,9 +411,9 @@ def test_post_render_quality_gate_is_permissive_resumable_and_parallel() -> None
     assert "as_completed(future_to_pair)" in code
     assert "H3_RETRY_SEED_STRIDE = 1_000_003" in code
     assert "bounded parallel pool" in markdown
-    assert "high-confidence" in markdown
-    assert "catastrophic" in markdown
-    assert "verdict" in markdown
+    assert "seven ordered interior frames" in markdown
+    assert "mandatory" in markdown
+    assert "global verdict says pass" in markdown
     assert "Rejected MP4s are retained in `rejected_videos`" in markdown
 
 
@@ -544,7 +556,7 @@ def test_openai_calls_use_bounded_backoff_and_prompt_micro_batches() -> None:
     assert "OPENAI_PROMPT_BATCH_PAUSE_SECONDS" in code
 
 
-def test_quality_sample_fractions_cover_one_to_three_interior_frames() -> None:
+def test_quality_sample_fractions_cover_three_to_nine_interior_frames() -> None:
     tree = ast.parse(cell_source("h3-17-render"))
     function = next(
         node
@@ -558,13 +570,66 @@ def test_quality_sample_fractions_cover_one_to_three_interior_frames() -> None:
         namespace,
     )
     expected = {
-        1: (0.5,),
-        2: (1 / 3, 2 / 3),
         3: (0.25, 0.5, 0.75),
+        5: tuple(index / 6 for index in range(1, 6)),
+        7: tuple(index / 8 for index in range(1, 8)),
+        9: tuple(index / 10 for index in range(1, 10)),
     }
     for count, fractions in expected.items():
         namespace["H3_QUALITY_SAMPLE_FRAME_COUNT"] = count
         assert namespace["h3_quality_sample_fractions"]() == fractions
+
+
+def test_slider_frame_flag_overrides_global_pass() -> None:
+    tree = ast.parse(cell_source("h3-17-render"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "h3_slider_gate_decision"
+    )
+    namespace = {"H3_SLIDER_RETRY_MIN_CONFIDENCE": 0.50}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "slider-veto", "exec"),
+        namespace,
+    )
+
+    def check(number, flagged=False, confidence=0.99):
+        return types.SimpleNamespace(
+            frame_number=number,
+            frame_wide_wipe_or_split=flagged,
+            confidence=confidence,
+        )
+
+    judgment = types.SimpleNamespace(
+        frame_checks=[check(number, flagged=number == 4) for number in range(1, 8)],
+        verdict="pass",
+        catastrophic_failure_types=["none"],
+        confidence=0.98,
+    )
+    decision = namespace["h3_slider_gate_decision"](judgment, 7)
+    assert decision == {
+        "frame_check_complete": True,
+        "slider_frame_numbers": [4],
+        "slider_hard_veto": True,
+        "gate_integrity_retry": False,
+    }
+
+    clean = types.SimpleNamespace(
+        frame_checks=[check(number) for number in range(1, 8)],
+        verdict="pass",
+        catastrophic_failure_types=["none"],
+        confidence=0.98,
+    )
+    assert namespace["h3_slider_gate_decision"](clean, 7)["slider_hard_veto"] is False
+
+    incomplete = types.SimpleNamespace(
+        frame_checks=[check(number) for number in range(1, 7)],
+        verdict="pass",
+        catastrophic_failure_types=["none"],
+        confidence=0.98,
+    )
+    assert namespace["h3_slider_gate_decision"](incomplete, 7)["gate_integrity_retry"] is True
 
 
 def test_final_audit_records_quality_gate_and_retry_outcomes() -> None:
@@ -575,6 +640,9 @@ def test_final_audit_records_quality_gate_and_retry_outcomes() -> None:
     assert '"quality_gate_rejected_attempt_count"' in code
     assert '"h3_max_parallel_transition_calls": H3_MAX_PARALLEL_TRANSITION_CALLS' in code
     assert '"h3_rejected_video_directory"' in code
+    assert '"quality_gate_slider_retry_min_confidence"' in code
+    assert '"quality_gate_image_detail"' in code
+    assert '"quality_gate_reasoning_effort"' in code
     assert '"quality_gate_negative_examples"' in code
 
 

@@ -102,6 +102,12 @@ def main() -> None:
         end_marker=quality_settings_end,
         reference_end_marker="# OpenAI plans prompts",
     )
+    settings_source = replace_bounded_fragment(
+        settings_source,
+        source(reference_cells["h3-02-settings"]),
+        current_start_marker="OPENAI_QUALITY_REASONING_EFFORT =",
+        end_marker="OPENAI_H3_DESCRIPTION_MIN_CHARS =",
+    )
     settings["source"] = settings_source.splitlines(keepends=True)
 
     drive = current_cells["h3-07-drive"]
@@ -142,6 +148,18 @@ def main() -> None:
         source(reference_cells["h3-17-render"]),
         current_start_marker="import glob",
         end_marker="H3_TEMPLATE =",
+    )
+    current_quality_class_start = (
+        "class H3FrameQualityJudgment(BaseModel):"
+        if "class H3FrameQualityJudgment(BaseModel):" in render_source
+        else "class H3QualityJudgment(BaseModel):"
+    )
+    render_source = replace_bounded_fragment(
+        render_source,
+        source(reference_cells["h3-17-render"]),
+        current_start_marker=current_quality_class_start,
+        reference_start_marker="class H3FrameQualityJudgment(BaseModel):",
+        end_marker="def safe_name(value):",
     )
     render_source = replace_bounded_fragment(
         render_source,
